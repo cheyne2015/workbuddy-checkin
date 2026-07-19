@@ -220,8 +220,9 @@ internal static class Program
             .ToArray();
         // 已领取按钮背景在本机为 RGB(242,242,242)。菜单关闭后的背景是纯白(255,255,255)，
         // 因此必须由三个采样点同时落在窄灰阶范围内，不能只判断“颜色接近灰色”。
-        bool claimed = IsClaimedButtonBackground(samples);
-        Log($"状态像素 {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，已领取判定: {claimed}");
+        bool darkTheme = IsDarkPersonalCenter(bitmap, config);
+        bool claimed = IsClaimedButtonBackground(samples, darkTheme);
+        Log($"状态像素 {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，主题={(darkTheme ? "深色" : "浅色")}，已领取判定: {claimed}");
         return claimed;
     }
 
@@ -275,7 +276,7 @@ internal static class Program
         using var bitmap = CaptureWindow(window);
         if (bitmap is null || config.PersonalCenterCardHeaderX >= bitmap.Width || config.PersonalCenterCardHeaderY >= bitmap.Height) return false;
         var c = bitmap.GetPixel(config.PersonalCenterCardHeaderX, config.PersonalCenterCardHeaderY);
-        bool ready = c.G >= 145 && c.R <= 100 && c.B >= 90;
+        bool ready = c.G >= 75 && c.G - c.R >= 50 && c.G - c.B >= 15;
         Log($"个人中心签到卡片: RGB({c.R},{c.G},{c.B})，展开判定: {ready}");
         return ready;
     }
@@ -287,13 +288,14 @@ internal static class Program
         if (bitmap is null || height <= config.ClaimBottomOffset) return false;
         int y = height - config.ClaimBottomOffset;
         var samples = new[] { 50, 130 }.Where(x => x < bitmap.Width).Select(x => bitmap.GetPixel(x, y)).ToArray();
+        bool darkTheme = IsDarkPersonalCenter(bitmap, config);
         bool enabled = samples.Length == 2 && samples.All(c =>
         {
             int max = Math.Max(c.R, Math.Max(c.G, c.B));
             int min = Math.Min(c.R, Math.Min(c.G, c.B));
-            return max - min <= 18 && max <= 140;
+            return max - min <= 18 && (darkTheme ? max >= 210 : max <= 140);
         });
-        Log($"个人中心领取按钮: {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，可领取判定: {enabled}");
+        Log($"个人中心领取按钮: {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，主题={(darkTheme ? "深色" : "浅色")}，可领取判定: {enabled}");
         return enabled;
     }
 
@@ -336,15 +338,23 @@ internal static class Program
         return matched;
     }
 
-    private static bool IsClaimedButtonBackground(IEnumerable<Color> samples)
+    private static bool IsClaimedButtonBackground(IEnumerable<Color> samples, bool darkTheme = false)
     {
         var colors = samples.ToArray();
         return colors.Length == 3 && colors.All(c =>
         {
             int max = Math.Max(c.R, Math.Max(c.G, c.B));
             int min = Math.Min(c.R, Math.Min(c.G, c.B));
-            return max - min <= 8 && max >= 230 && max <= 248;
+            // 浅色已领按钮约 RGB(242,242,242)；深色已领按钮约 RGB(47,47,47)。
+            return max - min <= 8 && (darkTheme ? max >= 38 && max <= 72 : max >= 230 && max <= 248);
         });
+    }
+
+    private static bool IsDarkPersonalCenter(Bitmap bitmap, Config config)
+    {
+        if (config.PersonalCenterInfoX >= bitmap.Width || config.PersonalCenterInfoY >= bitmap.Height) return false;
+        var c = bitmap.GetPixel(config.PersonalCenterInfoX, config.PersonalCenterInfoY);
+        return Math.Max(c.R, Math.Max(c.G, c.B)) < 100;
     }
 
     private static int GetWindowHeight(IntPtr hwnd)
@@ -517,6 +527,10 @@ internal static class Program
             throw new InvalidOperationException("已领取按钮颜色校验失败。");
         if (IsClaimedButtonBackground(new[] { Color.White, Color.White, Color.White }))
             throw new InvalidOperationException("纯白背景不能被判为已领取。");
+        if (!IsClaimedButtonBackground(new[] { Color.FromArgb(47, 47, 47), Color.FromArgb(47, 47, 47), Color.FromArgb(47, 47, 47) }, darkTheme: true))
+            throw new InvalidOperationException("深色模式已领取按钮颜色校验失败。");
+        if (IsClaimedButtonBackground(new[] { Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233) }, darkTheme: true))
+            throw new InvalidOperationException("深色模式可领取按钮不能被判为已领取。");
         Log("Self test OK.");
         return 0;
     }
@@ -579,6 +593,8 @@ internal sealed class Config
     public int PopupClaimBottomOffset { get; set; } = 96;
     public int PersonalCenterCardHeaderX { get; set; } = 210;
     public int PersonalCenterCardHeaderY { get; set; } = 445;
+    public int PersonalCenterInfoX { get; set; } = 250;
+    public int PersonalCenterInfoY { get; set; } = 500;
 }
 internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 

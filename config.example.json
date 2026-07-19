@@ -14,5 +14,7 @@
   "PopupClaimX": 77,
   "PopupClaimBottomOffset": 96,
   "PersonalCenterCardHeaderX": 210,
-  "PersonalCenterCardHeaderY": 445
+  "PersonalCenterCardHeaderY": 445,
+  "PersonalCenterInfoX": 250,
+  "PersonalCenterInfoY": 500
 }
