@@ -15,3 +15,5 @@
 `WorkBuddyAutoClaim.exe --verify-layout` 不会点击、不领取，只会使用 `PrintWindow` 在窗口被其他应用遮挡时抓取 WorkBuddy 内容，输出到 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-background-capture.png`。只有这项验证通过，后台领取的状态识别才会启用。
 
 `WorkBuddyAutoClaim.exe --test-menu` 只测试后台点击账户菜单：点击一次、保存 `workbuddy-menu-test.png`，再点击一次还原；不会领取或退出 WorkBuddy。
+
+`WorkBuddyAutoClaim.exe --test-personal-center` 只打开个人中心并保存 `workbuddy-personal-center-test.png`，不会点击“立即领取”。

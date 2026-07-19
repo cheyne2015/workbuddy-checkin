@@ -43,6 +43,7 @@ internal static class Program
                 "--dry-run" => DryRun(config),
                 "--verify-layout" => VerifyLayout(config),
                 "--test-menu" => TestMenuClick(config),
+                "--test-personal-center" => TestPersonalCenter(config),
                 "--self-test" => SelfTest(config),
                 "--daemon" => RunDaemon(config),
                 _ => 2
@@ -165,7 +166,8 @@ internal static class Program
             return false;
         }
         int y = height - config.ClaimBottomOffset;
-        var samples = new[] { config.ClaimStatusX, config.ClaimStatusX + 18, config.ClaimStatusX + 54 }
+        // 取按钮左右留白，避开“今日已领”文字本身的深灰抗锯齿像素。
+        var samples = new[] { config.ClaimStatusX, config.ClaimStatusX + 80, config.ClaimStatusX + 88 }
             .Where(x => x < bitmap.Width)
             .Select(x => bitmap.GetPixel(x, y))
             .ToArray();
@@ -184,8 +186,11 @@ internal static class Program
     private static bool TryClaimFromPersonalCenter(IntPtr window, Config config, out string result)
     {
         // 用户确认的稳定入口：左下个人中心。这里展示今日领取状态、当期累计积分和主领取按钮。
-        ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
-        Thread.Sleep(1200);
+        if (!OpenPersonalCenter(window, config))
+        {
+            result = "个人中心未完成加载或未能展开";
+            return false;
+        }
         if (LooksClaimed(window, config))
         {
             // 仅看到“今日已领”并不能证明本工具完成了领取；若用户端积分未到账，
@@ -203,6 +208,29 @@ internal static class Program
         bool claimed = LooksClaimed(window, config);
         result = claimed ? "领取成功，个人中心已更新为今日已领" : "点击后个人中心未更新为今日已领";
         return claimed;
+    }
+
+    private static bool OpenPersonalCenter(IntPtr window, Config config)
+    {
+        // Electron 窗口可先于侧栏用户信息完成渲染。最多等待 15 秒，并以绿色签到卡片出现为准。
+        for (int attempt = 0; attempt < 8; attempt++)
+        {
+            if (IsPersonalCenterReady(window, config)) return true;
+            ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
+            Thread.Sleep(1800);
+            if (IsPersonalCenterReady(window, config)) return true;
+        }
+        return false;
+    }
+
+    private static bool IsPersonalCenterReady(IntPtr window, Config config)
+    {
+        using var bitmap = CaptureWindow(window);
+        if (bitmap is null || config.PersonalCenterCardHeaderX >= bitmap.Width || config.PersonalCenterCardHeaderY >= bitmap.Height) return false;
+        var c = bitmap.GetPixel(config.PersonalCenterCardHeaderX, config.PersonalCenterCardHeaderY);
+        bool ready = c.G >= 145 && c.R <= 100 && c.B >= 90;
+        Log($"个人中心签到卡片: RGB({c.R},{c.G},{c.B})，展开判定: {ready}");
+        return ready;
     }
 
     private static bool LooksMenuClaimButtonEnabled(IntPtr window, Config config)
@@ -400,6 +428,21 @@ internal static class Program
         return 0;
     }
 
+    // 不点击领取，仅验证个人中心入口、领取状态卡片和后台截图。
+    private static int TestPersonalCenter(Config config)
+    {
+        var window = EnsureWorkBuddyWindow(config);
+        if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+        if (!OpenPersonalCenter(window, config)) throw new InvalidOperationException("个人中心未完成加载或未能展开。");
+        using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+        Directory.CreateDirectory(folder);
+        image.Save(Path.Combine(folder, "workbuddy-personal-center-test.png"), ImageFormat.Png);
+        bool claimed = LooksClaimed(window, config);
+        Log($"个人中心测试完成：已领状态={claimed}，未执行领取点击。");
+        return 0;
+    }
+
     private static Bitmap? CaptureWindow(IntPtr hwnd)
     {
         Native.GetWindowRect(hwnd, out var rect);
@@ -487,6 +530,8 @@ internal sealed class Config
     public int PopupHeaderBottomOffset { get; set; } = 220;
     public int PopupClaimX { get; set; } = 77;
     public int PopupClaimBottomOffset { get; set; } = 96;
+    public int PersonalCenterCardHeaderX { get; set; } = 210;
+    public int PersonalCenterCardHeaderY { get; set; } = 445;
 }
 internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 
