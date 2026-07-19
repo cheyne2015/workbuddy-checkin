@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Text.Json;
 using System.Windows.Forms;
 
@@ -26,9 +27,17 @@ internal static class Program
         {
             var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
             var config = LoadConfig();
+            if (command == "--install")
+            {
+                var exitCode = Install(config);
+                _mutex.ReleaseMutex();
+                _mutex = null;
+                var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
+                Process.Start(new ProcessStartInfo(exe, "--daemon") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+                return exitCode;
+            }
             return command switch
             {
-                "--install" => Install(config),
                 "--uninstall" => Uninstall(),
                 "--run-now" => RunOnce(config, notify: true),
                 "--dry-run" => DryRun(config),
@@ -246,16 +255,24 @@ internal static class Program
     private static int Install(Config config)
     {
         var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
-        var args = $"/Create /TN \"{TaskName}\" /TR \"\\\"{exe}\\\" --daemon\" /SC ONLOGON /RL LIMITED /F";
-        RunProcess("schtasks.exe", args);
+        var xmlPath = Path.Combine(Path.GetTempPath(), "workbuddy-auto-claim-task.xml");
+        var escapedExe = SecurityElement.Escape(exe) ?? throw new InvalidOperationException("无法转义程序路径。");
+        var escapedDir = SecurityElement.Escape(BaseDir) ?? throw new InvalidOperationException("无法转义工作目录。");
+        var xml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id=""Author""><RunLevel>LeastPrivilege</RunLevel><LogonType>InteractiveToken</LogonType></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Actions Context=""Author""><Exec><Command>{escapedExe}</Command><Arguments>--daemon</Arguments><WorkingDirectory>{escapedDir}</WorkingDirectory></Exec></Actions>
+</Task>";
+        File.WriteAllText(xmlPath, xml, new System.Text.UnicodeEncoding());
+        try { RunProcess("schtasks.exe", $"/Create /TN \"{TaskName}\" /XML \"{xmlPath}\" /F"); }
+        finally { try { File.Delete(xmlPath); } catch { } }
         // 安装发生在当天领取时间之后时，从下一天开始，避免安装动作立刻打断正在使用的 WorkBuddy。
         if (DateTime.TryParse(config.ClaimTime, out var scheduled) && DateTime.Now.TimeOfDay >= scheduled.TimeOfDay)
             SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
         Log("已安装开机自启任务。\n");
         Notify("WorkBuddy 自动领取", "已启用：每天 00:00 后自动领取。", ToolTipIcon.Info);
-        // 安装器自身持有互斥锁；延迟启动，确保守护进程不会被误判为重复实例。
-        var delayed = $"/c timeout /t 2 /nobreak >nul & start \"\" /b \"{exe}\" --daemon";
-        Process.Start(new ProcessStartInfo("cmd.exe", delayed) { UseShellExecute = false, CreateNoWindow = true });
         return 0;
     }
 
