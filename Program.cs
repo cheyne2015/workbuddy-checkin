@@ -32,6 +32,8 @@ internal static class Program
                 "--uninstall" => Uninstall(),
                 "--run-now" => RunOnce(config, notify: true),
                 "--dry-run" => DryRun(config),
+                "--verify-layout" => VerifyLayout(config),
+                "--test-menu" => TestMenuClick(config),
                 "--self-test" => SelfTest(config),
                 "--daemon" => RunDaemon(config),
                 _ => 2
@@ -168,11 +170,13 @@ internal static class Program
     {
         int height = GetWindowHeight(window);
         if (height <= config.ClaimBottomOffset) return false;
-        Native.GetWindowRect(window, out var rect);
-        var p = new Point(rect.Left + config.ClaimStatusX, rect.Top + height - config.ClaimBottomOffset);
-        using var bitmap = new Bitmap(1, 1, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(p, Point.Empty, new Size(1, 1));
-        var c = bitmap.GetPixel(0, 0);
+        using var bitmap = CaptureWindow(window);
+        if (bitmap is null || config.ClaimStatusX >= bitmap.Width || height - config.ClaimBottomOffset >= bitmap.Height)
+        {
+            Log("无法在后台捕获 WorkBuddy 窗口，拒绝把领取结果判为成功。");
+            return false;
+        }
+        var c = bitmap.GetPixel(config.ClaimStatusX, height - config.ClaimBottomOffset);
         // “今日已领”禁用按钮为低饱和浅灰；未领取按钮是高饱和薄荷绿。
         int max = Math.Max(c.R, Math.Max(c.G, c.B));
         int min = Math.Min(c.R, Math.Min(c.G, c.B));
@@ -222,12 +226,19 @@ internal static class Program
 
     private static bool IsInteractiveDesktop()
     {
-        var desktop = Native.OpenInputDesktop(0, false, Native.DESKTOP_SWITCHDESKTOP | Native.GENERIC_READ);
-        if (desktop == IntPtr.Zero) return false;
+        // GENERIC_READ 会在普通交互桌面上被拒绝；只请求读取桌面名称所需的最小权限。
+        var desktop = Native.OpenInputDesktop(0, false, Native.DESKTOP_SWITCHDESKTOP | Native.DESKTOP_READOBJECTS);
+        if (desktop == IntPtr.Zero)
+        {
+            Log($"无法打开输入桌面，Win32Error={Marshal.GetLastWin32Error()}。");
+            return false;
+        }
         try
         {
             var name = Native.GetDesktopName(desktop);
-            return name.Equals("Default", StringComparison.OrdinalIgnoreCase);
+            bool interactive = name.Equals("Default", StringComparison.OrdinalIgnoreCase);
+            if (!interactive) Log($"当前输入桌面为 {name}，等待解锁。");
+            return interactive;
         }
         finally { Native.CloseDesktop(desktop); }
     }
@@ -261,6 +272,55 @@ internal static class Program
         Log(window == IntPtr.Zero ? "检查结果: WorkBuddy 未运行。" : $"检查结果: 已找到窗口 0x{window.ToInt64():X}，高度 {GetWindowHeight(window)}。");
         Log(File.Exists(config.WorkBuddyPath) ? "程序路径: 正常。" : "程序路径: 不存在。\n");
         return window == IntPtr.Zero ? 1 : 0;
+    }
+
+    private static int VerifyLayout(Config config)
+    {
+        var window = FindWorkBuddyWindow();
+        if (window == IntPtr.Zero) throw new InvalidOperationException("WorkBuddy 未运行，无法验证布局。");
+        using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法在后台捕获 WorkBuddy 窗口。");
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+        Directory.CreateDirectory(folder);
+        var output = Path.Combine(folder, "workbuddy-background-capture.png");
+        image.Save(output, ImageFormat.Png);
+        Log($"后台截图验证成功: {image.Width}x{image.Height}，文件: {output}");
+        return 0;
+    }
+
+    // 仅供校准：点击账户入口、保存菜单截图、再点一次还原；不会领取积分，也不会关闭 WorkBuddy。
+    private static int TestMenuClick(Config config)
+    {
+        var window = EnsureWorkBuddyWindow(config);
+        if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+        ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
+        Thread.Sleep(900);
+        using (var image = CaptureWindow(window) ?? throw new InvalidOperationException("点击后无法捕获 WorkBuddy 窗口。"))
+        {
+            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+            Directory.CreateDirectory(folder);
+            image.Save(Path.Combine(folder, "workbuddy-menu-test.png"), ImageFormat.Png);
+        }
+        ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
+        Log("账户菜单后台点击测试完成，界面已还原，未执行领取。");
+        return 0;
+    }
+
+    private static Bitmap? CaptureWindow(IntPtr hwnd)
+    {
+        Native.GetWindowRect(hwnd, out var rect);
+        int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
+        if (width <= 0 || height <= 0) return null;
+        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(bitmap);
+        var hdc = graphics.GetHdc();
+        try
+        {
+            // PW_RENDERFULLCONTENT 可在窗口被遮挡时请求 Chromium/Electron 绘制自身内容。
+            if (Native.PrintWindow(hwnd, hdc, Native.PW_RENDERFULLCONTENT)) return bitmap;
+        }
+        finally { graphics.ReleaseHdc(hdc); }
+        bitmap.Dispose();
+        return null;
     }
 
     private static int SelfTest(Config config)
@@ -330,7 +390,7 @@ internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 internal static class Native
 {
     internal const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
-    internal const uint DESKTOP_SWITCHDESKTOP = 0x0100, GENERIC_READ = 0x80000000;
+    internal const uint DESKTOP_READOBJECTS = 0x0001, DESKTOP_SWITCHDESKTOP = 0x0100;
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] internal struct POINT { public int X, Y; }
@@ -343,6 +403,7 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
     [DllImport("user32.dll")] internal static extern bool CloseDesktop(IntPtr hDesktop);
     [DllImport("user32.dll", SetLastError = true)] static extern bool GetUserObjectInformation(IntPtr hObj, int index, IntPtr info, uint length, out uint needed);
@@ -355,4 +416,5 @@ internal static class Native
         try { return GetUserObjectInformation(desktop, 2, ptr, needed, out _) ? Marshal.PtrToStringUni(ptr) ?? "" : ""; }
         finally { Marshal.FreeHGlobal(ptr); }
     }
+    internal const uint PW_RENDERFULLCONTENT = 2;
 }
