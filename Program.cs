@@ -92,24 +92,61 @@ internal static class Program
             return 3;
         }
 
+        var originalWindow = FindWorkBuddyWindow();
+        bool wasRunning = originalWindow != IntPtr.Zero;
+        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool launchedByTool = false;
+        IntPtr window = IntPtr.Zero;
         bool succeeded = false;
         string result = "未能确认领取成功";
-        for (int attempt = 1; attempt <= config.MaxAttempts && !succeeded; attempt++)
+        try
         {
-            try
+            window = EnsureWorkBuddyWindow(config, out launchedByTool);
+            if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+            if (launchedByTool)
             {
-                Log($"开始领取，第 {attempt}/{config.MaxAttempts} 次。");
-                var window = EnsureWorkBuddyWindow(config);
-                if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+                // 新启动的 WorkBuddy 不抢占用户前台；后续用窗口消息和后台截图完成领取。
+                Native.ShowWindow(window, Native.SW_MINIMIZE);
+                Log("WorkBuddy 由工具启动，已最小化到后台领取。");
+            }
+            else if (wasForeground)
+            {
+                Log("WorkBuddy 原本在前台，保留前台状态领取。");
+            }
+            else
+            {
+                Log("WorkBuddy 原本在后台，领取后将恢复最小化状态。");
+            }
 
-                succeeded = TryClaimFromPersonalCenter(window, config, out result);
-            }
-            catch (Exception ex)
+            for (int attempt = 1; attempt <= config.MaxAttempts && !succeeded; attempt++)
             {
-                result = ex.Message;
-                Log($"第 {attempt} 次失败: {ex.Message}");
+                try
+                {
+                    Log($"开始领取，第 {attempt}/{config.MaxAttempts} 次。");
+                    succeeded = TryClaimFromPersonalCenter(window, config, out result);
+                }
+                catch (Exception ex)
+                {
+                    result = ex.Message;
+                    Log($"第 {attempt} 次失败: {ex.Message}");
+                }
             }
-            finally { CloseWorkBuddy(); }
+        }
+        finally
+        {
+            if (window != IntPtr.Zero)
+            {
+                if (launchedByTool)
+                {
+                    CloseWorkBuddy();
+                    Log("WorkBuddy 由工具启动，领取流程结束后已关闭。");
+                }
+                else if (!wasForeground)
+                {
+                    Native.ShowWindow(window, Native.SW_MINIMIZE);
+                    Log("WorkBuddy 原本在后台，领取流程结束后已最小化。");
+                }
+            }
         }
 
         if (succeeded)
@@ -127,10 +164,20 @@ internal static class Program
 
     private static IntPtr EnsureWorkBuddyWindow(Config config)
     {
+        return EnsureWorkBuddyWindow(config, out _);
+    }
+
+    private static IntPtr EnsureWorkBuddyWindow(Config config, out bool launchedByTool)
+    {
         var existing = FindWorkBuddyWindow();
-        if (existing != IntPtr.Zero) return existing;
+        if (existing != IntPtr.Zero)
+        {
+            launchedByTool = false;
+            return existing;
+        }
+        launchedByTool = true;
         if (!File.Exists(config.WorkBuddyPath)) throw new FileNotFoundException("找不到 WorkBuddy.exe", config.WorkBuddyPath);
-        Process.Start(new ProcessStartInfo(config.WorkBuddyPath) { UseShellExecute = true });
+        Process.Start(new ProcessStartInfo(config.WorkBuddyPath) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Minimized });
         var until = DateTime.UtcNow.AddSeconds(config.LaunchWaitSeconds);
         while (DateTime.UtcNow < until)
         {
@@ -538,6 +585,7 @@ internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 internal static class Native
 {
     internal const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
+    internal const int SW_MINIMIZE = 6;
     internal const uint DESKTOP_READOBJECTS = 0x0001, DESKTOP_SWITCHDESKTOP = 0x0100;
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int Left, Top, Right, Bottom; }
@@ -545,6 +593,8 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
     [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
