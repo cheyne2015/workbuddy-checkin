@@ -8,5 +8,9 @@
   "ProfileBottomOffset": 35,
   "ClaimClickX": 92,
   "ClaimStatusX": 50,
-  "ClaimBottomOffset": 432
+  "ClaimBottomOffset": 432,
+  "PopupHeaderX": 210,
+  "PopupHeaderBottomOffset": 220,
+  "PopupClaimX": 77,
+  "PopupClaimBottomOffset": 96
 }

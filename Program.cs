@@ -101,28 +101,7 @@ internal static class Program
                 var window = EnsureWorkBuddyWindow(config);
                 if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
 
-                // 已领取按钮为灰色；识别到它即表示今天的任务已经完成。
-                if (LooksClaimed(window, config))
-                {
-                    succeeded = true;
-                    result = "今日已领";
-                    break;
-                }
-
-                ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
-                Thread.Sleep(800);
-
-                if (LooksClaimed(window, config))
-                {
-                    succeeded = true;
-                    result = "今日已领";
-                    break;
-                }
-
-                ClickWindowPoint(window, config.ClaimClickX, GetWindowHeight(window) - config.ClaimBottomOffset);
-                Thread.Sleep(1200);
-                succeeded = LooksClaimed(window, config);
-                result = succeeded ? "领取成功" : "未识别到“今日已领”状态";
+                succeeded = TryClaimFromPersonalCenter(window, config, out result);
             }
             catch (Exception ex)
             {
@@ -195,6 +174,91 @@ internal static class Program
         bool claimed = IsClaimedButtonBackground(samples);
         Log($"状态像素 {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，已领取判定: {claimed}");
         return claimed;
+    }
+
+    private static bool LooksPopupClaimed(IntPtr window, Config config)
+    {
+        return InspectPopupButton(window, config, expectDisabled: true);
+    }
+
+    private static bool TryClaimFromPersonalCenter(IntPtr window, Config config, out string result)
+    {
+        // 用户确认的稳定入口：左下个人中心。这里展示今日领取状态、当期累计积分和主领取按钮。
+        ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
+        Thread.Sleep(1200);
+        if (LooksClaimed(window, config))
+        {
+            // 仅看到“今日已领”并不能证明本工具完成了领取；若用户端积分未到账，
+            // 必须告警而不是写入当天成功记录，防止再次被错误跳过。
+            result = "个人中心显示今日已领，但本次未执行领取点击，按状态冲突处理";
+            return false;
+        }
+        if (!LooksMenuClaimButtonEnabled(window, config))
+        {
+            result = "个人中心未显示可用的立即领取按钮";
+            return false;
+        }
+        ClickWindowPoint(window, config.ClaimClickX, GetWindowHeight(window) - config.ClaimBottomOffset);
+        Thread.Sleep(1500);
+        bool claimed = LooksClaimed(window, config);
+        result = claimed ? "领取成功，个人中心已更新为今日已领" : "点击后个人中心未更新为今日已领";
+        return claimed;
+    }
+
+    private static bool LooksMenuClaimButtonEnabled(IntPtr window, Config config)
+    {
+        int height = GetWindowHeight(window);
+        using var bitmap = CaptureWindow(window);
+        if (bitmap is null || height <= config.ClaimBottomOffset) return false;
+        int y = height - config.ClaimBottomOffset;
+        var samples = new[] { 50, 130 }.Where(x => x < bitmap.Width).Select(x => bitmap.GetPixel(x, y)).ToArray();
+        bool enabled = samples.Length == 2 && samples.All(c =>
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            return max - min <= 18 && max <= 140;
+        });
+        Log($"个人中心领取按钮: {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，可领取判定: {enabled}");
+        return enabled;
+    }
+
+    private static bool TryClaimVisiblePopup(IntPtr window, Config config)
+    {
+        if (!InspectPopupButton(window, config, expectDisabled: false)) return false;
+        ClickWindowPoint(window, config.PopupClaimX, GetWindowHeight(window) - config.PopupClaimBottomOffset);
+        Thread.Sleep(1200);
+        return LooksPopupClaimed(window, config);
+    }
+
+    private static bool InspectPopupButton(IntPtr window, Config config, bool expectDisabled)
+    {
+        int height = GetWindowHeight(window);
+        using var bitmap = CaptureWindow(window);
+        if (bitmap is null || height <= config.PopupHeaderBottomOffset || height <= config.PopupClaimBottomOffset) return false;
+        int headerY = height - config.PopupHeaderBottomOffset;
+        int buttonY = height - config.PopupClaimBottomOffset;
+        if (config.PopupHeaderX >= bitmap.Width || buttonY >= bitmap.Height || headerY >= bitmap.Height) return false;
+        var header = bitmap.GetPixel(config.PopupHeaderX, headerY);
+        bool popupOpen = header.G >= 150 && header.R <= 90 && header.B >= 100;
+        var buttonSamples = new[] { 35, 115 }.Where(x => x < bitmap.Width).Select(x => bitmap.GetPixel(x, buttonY)).ToArray();
+        bool disabled = buttonSamples.Length == 2 && buttonSamples.All(c =>
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            return max - min <= 8 && max >= 230 && max <= 248;
+        });
+        bool enabled = buttonSamples.Length == 2 && buttonSamples.All(c =>
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            // WorkBuddy 5.2.6 的“立即领取”按钮边缘实测为 RGB(121,121,121)。
+            return max - min <= 18 && max <= 140;
+        });
+        // 标题区域会随活动文案和关闭图标变化，不能作为领取按钮的前置条件；
+        // 两个按钮边缘采样点才是稳定且足够窄的实际动作判据。
+        bool matched = expectDisabled ? disabled : enabled;
+        Log($"领取卡片: header=RGB({header.R},{header.G},{header.B}), openHint={popupOpen}, button={string.Join(", ", buttonSamples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}, disabled={disabled}, enabled={enabled}");
+        return matched;
     }
 
     private static bool IsClaimedButtonBackground(IEnumerable<Color> samples)
@@ -419,6 +483,10 @@ internal sealed class Config
     public int ClaimClickX { get; set; } = 92;
     public int ClaimStatusX { get; set; } = 50;
     public int ClaimBottomOffset { get; set; } = 432;
+    public int PopupHeaderX { get; set; } = 210;
+    public int PopupHeaderBottomOffset { get; set; } = 220;
+    public int PopupClaimX { get; set; } = 77;
+    public int PopupClaimBottomOffset { get; set; } = 96;
 }
 internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 
