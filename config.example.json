@@ -1,0 +1,12 @@
+{
+  "WorkBuddyPath": "D:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+  "ClaimTime": "00:00",
+  "CheckIntervalSeconds": 30,
+  "MaxAttempts": 5,
+  "LaunchWaitSeconds": 20,
+  "ProfileX": 44,
+  "ProfileBottomOffset": 35,
+  "ClaimClickX": 92,
+  "ClaimStatusX": 50,
+  "ClaimBottomOffset": 432
+}
