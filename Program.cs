@@ -185,13 +185,27 @@ internal static class Program
             Log("无法在后台捕获 WorkBuddy 窗口，拒绝把领取结果判为成功。");
             return false;
         }
-        var c = bitmap.GetPixel(config.ClaimStatusX, height - config.ClaimBottomOffset);
-        // “今日已领”禁用按钮为低饱和浅灰；未领取按钮是高饱和薄荷绿。
-        int max = Math.Max(c.R, Math.Max(c.G, c.B));
-        int min = Math.Min(c.R, Math.Min(c.G, c.B));
-        bool gray = max - min < 18 && max > 170;
-        Log($"状态像素 RGB({c.R},{c.G},{c.B})，已领取判定: {gray}");
-        return gray;
+        int y = height - config.ClaimBottomOffset;
+        var samples = new[] { config.ClaimStatusX, config.ClaimStatusX + 18, config.ClaimStatusX + 54 }
+            .Where(x => x < bitmap.Width)
+            .Select(x => bitmap.GetPixel(x, y))
+            .ToArray();
+        // 已领取按钮背景在本机为 RGB(242,242,242)。菜单关闭后的背景是纯白(255,255,255)，
+        // 因此必须由三个采样点同时落在窄灰阶范围内，不能只判断“颜色接近灰色”。
+        bool claimed = IsClaimedButtonBackground(samples);
+        Log($"状态像素 {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，已领取判定: {claimed}");
+        return claimed;
+    }
+
+    private static bool IsClaimedButtonBackground(IEnumerable<Color> samples)
+    {
+        var colors = samples.ToArray();
+        return colors.Length == 3 && colors.All(c =>
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            return max - min <= 8 && max >= 230 && max <= 248;
+        });
     }
 
     private static int GetWindowHeight(IntPtr hwnd)
@@ -345,6 +359,10 @@ internal static class Program
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
         if (config.CheckIntervalSeconds < 10) throw new InvalidOperationException("CheckIntervalSeconds 不能小于 10。");
+        if (!IsClaimedButtonBackground(new[] { Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242) }))
+            throw new InvalidOperationException("已领取按钮颜色校验失败。");
+        if (IsClaimedButtonBackground(new[] { Color.White, Color.White, Color.White }))
+            throw new InvalidOperationException("纯白背景不能被判为已领取。");
         Log("Self test OK.");
         return 0;
     }
