@@ -42,6 +42,8 @@ internal static class Program
                 "--run-now" => RunOnce(config, notify: true),
                 "--dry-run" => DryRun(config),
                 "--verify-layout" => VerifyLayout(config),
+                "--verify-card" => VerifyBuddyCard(args.Skip(1).FirstOrDefault()),
+                "--test-buddy-card" => TestBuddyCard(config),
                 "--test-menu" => TestMenuClick(config),
                 "--test-personal-center" => TestPersonalCenter(config),
                 "--self-test" => SelfTest(config),
@@ -132,9 +134,10 @@ internal static class Program
             if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
             if (launchedByTool)
             {
-                // 新启动的 WorkBuddy 不抢占用户前台；后续用窗口消息和后台截图完成领取。
-                Native.ShowWindow(window, Native.SW_MINIMIZE);
-                Log("WorkBuddy 由工具启动，已最小化到后台领取。");
+                // 最小化的 Electron 窗口会返回纯白截图；恢复为无焦点窗口才能读取卡片，
+                // 不激活、不抢前台，完成后仍会自动关闭。
+                Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
+                Log("WorkBuddy 由工具启动，已无焦点恢复以读取领取卡片。");
             }
             else if (wasForeground)
             {
@@ -142,6 +145,7 @@ internal static class Program
             }
             else
             {
+                Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
                 Log("WorkBuddy 原本在后台，领取后将恢复最小化状态。");
             }
 
@@ -215,7 +219,8 @@ internal static class Program
         return IntPtr.Zero;
     }
 
-    // Chromium/Electron 会把内容放在子窗口；向该窗口投递鼠标消息无需激活或显示 WorkBuddy。
+    // Chromium/Electron 会把内容放在子窗口。领取按钮需要完整地处理按下和松开事件，
+    // 因此同步发送到渲染窗口；不移动真实鼠标、不激活 WorkBuddy。
     private static void ClickWindowPoint(IntPtr topWindow, int windowX, int windowY)
     {
         var target = FindChromeChild(topWindow);
@@ -224,9 +229,11 @@ internal static class Program
         var point = new Native.POINT { X = rect.Left + windowX, Y = rect.Top + windowY };
         Native.ScreenToClient(target, ref point);
         var lParam = (IntPtr)((point.Y << 16) | (point.X & 0xffff));
-        Native.PostMessage(target, Native.WM_MOUSEMOVE, IntPtr.Zero, lParam);
-        Native.PostMessage(target, Native.WM_LBUTTONDOWN, (IntPtr)1, lParam);
-        Native.PostMessage(target, Native.WM_LBUTTONUP, IntPtr.Zero, lParam);
+        Native.SendMessage(target, Native.WM_MOUSEMOVE, IntPtr.Zero, lParam);
+        Thread.Sleep(40);
+        Native.SendMessage(target, Native.WM_LBUTTONDOWN, (IntPtr)1, lParam);
+        Thread.Sleep(80);
+        Native.SendMessage(target, Native.WM_LBUTTONUP, IntPtr.Zero, lParam);
     }
 
     private static bool LooksClaimed(IntPtr window, Config config)
@@ -260,29 +267,166 @@ internal static class Program
 
     private static bool TryClaimFromPersonalCenter(IntPtr window, Config config, out string result)
     {
-        // 用户确认的稳定入口：左下个人中心。这里展示今日领取状态、当期累计积分和主领取按钮。
-        if (!OpenPersonalCenter(window, config))
+        // WorkBuddy 5.2.6 已把 Buddy 加油站卡片固定显示在主界面左栏；
+        // 旧版固定个人中心坐标会在不同窗口尺寸下反复开关账户菜单。
+        // 直接从整张窗口截图中寻找绿色卡片，不再点击个人中心入口。
+        if (!TryFindBuddyCard(window, out var card))
         {
-            result = "个人中心未完成加载或未能展开";
+            result = "未识别到 Buddy 加油站领取卡片";
             return false;
         }
-        if (LooksClaimed(window, config))
+        if (LooksBuddyCardClaimed(window, card))
         {
-            // 用户指定个人中心为状态依据：已显示“今日已领”即代表今天无需再次点击，
-            // 写入当天成功记录并发送成功通知，避免重复重试和错误告警。
             result = "WorkBuddy 今日已领取";
             return true;
         }
-        if (!LooksMenuClaimButtonEnabled(window, config))
+        if (!LooksBuddyCardClaimButtonEnabled(window, card))
         {
-            result = "个人中心未显示可用的立即领取按钮";
+            result = "Buddy 加油站未显示可用的立即领取按钮";
             return false;
         }
-        ClickWindowPoint(window, config.ClaimClickX, GetWindowHeight(window) - config.ClaimBottomOffset);
-        Thread.Sleep(1500);
-        bool claimed = LooksClaimed(window, config);
-        result = claimed ? "领取成功，个人中心已更新为今日已领" : "点击后个人中心未更新为今日已领";
+        ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
+        bool claimed = WaitForBuddyCardClaimed(window, TimeSpan.FromSeconds(20));
+        result = claimed ? "领取成功，Buddy 加油站已更新为今日已领" : "点击后 Buddy 加油站未更新为今日已领";
         return claimed;
+    }
+
+    private static bool WaitForBuddyCardClaimed(IntPtr window, TimeSpan timeout)
+    {
+        var until = DateTime.UtcNow.Add(timeout);
+        do
+        {
+            if (TryFindBuddyCard(window, out var updatedCard) && LooksBuddyCardClaimed(window, updatedCard))
+                return true;
+            Thread.Sleep(500);
+        }
+        while (DateTime.UtcNow < until);
+        return false;
+    }
+
+    private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
+    {
+        public int ButtonCenterX => Left + (int)Math.Round(Width * 0.25);
+        public int ButtonCenterY => HeaderTop + (int)Math.Round(Width * 0.64);
+    }
+
+    private static bool TryFindBuddyCard(IntPtr window, out BuddyCard card)
+    {
+        using var bitmap = CaptureWindow(window);
+        if (bitmap is null)
+        {
+            card = default;
+            Log("无法在后台捕获 WorkBuddy 窗口。");
+            return false;
+        }
+        return TryFindBuddyCard(bitmap, out card);
+    }
+
+    private static bool TryFindBuddyCard(Bitmap bitmap, out BuddyCard card)
+    {
+        const int minHeaderWidth = 120;
+        const int maxGap = 12;
+        for (int y = 0; y < bitmap.Height; y += 2)
+        {
+            int start = -1;
+            int lastGreen = -1;
+            for (int x = 0; x < bitmap.Width; x += 2)
+            {
+                if (IsBuddyGreen(bitmap.GetPixel(x, y)))
+                {
+                    if (start < 0) start = x;
+                    lastGreen = x;
+                    continue;
+                }
+
+                if (start >= 0 && x - lastGreen > maxGap)
+                {
+                    if (lastGreen - start >= minHeaderWidth)
+                    {
+                        card = new BuddyCard(start, y, lastGreen - start + 2);
+                        Log($"已识别 Buddy 加油站卡片：x={card.Left}, y={card.HeaderTop}, width={card.Width}。");
+                        return true;
+                    }
+                    start = -1;
+                    lastGreen = -1;
+                }
+            }
+            if (start >= 0 && lastGreen - start >= minHeaderWidth)
+            {
+                card = new BuddyCard(start, y, lastGreen - start + 2);
+                Log($"已识别 Buddy 加油站卡片：x={card.Left}, y={card.HeaderTop}, width={card.Width}。");
+                return true;
+            }
+        }
+        card = default;
+        Log("未在窗口中找到 Buddy 加油站绿色卡片。");
+        return false;
+    }
+
+    private static bool IsBuddyGreen(Color color) =>
+        color.G >= 110 && color.G - color.R >= 40 && color.G - color.B >= 15;
+
+    private static bool LooksBuddyCardClaimed(IntPtr window, BuddyCard card)
+    {
+        using var bitmap = CaptureWindow(window);
+        return bitmap is not null && LooksBuddyCardClaimed(bitmap, card);
+    }
+
+    private static bool LooksBuddyCardClaimed(Bitmap bitmap, BuddyCard card)
+    {
+        if (!TryGetBuddyButtonSamples(bitmap, card, out var samples, out bool darkTheme)) return false;
+        bool claimed = IsClaimedButtonBackground(samples, darkTheme);
+        Log($"Buddy 加油站状态像素 {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，主题={(darkTheme ? "深色" : "浅色")}，已领取判定: {claimed}");
+        return claimed;
+    }
+
+    private static bool LooksBuddyCardClaimButtonEnabled(IntPtr window, BuddyCard card)
+    {
+        using var bitmap = CaptureWindow(window);
+        return bitmap is not null && LooksBuddyCardClaimButtonEnabled(bitmap, card);
+    }
+
+    private static bool LooksBuddyCardClaimButtonEnabled(Bitmap bitmap, BuddyCard card)
+    {
+        if (!TryGetBuddyButtonSamples(bitmap, card, out var samples, out bool darkTheme)) return false;
+        bool enabled = samples.Length == 3 && samples.All(c =>
+        {
+            int max = Math.Max(c.R, Math.Max(c.G, c.B));
+            int min = Math.Min(c.R, Math.Min(c.G, c.B));
+            return max - min <= 18 && (darkTheme ? max >= 210 : max <= 140);
+        });
+        Log($"Buddy 加油站领取按钮: {string.Join(", ", samples.Select(c => $"RGB({c.R},{c.G},{c.B})"))}，主题={(darkTheme ? "深色" : "浅色")}，可领取判定: {enabled}");
+        return enabled;
+    }
+
+    private static bool TryGetBuddyButtonSamples(Bitmap bitmap, BuddyCard card, out Color[] samples, out bool darkTheme)
+    {
+        // 领取按钮的居中文字会改变中心行的少量像素；从按钮上方的纯背景取样。
+        int y = card.ButtonCenterY - Math.Max(6, card.Width / 25);
+        var xs = new[] { 0.08, 0.38, 0.44 }
+            .Select(factor => card.Left + (int)Math.Round(card.Width * factor))
+            .ToArray();
+        if (y < 0 || y >= bitmap.Height || xs.Any(x => x < 0 || x >= bitmap.Width))
+        {
+            samples = Array.Empty<Color>();
+            darkTheme = false;
+            return false;
+        }
+        samples = xs.Select(x => bitmap.GetPixel(x, y)).ToArray();
+        darkTheme = IsDarkBuddyCard(bitmap, card);
+        return true;
+    }
+
+    private static bool IsDarkBuddyCard(Bitmap bitmap, BuddyCard card)
+    {
+        var points = new[] { (0.84, 0.35), (0.84, 0.45), (0.84, 0.50) }
+            .Select(point => (
+                X: card.Left + (int)Math.Round(card.Width * point.Item1),
+                Y: card.HeaderTop + (int)Math.Round(card.Width * point.Item2)))
+            .Where(point => point.X >= 0 && point.X < bitmap.Width && point.Y >= 0 && point.Y < bitmap.Height)
+            .Select(point => bitmap.GetPixel(point.X, point.Y))
+            .ToArray();
+        return points.Length > 0 && points.All(c => Math.Max(c.R, Math.Max(c.G, c.B)) < 100);
     }
 
     private static bool OpenPersonalCenter(IntPtr window, Config config)
@@ -494,6 +638,64 @@ internal static class Program
         return 0;
     }
 
+    // 对保存的 WorkBuddy 截图校验动态卡片定位；不控制 WorkBuddy，也不会领取积分。
+    private static int VerifyBuddyCard(string? imagePath)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+            throw new FileNotFoundException("请提供可读取的 WorkBuddy 截图路径。", imagePath);
+
+        using var bitmap = new Bitmap(imagePath);
+        if (!TryFindBuddyCard(bitmap, out var card))
+            throw new InvalidOperationException("截图中未识别到 Buddy 加油站领取卡片。");
+
+        bool claimed = LooksBuddyCardClaimed(bitmap, card);
+        bool enabled = !claimed && LooksBuddyCardClaimButtonEnabled(bitmap, card);
+        if (!claimed && !enabled)
+            throw new InvalidOperationException("截图中的 Buddy 加油站按钮既非已领取也非可领取。");
+
+        Log($"截图卡片验证通过：x={card.Left}, y={card.HeaderTop}, width={card.Width}，状态={(claimed ? "今日已领" : "可领取")}。");
+        return 0;
+    }
+
+    // 只验证真实窗口中的动态卡片定位和领取状态，保存截图，但绝不点击“立即领取”。
+    private static int TestBuddyCard(Config config)
+    {
+        var originalWindow = FindWorkBuddyWindow();
+        bool wasRunning = originalWindow != IntPtr.Zero;
+        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool launchedByTool = false;
+        IntPtr window = IntPtr.Zero;
+        try
+        {
+            window = EnsureWorkBuddyWindow(config, out launchedByTool);
+            if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+            Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
+            Thread.Sleep(1200);
+
+            if (!TryFindBuddyCard(window, out var card))
+                throw new InvalidOperationException("未识别到 Buddy 加油站领取卡片。");
+            using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获 Buddy 加油站卡片。");
+            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+            Directory.CreateDirectory(folder);
+            image.Save(Path.Combine(folder, "workbuddy-buddy-card-test.png"), ImageFormat.Png);
+
+            bool claimed = LooksBuddyCardClaimed(image, card);
+            bool enabled = !claimed && LooksBuddyCardClaimButtonEnabled(image, card);
+            if (!claimed && !enabled)
+                throw new InvalidOperationException("Buddy 加油站按钮既非已领取也非可领取。");
+            Log($"Buddy 加油站真实窗口测试完成：状态={(claimed ? "今日已领" : "可领取")}，未执行领取点击。");
+            return 0;
+        }
+        finally
+        {
+            if (window != IntPtr.Zero)
+            {
+                if (launchedByTool) CloseWorkBuddy();
+                else if (!wasForeground) Native.ShowWindow(window, Native.SW_MINIMIZE);
+            }
+        }
+    }
+
     // 仅供校准：点击账户入口、保存菜单截图、再点一次还原；不会领取积分，也不会关闭 WorkBuddy。
     private static int TestMenuClick(Config config)
     {
@@ -628,7 +830,7 @@ internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 internal static class Native
 {
     internal const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
-    internal const int SW_MINIMIZE = 6;
+    internal const int SW_SHOWNOACTIVATE = 4, SW_MINIMIZE = 6;
     internal const uint DESKTOP_READOBJECTS = 0x0001, DESKTOP_SWITCHDESKTOP = 0x0100;
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int Left, Top, Right, Bottom; }
@@ -644,6 +846,7 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] internal static extern IntPtr SendMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
     [DllImport("user32.dll")] internal static extern bool CloseDesktop(IntPtr hDesktop);
