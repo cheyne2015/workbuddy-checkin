@@ -6,6 +6,8 @@
 
 所有成功与失败均通过右下角通知提示。领取后 WorkBuddy 会自动退出。日志和当天成功记录位于 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
 
+个人中心显示“今日已领”时，工具会将其视为当天成功并通知“WorkBuddy 今日已领取”，不会再重复点击或发送失败提醒。
+
 `release\config.json` 首次运行时会从 `config.example.json` 创建；其中四个坐标参数用于适配 WorkBuddy 的账户菜单布局。请先运行 `WorkBuddyAutoClaim.exe --dry-run` 检查是否能识别窗口；不要在当天已领的界面上直接运行 `--run-now`。
 
 `RetryIntervalSeconds` 默认是 `60`，只控制到点后的锁屏或失败重试间隔；当天领取成功后不会继续按该间隔轮询。

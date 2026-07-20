@@ -268,10 +268,10 @@ internal static class Program
         }
         if (LooksClaimed(window, config))
         {
-            // 仅看到“今日已领”并不能证明本工具完成了领取；若用户端积分未到账，
-            // 必须告警而不是写入当天成功记录，防止再次被错误跳过。
-            result = "个人中心显示今日已领，但本次未执行领取点击，按状态冲突处理";
-            return false;
+            // 用户指定个人中心为状态依据：已显示“今日已领”即代表今天无需再次点击，
+            // 写入当天成功记录并发送成功通知，避免重复重试和错误告警。
+            result = "WorkBuddy 今日已领取";
+            return true;
         }
         if (!LooksMenuClaimButtonEnabled(window, config))
         {
