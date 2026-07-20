@@ -1,7 +1,7 @@
 {
   "WorkBuddyPath": "D:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
   "ClaimTime": "00:00",
-  "CheckIntervalSeconds": 30,
+  "RetryIntervalSeconds": 60,
   "MaxAttempts": 5,
   "LaunchWaitSeconds": 20,
   "ProfileX": 44,

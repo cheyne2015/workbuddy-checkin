@@ -61,26 +61,53 @@ internal static class Program
     private static int RunDaemon(Config config)
     {
         Log("后台守护已启动，领取时间: " + config.ClaimTime);
+        if (!TimeSpan.TryParse(config.ClaimTime, out var claimTime))
+            throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
+
+        var retryDelay = TimeSpan.FromSeconds(Math.Max(10, config.RetryIntervalSeconds));
         while (true)
         {
             try
             {
+                var now = DateTime.Now;
                 var state = LoadState();
-                if (DateTime.TryParse(config.ClaimTime, out var scheduled) &&
-                    DateTime.Now.TimeOfDay >= scheduled.TimeOfDay && state.SuccessDate != DateOnly.FromDateTime(DateTime.Today))
+                var scheduledToday = now.Date.Add(claimTime);
+                if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    if (IsInteractiveDesktop())
-                    {
-                        RunOnce(config, notify: true);
-                    }
-                    else
-                    {
-                        Log("桌面已锁定；等待解锁后继续领取。");
-                    }
+                    SleepUntil(scheduledToday.AddDays(1), "今天已成功领取");
+                    continue;
+                }
+
+                if (now < scheduledToday)
+                {
+                    SleepUntil(scheduledToday, "尚未到领取时间");
+                    continue;
+                }
+
+                if (!IsInteractiveDesktop())
+                {
+                    Log($"桌面已锁定；将在 {retryDelay.TotalSeconds:0} 秒后重试。");
+                }
+                else if (RunOnce(config, notify: true) != 0)
+                {
+                    Log($"领取未成功；将在 {retryDelay.TotalSeconds:0} 秒后重试。");
                 }
             }
-            catch (Exception ex) { Log("轮询错误: " + ex.Message); }
-            Thread.Sleep(Math.Max(10, config.CheckIntervalSeconds) * 1000);
+            catch (Exception ex) { Log("守护错误: " + ex.Message); }
+            Thread.Sleep(retryDelay);
+        }
+    }
+
+    private static void SleepUntil(DateTime wakeAt, string reason)
+    {
+        while (true)
+        {
+            var remaining = wakeAt - DateTime.Now;
+            if (remaining <= TimeSpan.Zero) return;
+
+            Log($"{reason}；休眠至 {wakeAt:yyyy-MM-dd HH:mm:ss}。");
+            var milliseconds = Math.Min(remaining.TotalMilliseconds, int.MaxValue);
+            Thread.Sleep((int)Math.Ceiling(milliseconds));
         }
     }
 
@@ -522,7 +549,7 @@ internal static class Program
     {
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
-        if (config.CheckIntervalSeconds < 10) throw new InvalidOperationException("CheckIntervalSeconds 不能小于 10。");
+        if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
         if (!IsClaimedButtonBackground(new[] { Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242) }))
             throw new InvalidOperationException("已领取按钮颜色校验失败。");
         if (IsClaimedButtonBackground(new[] { Color.White, Color.White, Color.White }))
@@ -579,7 +606,7 @@ internal sealed class Config
 {
     public string WorkBuddyPath { get; set; } = @"D:\Program Files\WorkBuddy\WorkBuddy.exe";
     public string ClaimTime { get; set; } = "00:00";
-    public int CheckIntervalSeconds { get; set; } = 30;
+    public int RetryIntervalSeconds { get; set; } = 60;
     public int MaxAttempts { get; set; } = 5;
     public int LaunchWaitSeconds { get; set; } = 20;
     public int ProfileX { get; set; } = 44;
