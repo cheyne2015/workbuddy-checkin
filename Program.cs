@@ -290,14 +290,16 @@ internal static class Program
             result = "Buddy 加油站未显示可用的立即领取按钮";
             return false;
         }
+        SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
         bool claimed = WaitForBuddyCardClaimed(window, config, TimeSpan.FromSeconds(20));
+        SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
         result = claimed ? "领取成功，Buddy 加油站已更新为今日已领" : "点击后 Buddy 加油站未更新为今日已领";
         return claimed;
     }
 
-    // WorkBuddy 5.2.7 将 Buddy 加油站从主界面移入左下角个人菜单。旧版本卡片仍可能
-    // 直接显示在侧栏，因此先直接识别，找不到时才打开菜单，避免无意义地反复开关菜单。
+    // Buddy 加油站可能直接显示在侧栏，也可能仅在左下个人菜单中显示；先直接识别，
+    // 找不到时才打开菜单，避免无意义地反复开关菜单。
     private static bool TryFindOrOpenBuddyCard(IntPtr window, Config config, out BuddyCard card)
     {
         if (TryFindBuddyCard(window, out card)) return true;
@@ -349,6 +351,19 @@ internal static class Program
         }
         while (DateTime.UtcNow < until);
         return false;
+    }
+
+    // 领取是不可逆操作。保留最近一次点击前后的窗口截图，便于区分“未点到”、
+    // “页面过渡中”与“点击后未更新”，而不把之后的状态倒推为本次点击成功。
+    private static void SaveBuddyDiagnosticCapture(IntPtr window, string phase)
+    {
+        using var image = CaptureWindow(window);
+        if (image is null) return;
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+        Directory.CreateDirectory(folder);
+        var output = Path.Combine(folder, $"workbuddy-{phase}.png");
+        image.Save(output, ImageFormat.Png);
+        Log($"领取诊断截图已保存: {output}");
     }
 
     private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
