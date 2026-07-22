@@ -229,11 +229,16 @@ internal static class Program
         var point = new Native.POINT { X = rect.Left + windowX, Y = rect.Top + windowY };
         Native.ScreenToClient(target, ref point);
         var lParam = (IntPtr)((point.Y << 16) | (point.X & 0xffff));
-        Native.SendMessage(target, Native.WM_MOUSEMOVE, IntPtr.Zero, lParam);
+        Native.SendMessageTimeout(target, Native.WM_MOUSEMOVE, IntPtr.Zero, lParam,
+            Native.SMTO_ABORTIFHUNG | Native.SMTO_BLOCK, Native.ClickMessageTimeoutMilliseconds, out _);
         Thread.Sleep(40);
-        Native.SendMessage(target, Native.WM_LBUTTONDOWN, (IntPtr)1, lParam);
+        if (Native.SendMessageTimeout(target, Native.WM_LBUTTONDOWN, (IntPtr)1, lParam,
+                Native.SMTO_ABORTIFHUNG | Native.SMTO_BLOCK, Native.ClickMessageTimeoutMilliseconds, out _) == IntPtr.Zero)
+            throw new InvalidOperationException("向 WorkBuddy 发送鼠标按下事件超时。");
         Thread.Sleep(80);
-        Native.SendMessage(target, Native.WM_LBUTTONUP, IntPtr.Zero, lParam);
+        if (Native.SendMessageTimeout(target, Native.WM_LBUTTONUP, IntPtr.Zero, lParam,
+                Native.SMTO_ABORTIFHUNG | Native.SMTO_BLOCK, Native.ClickMessageTimeoutMilliseconds, out _) == IntPtr.Zero)
+            throw new InvalidOperationException("向 WorkBuddy 发送鼠标松开事件超时。");
     }
 
     private static bool LooksClaimed(IntPtr window, Config config)
@@ -270,7 +275,7 @@ internal static class Program
         // WorkBuddy 5.2.6 已把 Buddy 加油站卡片固定显示在主界面左栏；
         // 旧版固定个人中心坐标会在不同窗口尺寸下反复开关账户菜单。
         // 直接从整张窗口截图中寻找绿色卡片，不再点击个人中心入口。
-        if (!TryFindBuddyCard(window, out var card))
+        if (!TryFindOrOpenBuddyCard(window, config, out var card))
         {
             result = "未识别到 Buddy 加油站领取卡片";
             return false;
@@ -286,18 +291,60 @@ internal static class Program
             return false;
         }
         ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
-        bool claimed = WaitForBuddyCardClaimed(window, TimeSpan.FromSeconds(20));
+        bool claimed = WaitForBuddyCardClaimed(window, config, TimeSpan.FromSeconds(20));
         result = claimed ? "领取成功，Buddy 加油站已更新为今日已领" : "点击后 Buddy 加油站未更新为今日已领";
         return claimed;
     }
 
-    private static bool WaitForBuddyCardClaimed(IntPtr window, TimeSpan timeout)
+    // WorkBuddy 5.2.7 将 Buddy 加油站从主界面移入左下角个人菜单。旧版本卡片仍可能
+    // 直接显示在侧栏，因此先直接识别，找不到时才打开菜单，避免无意义地反复开关菜单。
+    private static bool TryFindOrOpenBuddyCard(IntPtr window, Config config, out BuddyCard card)
     {
-        var until = DateTime.UtcNow.Add(timeout);
+        if (TryFindBuddyCard(window, out card)) return true;
+
+        int windowHeight = GetWindowHeight(window);
+        if (windowHeight <= config.ProfileBottomOffset)
+        {
+            card = default;
+            return false;
+        }
+
+        Log("主界面未显示 Buddy 加油站；打开左下个人菜单后等待卡片加载。");
+        ClickWindowPoint(window, config.ProfileX, windowHeight - config.ProfileBottomOffset);
+        var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
         do
         {
-            if (TryFindBuddyCard(window, out var updatedCard) && LooksBuddyCardClaimed(window, updatedCard))
-                return true;
+            if (TryFindBuddyCard(window, out card, logMissing: false)) return true;
+            Thread.Sleep(500);
+        }
+        while (DateTime.UtcNow < until);
+
+        card = default;
+        Log("打开个人菜单后仍未识别到 Buddy 加油站卡片。");
+        return false;
+    }
+
+    private static bool WaitForBuddyCardClaimed(IntPtr window, Config config, TimeSpan timeout)
+    {
+        var until = DateTime.UtcNow.Add(timeout);
+        var reopenMenuAfter = DateTime.UtcNow.AddSeconds(2);
+        bool reopenedMenu = false;
+        do
+        {
+            if (TryFindBuddyCard(window, out var updatedCard, logMissing: false))
+            {
+                if (LooksBuddyCardClaimed(window, updatedCard)) return true;
+            }
+            else if (!reopenedMenu && DateTime.UtcNow >= reopenMenuAfter)
+            {
+                int windowHeight = GetWindowHeight(window);
+                if (windowHeight > config.ProfileBottomOffset)
+                {
+                    Log("领取后卡片暂时隐藏；重新打开左下个人菜单核验领取结果。");
+                    ClickWindowPoint(window, config.ProfileX, windowHeight - config.ProfileBottomOffset);
+                    reopenedMenu = true;
+                }
+            }
             Thread.Sleep(500);
         }
         while (DateTime.UtcNow < until);
@@ -310,7 +357,7 @@ internal static class Program
         public int ButtonCenterY => HeaderTop + (int)Math.Round(Width * 0.64);
     }
 
-    private static bool TryFindBuddyCard(IntPtr window, out BuddyCard card)
+    private static bool TryFindBuddyCard(IntPtr window, out BuddyCard card, bool logMissing = true)
     {
         using var bitmap = CaptureWindow(window);
         if (bitmap is null)
@@ -319,10 +366,10 @@ internal static class Program
             Log("无法在后台捕获 WorkBuddy 窗口。");
             return false;
         }
-        return TryFindBuddyCard(bitmap, out card);
+        return TryFindBuddyCard(bitmap, out card, logMissing);
     }
 
-    private static bool TryFindBuddyCard(Bitmap bitmap, out BuddyCard card)
+    private static bool TryFindBuddyCard(Bitmap bitmap, out BuddyCard card, bool logMissing = true)
     {
         const int minHeaderWidth = 120;
         const int maxGap = 12;
@@ -359,7 +406,7 @@ internal static class Program
             }
         }
         card = default;
-        Log("未在窗口中找到 Buddy 加油站绿色卡片。");
+        if (logMissing) Log("未在窗口中找到 Buddy 加油站绿色卡片。");
         return false;
     }
 
@@ -672,7 +719,7 @@ internal static class Program
             Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
             Thread.Sleep(1200);
 
-            if (!TryFindBuddyCard(window, out var card))
+            if (!TryFindOrOpenBuddyCard(window, config, out var card))
                 throw new InvalidOperationException("未识别到 Buddy 加油站领取卡片。");
             using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获 Buddy 加油站卡片。");
             var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
@@ -811,6 +858,7 @@ internal sealed class Config
     public int RetryIntervalSeconds { get; set; } = 60;
     public int MaxAttempts { get; set; } = 5;
     public int LaunchWaitSeconds { get; set; } = 20;
+    public int CardReadyTimeoutSeconds { get; set; } = 30;
     public int ProfileX { get; set; } = 44;
     public int ProfileBottomOffset { get; set; } = 35;
     public int ClaimClickX { get; set; } = 92;
@@ -830,6 +878,8 @@ internal sealed class State { public DateOnly? SuccessDate { get; set; } }
 internal static class Native
 {
     internal const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
+    internal const uint SMTO_BLOCK = 0x0001, SMTO_ABORTIFHUNG = 0x0002;
+    internal const uint ClickMessageTimeoutMilliseconds = 2_000;
     internal const int SW_SHOWNOACTIVATE = 4, SW_MINIMIZE = 6;
     internal const uint DESKTOP_READOBJECTS = 0x0001, DESKTOP_SWITCHDESKTOP = 0x0100;
     internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
@@ -847,6 +897,8 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern IntPtr SendMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr SendMessageTimeout(
+        IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeoutMilliseconds, out IntPtr result);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
     [DllImport("user32.dll")] internal static extern bool CloseDesktop(IntPtr hDesktop);

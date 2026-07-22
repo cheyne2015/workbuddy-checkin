@@ -4,6 +4,7 @@
   "RetryIntervalSeconds": 60,
   "MaxAttempts": 5,
   "LaunchWaitSeconds": 20,
+  "CardReadyTimeoutSeconds": 30,
   "ProfileX": 44,
   "ProfileBottomOffset": 35,
   "ClaimClickX": 92,

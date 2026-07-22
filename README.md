@@ -4,9 +4,9 @@
 2. 双击 `install.cmd`，工具会创建当前用户的登录自启任务，并立即开始后台守护。
 3. 默认每天 00:00 后领取；未到时间和当天领取成功后都会休眠至下一个领取时间。只有到点后的锁屏或领取失败，才会每 60 秒重试；睡眠或锁屏期间不操作，解锁/恢复后自动继续。
 
-所有成功与失败均通过右下角通知提示。领取后 WorkBuddy 会自动退出。日志和当天成功记录位于 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
+所有成功与失败均通过右下角通知提示。由工具启动的 WorkBuddy 会在流程结束后自动退出；原本在前台的窗口保持前台，原本在后台的窗口会恢复最小化。日志和当天成功记录位于 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
 
-工具会在整个 WorkBuddy 窗口中动态定位绿色的“Buddy 加油站”卡片，直接识别“立即领取”或“今日已领”；不会再通过反复开关左下个人中心来寻找按钮。显示“今日已领”时，会将其视为当天成功并通知“WorkBuddy 今日已领取”。
+工具会先动态定位绿色的“Buddy 加油站”卡片；若新版 WorkBuddy 未在主界面显示卡片，会只打开一次左下个人菜单并等待卡片加载。点击后若卡片暂时隐藏，工具会重新打开菜单核验“今日已领”。显示“今日已领”时会视为当天成功，不会再次点击领取。
 
 `release\config.json` 首次运行时会从 `config.example.json` 创建；领取卡片使用动态定位，不依赖固定的屏幕分辨率或窗口尺寸。请先运行 `WorkBuddyAutoClaim.exe --dry-run` 检查是否能识别窗口。
 
@@ -18,7 +18,7 @@
 
 `WorkBuddyAutoClaim.exe --verify-layout` 不会点击、不领取，只会使用 `PrintWindow` 在窗口被其他应用遮挡时抓取 WorkBuddy 内容，输出到 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-background-capture.png`。只有这项验证通过，后台领取的状态识别才会启用。
 
-`WorkBuddyAutoClaim.exe --test-buddy-card` 会读取真实 WorkBuddy 窗口、识别 Buddy 加油站卡片并保存 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-buddy-card-test.png`；不点击“立即领取”。
+`WorkBuddyAutoClaim.exe --test-buddy-card` 会读取真实 WorkBuddy 窗口；若需要会打开左下个人菜单，识别 Buddy 加油站卡片并保存 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-buddy-card-test.png`；不点击“立即领取”。
 
 `WorkBuddyAutoClaim.exe --verify-card <截图路径>` 只校验保存的截图是否能识别领取卡片和“可领取/今日已领”状态；不启动或控制 WorkBuddy。
 
