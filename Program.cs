@@ -275,7 +275,7 @@ internal static class Program
         // WorkBuddy 5.2.6 已把 Buddy 加油站卡片固定显示在主界面左栏；
         // 旧版固定个人中心坐标会在不同窗口尺寸下反复开关账户菜单。
         // 直接从整张窗口截图中寻找绿色卡片，不再点击个人中心入口。
-        if (!TryFindOrOpenBuddyCard(window, config, out var card))
+        if (!TryFindBuddyCardInPersonalMenu(window, config, out var card))
         {
             result = "未识别到 Buddy 加油站领取卡片";
             return false;
@@ -290,33 +290,40 @@ internal static class Program
             result = "Buddy 加油站未显示可用的立即领取按钮";
             return false;
         }
+        var pointsBefore = CapturePointsBalance(window, card);
         SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
-        bool claimed = WaitForBuddyCardClaimed(window, config, TimeSpan.FromSeconds(20));
+        var verification = WaitForBuddyCardClaimed(window, config, pointsBefore, TimeSpan.FromSeconds(20));
+        bool claimed = verification != ClaimVerification.NotConfirmed;
         SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
-        result = claimed ? "领取成功，Buddy 加油站已更新为今日已领" : "点击后 Buddy 加油站未更新为今日已领";
+        result = verification switch
+        {
+            ClaimVerification.ClaimedButton => "领取成功，Buddy 加油站已更新为今日已领",
+            ClaimVerification.PointsBalanceChanged => "领取成功，Buddy 加油站积分余额已更新",
+            _ => "点击后 Buddy 加油站未更新为今日已领，积分余额也未变化"
+        };
         return claimed;
     }
 
-    // Buddy 加油站可能直接显示在侧栏，也可能仅在左下个人菜单中显示；先直接识别，
-    // 找不到时才打开菜单，避免无意义地反复开关菜单。
-    private static bool TryFindOrOpenBuddyCard(IntPtr window, Config config, out BuddyCard card)
+    // 领取统一从左下个人菜单进行。主界面检查只用于避免菜单已经打开时被再次点击关闭，
+    // 领取按钮、今日已领状态和积分余额均必须来自菜单内的 Buddy 加油站卡片。
+    private static bool TryFindBuddyCardInPersonalMenu(IntPtr window, Config config, out BuddyCard card)
     {
-        if (TryFindBuddyCard(window, out card)) return true;
-
         int windowHeight = GetWindowHeight(window);
+        if (TryFindBuddyCard(window, out card) && IsPersonalMenuCard(card, windowHeight)) return true;
+
         if (windowHeight <= config.ProfileBottomOffset)
         {
             card = default;
             return false;
         }
 
-        Log("主界面未显示 Buddy 加油站；打开左下个人菜单后等待卡片加载。");
+        Log("打开左下个人菜单后等待 Buddy 加油站卡片加载。");
         ClickWindowPoint(window, config.ProfileX, windowHeight - config.ProfileBottomOffset);
         var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
         do
         {
-            if (TryFindBuddyCard(window, out card, logMissing: false)) return true;
+            if (TryFindBuddyCard(window, out card, logMissing: false) && IsPersonalMenuCard(card, windowHeight)) return true;
             Thread.Sleep(500);
         }
         while (DateTime.UtcNow < until);
@@ -326,31 +333,37 @@ internal static class Program
         return false;
     }
 
-    private static bool WaitForBuddyCardClaimed(IntPtr window, Config config, TimeSpan timeout)
+    private static ClaimVerification WaitForBuddyCardClaimed(
+        IntPtr window, Config config, PointsBalance? pointsBefore, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
         var reopenMenuAfter = DateTime.UtcNow.AddSeconds(2);
         bool reopenedMenu = false;
         do
         {
-            if (TryFindBuddyCard(window, out var updatedCard, logMissing: false))
+            int windowHeight = GetWindowHeight(window);
+            if (TryFindBuddyCard(window, out var updatedCard, logMissing: false) && IsPersonalMenuCard(updatedCard, windowHeight))
             {
-                if (LooksBuddyCardClaimed(window, updatedCard)) return true;
+                if (LooksBuddyCardClaimed(window, updatedCard)) return ClaimVerification.ClaimedButton;
+                if (HasPointsBalanceChanged(pointsBefore, CapturePointsBalance(window, updatedCard)))
+                {
+                    Log("Buddy 加油站积分余额显示区域已变化，判定本次领取成功。");
+                    return ClaimVerification.PointsBalanceChanged;
+                }
             }
             else if (!reopenedMenu && DateTime.UtcNow >= reopenMenuAfter)
             {
-                int windowHeight = GetWindowHeight(window);
                 if (windowHeight > config.ProfileBottomOffset)
                 {
                     Log("领取后卡片暂时隐藏；重新打开左下个人菜单核验领取结果。");
-                    ClickWindowPoint(window, config.ProfileX, windowHeight - config.ProfileBottomOffset);
+                    TryFindBuddyCardInPersonalMenu(window, config, out _);
                     reopenedMenu = true;
                 }
             }
             Thread.Sleep(500);
         }
         while (DateTime.UtcNow < until);
-        return false;
+        return ClaimVerification.NotConfirmed;
     }
 
     // 领取是不可逆操作。保留最近一次点击前后的窗口截图，便于区分“未点到”、
@@ -366,10 +379,51 @@ internal static class Program
         Log($"领取诊断截图已保存: {output}");
     }
 
+    private enum ClaimVerification { NotConfirmed, ClaimedButton, PointsBalanceChanged }
+
     private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
     {
         public int ButtonCenterX => Left + (int)Math.Round(Width * 0.25);
         public int ButtonCenterY => HeaderTop + (int)Math.Round(Width * 0.64);
+    }
+
+    private sealed record PointsBalance(Color[] Pixels);
+
+    private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
+        windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
+
+    private static PointsBalance? CapturePointsBalance(IntPtr window, BuddyCard card)
+    {
+        using var bitmap = CaptureWindow(window);
+        return bitmap is null ? null : CapturePointsBalance(bitmap, card);
+    }
+
+    private static PointsBalance? CapturePointsBalance(Bitmap bitmap, BuddyCard card)
+    {
+        int left = Math.Max(0, card.Left);
+        int right = Math.Min(bitmap.Width, card.Left + card.Width + 8);
+        int top = Math.Max(0, card.HeaderTop + (int)Math.Round(card.Width * 0.82));
+        int bottom = Math.Min(bitmap.Height, card.HeaderTop + (int)Math.Round(card.Width * 1.05));
+        if (right <= left || bottom <= top) return null;
+
+        var pixels = new Color[(right - left) * (bottom - top)];
+        int index = 0;
+        for (int y = top; y < bottom; y++)
+        for (int x = left; x < right; x++) pixels[index++] = bitmap.GetPixel(x, y);
+        return new PointsBalance(pixels);
+    }
+
+    private static bool HasPointsBalanceChanged(PointsBalance? before, PointsBalance? after)
+    {
+        if (before is null || after is null || before.Pixels.Length != after.Pixels.Length) return false;
+        int changed = 0;
+        for (int index = 0; index < before.Pixels.Length; index++)
+        {
+            var a = before.Pixels[index];
+            var b = after.Pixels[index];
+            if (Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B) >= 30) changed++;
+        }
+        return changed >= 16;
     }
 
     private static bool TryFindBuddyCard(IntPtr window, out BuddyCard card, bool logMissing = true)
@@ -734,7 +788,7 @@ internal static class Program
             Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
             Thread.Sleep(1200);
 
-            if (!TryFindOrOpenBuddyCard(window, config, out var card))
+            if (!TryFindBuddyCardInPersonalMenu(window, config, out var card))
                 throw new InvalidOperationException("未识别到 Buddy 加油站领取卡片。");
             using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获 Buddy 加油站卡片。");
             var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
@@ -822,6 +876,13 @@ internal static class Program
             throw new InvalidOperationException("深色模式已领取按钮颜色校验失败。");
         if (IsClaimedButtonBackground(new[] { Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233) }, darkTheme: true))
             throw new InvalidOperationException("深色模式可领取按钮不能被判为已领取。");
+        if (!IsPersonalMenuCard(new BuddyCard(34, 180, 216), 600) || IsPersonalMenuCard(new BuddyCard(22, 366, 218), 600))
+            throw new InvalidOperationException("个人菜单卡片位置路由校验失败。");
+        var unchangedPoints = new PointsBalance(Enumerable.Repeat(Color.FromArgb(242, 242, 242), 16).ToArray());
+        var changedPoints = new PointsBalance(Enumerable.Repeat(Color.FromArgb(120, 120, 120), 16).ToArray());
+        if (HasPointsBalanceChanged(unchangedPoints, new PointsBalance(unchangedPoints.Pixels.ToArray())) ||
+            !HasPointsBalanceChanged(unchangedPoints, changedPoints))
+            throw new InvalidOperationException("积分余额变化校验失败。");
         Log("Self test OK.");
         return 0;
     }
