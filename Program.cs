@@ -272,9 +272,7 @@ internal static class Program
 
     private static bool TryClaimFromPersonalCenter(IntPtr window, Config config, out string result)
     {
-        // WorkBuddy 5.2.6 已把 Buddy 加油站卡片固定显示在主界面左栏；
-        // 旧版固定个人中心坐标会在不同窗口尺寸下反复开关账户菜单。
-        // 直接从整张窗口截图中寻找绿色卡片，不再点击个人中心入口。
+        // 领取按钮、领取结果和诊断截图都以左下个人菜单内的 Buddy 加油站为准。
         if (!TryFindBuddyCardInPersonalMenu(window, config, out var card))
         {
             result = "未识别到 Buddy 加油站领取卡片";
@@ -290,17 +288,15 @@ internal static class Program
             result = "Buddy 加油站未显示可用的立即领取按钮";
             return false;
         }
-        var pointsBefore = CapturePointsBalance(window, card);
         SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
-        var verification = WaitForBuddyCardClaimed(window, config, pointsBefore, TimeSpan.FromSeconds(20));
+        var verification = WaitForBuddyCardClaimed(window, config, TimeSpan.FromSeconds(20));
         bool claimed = verification != ClaimVerification.NotConfirmed;
         SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
         result = verification switch
         {
-            ClaimVerification.ClaimedButton => "领取成功，Buddy 加油站已更新为今日已领",
-            ClaimVerification.PointsBalanceChanged => "领取成功，Buddy 加油站积分余额已更新",
-            _ => "点击后 Buddy 加油站未更新为今日已领，积分余额也未变化"
+            ClaimVerification.ClaimedButton => "领取成功，Buddy 加油站已更新为今日已领或 +100",
+            _ => "点击后 Buddy 加油站未更新为今日已领或 +100"
         };
         return claimed;
     }
@@ -333,8 +329,7 @@ internal static class Program
         return false;
     }
 
-    private static ClaimVerification WaitForBuddyCardClaimed(
-        IntPtr window, Config config, PointsBalance? pointsBefore, TimeSpan timeout)
+    private static ClaimVerification WaitForBuddyCardClaimed(IntPtr window, Config config, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
         var reopenMenuAfter = DateTime.UtcNow.AddSeconds(2);
@@ -345,11 +340,6 @@ internal static class Program
             if (TryFindBuddyCard(window, out var updatedCard, logMissing: false) && IsPersonalMenuCard(updatedCard, windowHeight))
             {
                 if (LooksBuddyCardClaimed(window, updatedCard)) return ClaimVerification.ClaimedButton;
-                if (HasPointsBalanceChanged(pointsBefore, CapturePointsBalance(window, updatedCard)))
-                {
-                    Log("Buddy 加油站积分余额显示区域已变化，判定本次领取成功。");
-                    return ClaimVerification.PointsBalanceChanged;
-                }
             }
             else if (!reopenedMenu && DateTime.UtcNow >= reopenMenuAfter)
             {
@@ -379,7 +369,7 @@ internal static class Program
         Log($"领取诊断截图已保存: {output}");
     }
 
-    private enum ClaimVerification { NotConfirmed, ClaimedButton, PointsBalanceChanged }
+    private enum ClaimVerification { NotConfirmed, ClaimedButton }
 
     private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
     {
@@ -387,44 +377,8 @@ internal static class Program
         public int ButtonCenterY => HeaderTop + (int)Math.Round(Width * 0.64);
     }
 
-    private sealed record PointsBalance(Color[] Pixels);
-
     private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
         windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
-
-    private static PointsBalance? CapturePointsBalance(IntPtr window, BuddyCard card)
-    {
-        using var bitmap = CaptureWindow(window);
-        return bitmap is null ? null : CapturePointsBalance(bitmap, card);
-    }
-
-    private static PointsBalance? CapturePointsBalance(Bitmap bitmap, BuddyCard card)
-    {
-        int left = Math.Max(0, card.Left);
-        int right = Math.Min(bitmap.Width, card.Left + card.Width + 8);
-        int top = Math.Max(0, card.HeaderTop + (int)Math.Round(card.Width * 0.82));
-        int bottom = Math.Min(bitmap.Height, card.HeaderTop + (int)Math.Round(card.Width * 1.05));
-        if (right <= left || bottom <= top) return null;
-
-        var pixels = new Color[(right - left) * (bottom - top)];
-        int index = 0;
-        for (int y = top; y < bottom; y++)
-        for (int x = left; x < right; x++) pixels[index++] = bitmap.GetPixel(x, y);
-        return new PointsBalance(pixels);
-    }
-
-    private static bool HasPointsBalanceChanged(PointsBalance? before, PointsBalance? after)
-    {
-        if (before is null || after is null || before.Pixels.Length != after.Pixels.Length) return false;
-        int changed = 0;
-        for (int index = 0; index < before.Pixels.Length; index++)
-        {
-            var a = before.Pixels[index];
-            var b = after.Pixels[index];
-            if (Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B) >= 30) changed++;
-        }
-        return changed >= 16;
-    }
 
     private static bool TryFindBuddyCard(IntPtr window, out BuddyCard card, bool logMissing = true)
     {
@@ -628,14 +582,19 @@ internal static class Program
     private static bool IsClaimedButtonBackground(IEnumerable<Color> samples, bool darkTheme = false)
     {
         var colors = samples.ToArray();
-        return colors.Length == 3 && colors.All(c =>
+        if (colors.Length != 3) return false;
+        return colors.All(c =>
         {
             int max = Math.Max(c.R, Math.Max(c.G, c.B));
             int min = Math.Min(c.R, Math.Min(c.G, c.B));
             // 浅色已领按钮约 RGB(242,242,242)；深色已领按钮约 RGB(47,47,47)。
             return max - min <= 8 && (darkTheme ? max >= 38 && max <= 72 : max >= 230 && max <= 248);
-        });
+        }) || colors.All(IsClaimRewardGreen);
     }
+
+    // 2026-07-23 实际领取成功后，WorkBuddy 将按钮改为绿色“+100 ✓”，而非“今日已领”灰色按钮。
+    private static bool IsClaimRewardGreen(Color color) =>
+        color.G >= 125 && color.R <= 80 && color.B <= 170 && color.G - color.R >= 60 && color.G - color.B >= 20;
 
     private static bool IsDarkPersonalCenter(Bitmap bitmap, Config config)
     {
@@ -876,13 +835,10 @@ internal static class Program
             throw new InvalidOperationException("深色模式已领取按钮颜色校验失败。");
         if (IsClaimedButtonBackground(new[] { Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233), Color.FromArgb(233, 233, 233) }, darkTheme: true))
             throw new InvalidOperationException("深色模式可领取按钮不能被判为已领取。");
+        if (!IsClaimedButtonBackground(new[] { Color.FromArgb(16, 163, 127), Color.FromArgb(16, 163, 127), Color.FromArgb(16, 163, 127) }))
+            throw new InvalidOperationException("+100 领取成功按钮颜色校验失败。");
         if (!IsPersonalMenuCard(new BuddyCard(34, 180, 216), 600) || IsPersonalMenuCard(new BuddyCard(22, 366, 218), 600))
             throw new InvalidOperationException("个人菜单卡片位置路由校验失败。");
-        var unchangedPoints = new PointsBalance(Enumerable.Repeat(Color.FromArgb(242, 242, 242), 16).ToArray());
-        var changedPoints = new PointsBalance(Enumerable.Repeat(Color.FromArgb(120, 120, 120), 16).ToArray());
-        if (HasPointsBalanceChanged(unchangedPoints, new PointsBalance(unchangedPoints.Pixels.ToArray())) ||
-            !HasPointsBalanceChanged(unchangedPoints, changedPoints))
-            throw new InvalidOperationException("积分余额变化校验失败。");
         Log("Self test OK.");
         return 0;
     }
