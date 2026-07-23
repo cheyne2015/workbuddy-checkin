@@ -5,6 +5,7 @@
   "MaxAttempts": 5,
   "LaunchWaitSeconds": 20,
   "CardReadyTimeoutSeconds": 30,
+  "ClaimActionKeywords": ["签到领积分", "立即领取", "去签到", "签到", "领积分", "领取", "体验"],
   "ProfileX": 44,
   "ProfileBottomOffset": 35,
   "ClaimClickX": 92,

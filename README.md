@@ -1,27 +1,44 @@
 # WorkBuddy 自动领取
 
-1. 运行 `build.ps1` 生成 `release\WorkBuddyAutoClaim.exe`。
-2. 双击 `install.cmd`，工具会创建当前用户的登录自启任务，并立即开始后台守护。
-3. 默认每天 00:00 后领取；未到时间和当天领取成功后都会休眠至下一个领取时间。只有到点后的锁屏或领取失败，才会每 60 秒重试；睡眠或锁屏期间不操作，解锁/恢复后自动继续。
+运行 `build.ps1` 生成 `release\WorkBuddyAutoClaim.exe`，再双击 `install.cmd`。它会为当前用户创建登录自启动任务并立即启动后台守护进程；默认每天 `00:00` 执行一次。
 
-所有成功与失败均通过右下角通知提示。由工具启动的 WorkBuddy 会在流程结束后自动退出；原本在前台的窗口保持前台，原本在后台的窗口会恢复最小化。日志和当天成功记录位于 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
+当天确认成功后，进程会休眠到下一个 `00:00`，不会继续轮询。只有到点后遇到锁屏、睡眠或领取失败，才每 60 秒重新尝试。每轮领取最多连续执行 5 次；成功和五次失败都通过右下角通知提示。
 
-工具统一通过左下个人菜单内的“Buddy 加油站”领取。点击后若卡片暂时隐藏，工具会重新打开菜单核验成功状态：旧界面为“今日已领”，当前界面为绿色“+100 ✓”。积分余额会保留在诊断截图中供人工复核，但不作为自动成功条件。每次实际点击都会在日志目录保存点击前后的窗口截图，便于排查失败。
+## 领取策略
 
-`release\config.json` 首次运行时会从 `config.example.json` 创建；领取卡片使用动态定位，不依赖固定的屏幕分辨率或窗口尺寸。请先运行 `WorkBuddyAutoClaim.exe --dry-run` 检查是否能识别窗口。
+正常领取不再依赖 Buddy 加油站的绿色卡片、按钮颜色或固定按钮坐标：
 
-`RetryIntervalSeconds` 默认是 `60`，只控制到点后的锁屏或失败重试间隔；当天领取成功后不会继续按该间隔轮询。
+1. 以配置中的左下个人中心入口打开菜单；不会抢占前台焦点或移动真实鼠标。
+2. 用 `PrintWindow` 取得 WorkBuddy 后台截图，并由本机 Windows OCR 识别文字。截图不会上传。
+3. 先识别“积分余额”并记录其数字指纹；未找到这个锚点时拒绝点击，避免误操作。
+4. 在余额附近的同一张个人中心卡片内，动态寻找 `签到领积分`、`立即领取`、`去签到`、`签到`、`领积分`、`领取`、`体验` 等文字。每个识别到的候选只点击一次。
+5. 每点一次立即重新 OCR，比较本次点击前后的积分余额。余额数字变化即为领取成功；也会识别“今日已领”“本期已领”“领取成功”“签到成功”或 `+100` 作为已领取证据。
 
-## 上游复用与验证
+实际 WorkBuddy 有时会把奖励计入 Credits 而不立即改写“积分余额”。因此余额变化是最直接的成功证据，但不会是唯一条件；工具必须再读到明确的已领取文字或 `+100`，才会在余额未变的情况下报告成功，绝不会仅凭一次点击就报告成功。
 
-本项目以 `GitOfUser/workbuddy-checkin` 的最新 `cb9f5e2` 提交为上游参考：复用其窗口定位、账户菜单、领取按钮的操作顺序，并保留该仓库为 Git 远端 `upstream`。它的固定 1920×1080 坐标仅作校准参考，不能直接用于本机不同窗口尺寸。
+由工具启动的 WorkBuddy 会在结束后关闭；原本前台的窗口保持前台，原本后台/最小化的窗口会恢复最小化。
 
-`WorkBuddyAutoClaim.exe --verify-layout` 不会点击、不领取，只会使用 `PrintWindow` 在窗口被其他应用遮挡时抓取 WorkBuddy 内容，输出到 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-background-capture.png`。只有这项验证通过，后台领取的状态识别才会启用。
+## 配置与检查
 
-`WorkBuddyAutoClaim.exe --test-buddy-card` 会读取真实 WorkBuddy 窗口；若需要会打开左下个人菜单，识别 Buddy 加油站卡片并保存 `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-buddy-card-test.png`；不点击“立即领取”。
+`release\config.json` 首次运行时由 `config.example.json` 创建。可编辑：
 
-`WorkBuddyAutoClaim.exe --verify-card <截图路径>` 只校验保存的截图是否能识别领取卡片和“可领取/今日已领”状态；不启动或控制 WorkBuddy。
+- `ClaimTime`：每日领取时间，默认 `00:00`。
+- `RetryIntervalSeconds`：仅用于到点后失败或锁屏的重试间隔，默认 `60`。
+- `ClaimActionKeywords`：可领取按钮的 OCR 关键词；遇到版本更新时在此增加新文案即可，不要删除现有词。
+- `ProfileX`、`ProfileBottomOffset`：左下个人中心入口的相对点击位置。只有这一个稳定入口使用配置坐标；领取按钮位置由 OCR 动态决定。
 
-`WorkBuddyAutoClaim.exe --test-menu` 只测试后台点击账户菜单：点击一次、保存 `workbuddy-menu-test.png`，再点击一次还原；不会领取或退出 WorkBuddy。
+日志、当天成功记录及“点击前/后”诊断截图保存在 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
 
-`WorkBuddyAutoClaim.exe --test-personal-center` 只打开个人中心并保存 `workbuddy-personal-center-test.png`，不会点击“立即领取”。
+这些命令均不会点击领取：
+
+```powershell
+release\WorkBuddyAutoClaim.exe --self-test
+release\WorkBuddyAutoClaim.exe --test-personal-center
+release\WorkBuddyAutoClaim.exe --verify-claim-ocr "C:\path\to\screenshot.png"
+```
+
+`--test-personal-center` 会打开个人中心、确认 OCR 能读到积分余额并保存截图，但不领取。`--verify-claim-ocr` 只验证已有截图中能否识别余额和领取/已领取文本。
+
+## 上游参考
+
+项目保留 `GitOfUser/workbuddy-checkin` 为 `upstream` 参考。它的账户入口和领取流程思路已被复用；其固定屏幕坐标没有用于本工具的正常领取路径。

@@ -8,4 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <SelfContained>false</SelfContained>
   </PropertyGroup>
+  <ItemGroup>
+    <None Update="workbuddy-ocr.ps1" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

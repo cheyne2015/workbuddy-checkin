@@ -3,7 +3,9 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace WorkBuddyAutoClaim;
@@ -43,6 +45,8 @@ internal static class Program
                 "--dry-run" => DryRun(config),
                 "--verify-layout" => VerifyLayout(config),
                 "--verify-card" => VerifyBuddyCard(args.Skip(1).FirstOrDefault()),
+                "--ocr-screenshot" => OcrScreenshot(args.Skip(1).FirstOrDefault()),
+                "--verify-claim-ocr" => VerifyClaimOcr(args.Skip(1).FirstOrDefault(), config),
                 "--test-buddy-card" => TestBuddyCard(config),
                 "--test-menu" => TestMenuClick(config),
                 "--test-personal-center" => TestPersonalCenter(config),
@@ -272,33 +276,100 @@ internal static class Program
 
     private static bool TryClaimFromPersonalCenter(IntPtr window, Config config, out string result)
     {
-        // 领取按钮、领取结果和诊断截图都以左下个人菜单内的 Buddy 加油站为准。
-        if (!TryFindBuddyCardInPersonalMenu(window, config, out var card))
+        // 以“积分余额”文字为个人中心锚点。这样页面的卡片颜色、尺寸和按钮位置改变时，
+        // 仍然只会在确认个人中心已经打开后，点击 OCR 实际读到的领取文字。
+        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence))
         {
-            result = "未识别到 Buddy 加油站领取卡片";
+            result = "未能在左下个人中心识别到“积分余额”，拒绝猜测点击";
             return false;
         }
-        if (LooksBuddyCardClaimed(window, card))
+        if (evidence.HasSuccessText)
         {
             result = "WorkBuddy 今日已领取";
             return true;
         }
-        if (!LooksBuddyCardClaimButtonEnabled(window, card))
+        if (evidence.Actions.Count == 0)
         {
-            result = "Buddy 加油站未显示可用的立即领取按钮";
+            result = "OCR 未识别到 签到/领取/体验 等可领取按钮文字";
             return false;
         }
-        SaveBuddyDiagnosticCapture(window, "before-claim");
-        ClickWindowPoint(window, card.ButtonCenterX, card.ButtonCenterY);
-        var verification = WaitForBuddyCardClaimed(window, config, TimeSpan.FromSeconds(20));
-        bool claimed = verification != ClaimVerification.NotConfirmed;
-        SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
-        result = verification switch
+
+        var triedActions = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
         {
-            ClaimVerification.ClaimedButton => "领取成功，Buddy 加油站已更新为今日已领或 +100",
-            _ => "点击后 Buddy 加油站未更新为今日已领或 +100"
-        };
-        return claimed;
+            var action = evidence.Actions.FirstOrDefault(candidate =>
+                !triedActions.Contains(candidate.DeduplicationKey));
+            if (action is null) break;
+            triedActions.Add(action.DeduplicationKey);
+
+            // 每一次点击都使用该次点击前刚读到的余额指纹，绝不把上一次截图当作本次基线。
+            var beforeBalance = evidence.Balance ?? throw new InvalidOperationException("领取前丢失了积分余额 OCR 锚点。");
+            Log($"OCR 识别领取候选：{action.Keyword}，文本={action.Text}，位置=({action.CenterX},{action.CenterY})，积分余额记录={beforeBalance.RawText}。");
+            SaveBuddyDiagnosticCapture(window, "before-claim");
+            ClickWindowPoint(window, action.CenterX, action.CenterY);
+            var verification = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
+            bool claimed = verification != ClaimVerification.NotConfirmed;
+            SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
+            if (claimed)
+            {
+                result = verification switch
+                {
+                    ClaimVerification.ClaimedText => "领取成功，OCR 已识别今日已领或领取成功文字",
+                    ClaimVerification.BalanceChanged => "领取成功，OCR 识别到积分余额变化",
+                    _ => "领取成功"
+                };
+                return true;
+            }
+
+            // 失败后重新从个人中心和余额锚点读取当前页面，再处理还未点击过的文字候选。
+            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out evidence)) break;
+            if (evidence.HasSuccessText)
+            {
+                result = "领取成功，OCR 已识别今日已领或领取成功文字";
+                return true;
+            }
+        }
+
+        result = "已依次点击 OCR 识别到的领取候选，但未识别到成功状态或积分余额变化";
+        return false;
+    }
+
+    private static bool TryOpenPersonalCenterAndReadEvidence(IntPtr window, Config config, out MenuEvidence evidence)
+    {
+        using (var current = CaptureWindow(window))
+        {
+            if (current is not null)
+            {
+                evidence = ReadMenuEvidence(current, config);
+                if (evidence.Balance is not null) return true;
+            }
+        }
+
+        int height = GetWindowHeight(window);
+        if (height <= config.ProfileBottomOffset)
+        {
+            evidence = MenuEvidence.Empty;
+            return false;
+        }
+
+        Log("未发现积分余额；打开左下个人中心并等待 OCR 锚点加载。");
+        ClickWindowPoint(window, config.ProfileX, height - config.ProfileBottomOffset);
+        var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
+        do
+        {
+            using var image = CaptureWindow(window);
+            if (image is not null)
+            {
+                evidence = ReadMenuEvidence(image, config);
+                if (evidence.Balance is not null) return true;
+            }
+            Thread.Sleep(650);
+        }
+        while (DateTime.UtcNow < until);
+
+        evidence = MenuEvidence.Empty;
+        Log("打开个人中心后仍未通过 OCR 识别到积分余额。");
+        return false;
     }
 
     // 领取统一从左下个人菜单进行。主界面检查只用于避免菜单已经打开时被再次点击关闭，
@@ -329,28 +400,39 @@ internal static class Program
         return false;
     }
 
-    private static ClaimVerification WaitForBuddyCardClaimed(IntPtr window, Config config, TimeSpan timeout)
+    private static ClaimVerification WaitForClaimResult(
+        IntPtr window, Config config, BalanceReading beforeBalance, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
         var reopenMenuAfter = DateTime.UtcNow.AddSeconds(2);
         bool reopenedMenu = false;
         do
         {
-            int windowHeight = GetWindowHeight(window);
-            if (TryFindBuddyCard(window, out var updatedCard, logMissing: false) && IsPersonalMenuCard(updatedCard, windowHeight))
+            bool hasBalanceAnchor = false;
+            using (var image = CaptureWindow(window))
             {
-                if (LooksBuddyCardClaimed(window, updatedCard)) return ClaimVerification.ClaimedButton;
-            }
-            else if (!reopenedMenu && DateTime.UtcNow >= reopenMenuAfter)
-            {
-                if (windowHeight > config.ProfileBottomOffset)
+                if (image is not null)
                 {
-                    Log("领取后卡片暂时隐藏；重新打开左下个人菜单核验领取结果。");
-                    TryFindBuddyCardInPersonalMenu(window, config, out _);
+                    var evidence = ReadMenuEvidence(image, config);
+                    hasBalanceAnchor = evidence.Balance is not null;
+                    if (evidence.HasSuccessText) return ClaimVerification.ClaimedText;
+                    if (evidence.Balance is not null && !StringComparer.Ordinal.Equals(beforeBalance.Fingerprint, evidence.Balance.Fingerprint))
+                    {
+                        Log($"OCR 积分余额变化：{beforeBalance.RawText} -> {evidence.Balance.RawText}。");
+                        return ClaimVerification.BalanceChanged;
+                    }
+                }
+            }
+            if (!hasBalanceAnchor && !reopenedMenu && DateTime.UtcNow >= reopenMenuAfter)
+            {
+                if (GetWindowHeight(window) > config.ProfileBottomOffset)
+                {
+                    Log("领取后未读到个人中心；重新打开左下个人中心核验领取结果。");
+                    TryOpenPersonalCenterAndReadEvidence(window, config, out _);
                     reopenedMenu = true;
                 }
             }
-            Thread.Sleep(500);
+            Thread.Sleep(650);
         }
         while (DateTime.UtcNow < until);
         return ClaimVerification.NotConfirmed;
@@ -369,13 +451,216 @@ internal static class Program
         Log($"领取诊断截图已保存: {output}");
     }
 
-    private enum ClaimVerification { NotConfirmed, ClaimedButton }
+    private enum ClaimVerification { NotConfirmed, ClaimedText, BalanceChanged }
 
     private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
     {
         public int ButtonCenterX => Left + (int)Math.Round(Width * 0.25);
         public int ButtonCenterY => HeaderTop + (int)Math.Round(Width * 0.64);
     }
+
+    private sealed class OcrSnapshot
+    {
+        public string Language { get; set; } = "";
+        public List<OcrLine> Lines { get; set; } = [];
+    }
+
+    private sealed class OcrLine
+    {
+        public string Text { get; set; } = "";
+        public List<OcrWord> Words { get; set; } = [];
+    }
+
+    private sealed class OcrWord
+    {
+        public string Text { get; set; } = "";
+        public int X { get; set; }
+        public int Y { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+    }
+
+    private readonly record struct OcrBounds(int Left, int Top, int Right, int Bottom)
+    {
+        public int CenterX => Left + (Right - Left) / 2;
+        public int CenterY => Top + (Bottom - Top) / 2;
+    }
+
+    // Bounds is deliberately the “积分余额” label position, not the numeric value position:
+    // action text is normally aligned with the label on the left side of the card.
+    private sealed record BalanceReading(string RawText, string Fingerprint, OcrBounds Bounds);
+    private sealed record ClaimAction(string Keyword, string Text, int CenterX, int CenterY)
+    {
+        public string DeduplicationKey => Keyword + "|" + NormalizeOcrText(Text);
+    }
+    private sealed record MenuEvidence(BalanceReading? Balance, IReadOnlyList<ClaimAction> Actions, bool HasSuccessText)
+    {
+        public static readonly MenuEvidence Empty = new(null, [], false);
+    }
+
+    private static int OcrScreenshot(string? imagePath)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+            throw new FileNotFoundException("请提供可读取的截图路径。", imagePath);
+        using var bitmap = new Bitmap(imagePath);
+        var ocr = ReadOcr(bitmap);
+        Console.WriteLine(string.Join(Environment.NewLine, ocr.Lines.Select(line =>
+            $"{string.Join(' ', line.Words.Select(word => $"{word.X},{word.Y},{word.Width},{word.Height}"))}: {line.Text}")));
+        Log($"OCR 截图测试完成：语言={ocr.Language}，识别到 {ocr.Lines.Count} 行文字。");
+        return 0;
+    }
+
+    private static int VerifyClaimOcr(string? imagePath, Config config)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+            throw new FileNotFoundException("请提供可读取的截图路径。", imagePath);
+        using var bitmap = new Bitmap(imagePath);
+        var evidence = ReadMenuEvidence(bitmap, config);
+        if (evidence.Balance is null)
+            throw new InvalidOperationException("OCR 未读取到积分余额。\n");
+        if (!evidence.HasSuccessText && evidence.Actions.Count == 0)
+            throw new InvalidOperationException("OCR 未识别到成功状态或可领取文字。\n");
+        Console.WriteLine($"余额={evidence.Balance.RawText}; 成功文字={evidence.HasSuccessText}; 候选={string.Join(", ", evidence.Actions.Select(action => action.Text))}");
+        Log($"OCR 领取截图验证通过：余额={evidence.Balance.RawText}，成功文字={evidence.HasSuccessText}，候选数量={evidence.Actions.Count}。\n");
+        return 0;
+    }
+
+    private static OcrSnapshot ReadOcr(Bitmap bitmap)
+    {
+        var script = Path.Combine(BaseDir, "workbuddy-ocr.ps1");
+        if (!File.Exists(script)) throw new FileNotFoundException("找不到 Windows OCR 脚本。", script);
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+        Directory.CreateDirectory(folder);
+        var imagePath = Path.Combine(folder, $"ocr-{Environment.ProcessId}-{Guid.NewGuid():N}.png");
+        bitmap.Save(imagePath, ImageFormat.Png);
+        try
+        {
+            var start = new ProcessStartInfo("powershell.exe")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                // workbuddy-ocr.ps1 deliberately emits UTF-8 JSON. Do not let the
+                // current Windows ANSI code page corrupt OCR text before JSON parsing.
+                StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+            };
+            start.ArgumentList.Add("-NoProfile");
+            start.ArgumentList.Add("-ExecutionPolicy");
+            start.ArgumentList.Add("Bypass");
+            start.ArgumentList.Add("-File");
+            start.ArgumentList.Add(script);
+            start.ArgumentList.Add("-ImagePath");
+            start.ArgumentList.Add(imagePath);
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Windows OCR。\n");
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+            Task.WaitAll(outputTask, errorTask);
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException("Windows OCR 失败: " + errorTask.Result.Trim());
+            byte[] jsonBytes;
+            try { jsonBytes = Convert.FromBase64String(outputTask.Result.Trim()); }
+            catch (FormatException ex) { throw new InvalidOperationException("Windows OCR 返回的数据格式无效。", ex); }
+            return JsonSerializer.Deserialize<OcrSnapshot>(Encoding.UTF8.GetString(jsonBytes),
+                       new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                   ?? throw new InvalidOperationException("Windows OCR 未返回可读取的结果。");
+        }
+        finally { try { File.Delete(imagePath); } catch { } }
+    }
+
+    private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, Config config)
+    {
+        var ocr = ReadOcr(bitmap);
+        var balance = TryReadBalance(ocr);
+        var actions = balance is null ? [] : FindClaimActions(ocr, balance, config.ClaimActionKeywords);
+        bool hasSuccessText = balance is not null && HasClaimSuccessText(ocr, balance);
+        return new MenuEvidence(balance, actions, hasSuccessText);
+    }
+
+    private static BalanceReading? TryReadBalance(OcrSnapshot snapshot)
+    {
+        var label = snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
+            .FirstOrDefault(item => NormalizeOcrText(item.Line.Text).Contains("积分余额", StringComparison.Ordinal));
+        if (label.Line is null) return null;
+
+        var candidate = snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
+            .Where(item => item.Line.Words.Count > 0 && item.Bounds.Left > label.Bounds.Right &&
+                           Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY) <= 40 &&
+                           item.Line.Text.Count(char.IsDigit) >= 2)
+            .OrderBy(item => Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY))
+            .ThenBy(item => item.Bounds.Left)
+            .FirstOrDefault();
+        if (candidate.Line is null) return null;
+
+        var fingerprint = new string(candidate.Line.Text.Where(char.IsDigit).ToArray());
+        return fingerprint.Length >= 2 ? new BalanceReading(candidate.Line.Text, fingerprint, label.Bounds) : null;
+    }
+
+    private static IReadOnlyList<ClaimAction> FindClaimActions(
+        OcrSnapshot snapshot, BalanceReading balance, IEnumerable<string>? configuredKeywords)
+    {
+        var keywords = (configuredKeywords ?? Config.DefaultClaimActionKeywords)
+            .Select(NormalizeOcrText)
+            .Where(keyword => !string.IsNullOrWhiteSpace(keyword))
+            .OrderByDescending(keyword => keyword.Length)
+            .ToArray();
+        // 按钮通常在“积分余额”同一张个人中心卡片的上方。范围是相对余额文字推导，
+        // 不是任何特定 WorkBuddy 版本的绝对坐标或卡片颜色。
+        int actionLeft = Math.Max(0, balance.Bounds.Left - 48);
+        int actionRight = balance.Bounds.Right + 320;
+        int actionTop = Math.Max(0, balance.Bounds.Top - 150);
+        int actionBottom = balance.Bounds.Bottom + 56;
+        return snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
+            .Where(item => item.Line.Words.Count > 0 && item.Bounds.Left >= actionLeft &&
+                           item.Bounds.Right <= actionRight &&
+                           item.Bounds.CenterY >= actionTop && item.Bounds.CenterY <= actionBottom &&
+                           !item.Normalized.Contains("已领", StringComparison.Ordinal) &&
+                           !item.Normalized.Contains("成功", StringComparison.Ordinal))
+            .Select(item =>
+            {
+                var keyword = keywords.FirstOrDefault(value => item.Normalized.Contains(value, StringComparison.Ordinal));
+                return string.IsNullOrWhiteSpace(keyword) ? null : new ClaimAction(keyword, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY);
+            })
+            .Where(action => action is not null)
+            .Select(action => action!)
+            .GroupBy(action => (action.CenterX / 8, action.CenterY / 8))
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private static bool HasClaimSuccessText(OcrSnapshot snapshot, BalanceReading balance)
+    {
+        int left = Math.Max(0, balance.Bounds.Left - 48);
+        int right = balance.Bounds.Right + 320;
+        int top = Math.Max(0, balance.Bounds.Top - 180);
+        int bottom = balance.Bounds.Bottom + 96;
+        return snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
+            .Where(item => item.Line.Words.Count > 0 && item.Bounds.Left >= left && item.Bounds.Right <= right &&
+                           item.Bounds.CenterY >= top && item.Bounds.CenterY <= bottom)
+            .Any(item => item.Normalized.Contains("今日已领", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("本期已领", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("已领取", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("领取成功", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("领成功", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("签到成功", StringComparison.Ordinal) ||
+                         Regex.IsMatch(item.Line.Text, @"\+\s*\d{2,4}"));
+    }
+
+    private static OcrBounds GetOcrBounds(OcrLine line)
+    {
+        if (line.Words.Count == 0) return default;
+        return new OcrBounds(line.Words.Min(word => word.X), line.Words.Min(word => word.Y),
+            line.Words.Max(word => word.X + word.Width), line.Words.Max(word => word.Y + word.Height));
+    }
+
+    private static string NormalizeOcrText(string text) =>
+        Regex.Replace(text, "[\\s\\p{P}\\p{S}]", string.Empty);
 
     private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
         windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
@@ -501,15 +786,7 @@ internal static class Program
 
     private static bool OpenPersonalCenter(IntPtr window, Config config)
     {
-        // Electron 窗口可先于侧栏用户信息完成渲染。最多等待 15 秒，并以绿色签到卡片出现为准。
-        for (int attempt = 0; attempt < 8; attempt++)
-        {
-            if (IsPersonalCenterReady(window, config)) return true;
-            ClickWindowPoint(window, config.ProfileX, GetWindowHeight(window) - config.ProfileBottomOffset);
-            Thread.Sleep(1800);
-            if (IsPersonalCenterReady(window, config)) return true;
-        }
-        return false;
+        return TryOpenPersonalCenterAndReadEvidence(window, config, out _);
     }
 
     private static bool IsPersonalCenterReady(IntPtr window, Config config)
@@ -794,13 +1071,13 @@ internal static class Program
     {
         var window = EnsureWorkBuddyWindow(config);
         if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
-        if (!OpenPersonalCenter(window, config)) throw new InvalidOperationException("个人中心未完成加载或未能展开。");
+        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence))
+            throw new InvalidOperationException("个人中心未完成加载或 OCR 未识别到积分余额。");
         using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。");
         var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
         Directory.CreateDirectory(folder);
         image.Save(Path.Combine(folder, "workbuddy-personal-center-test.png"), ImageFormat.Png);
-        bool claimed = LooksClaimed(window, config);
-        Log($"个人中心测试完成：已领状态={claimed}，未执行领取点击。");
+        Log($"个人中心测试完成：余额={evidence.Balance!.RawText}，已领状态={evidence.HasSuccessText}，未执行领取点击。");
         return 0;
     }
 
@@ -839,6 +1116,32 @@ internal static class Program
             throw new InvalidOperationException("+100 领取成功按钮颜色校验失败。");
         if (!IsPersonalMenuCard(new BuddyCard(34, 180, 216), 600) || IsPersonalMenuCard(new BuddyCard(22, 366, 218), 600))
             throw new InvalidOperationException("个人菜单卡片位置路由校验失败。");
+
+        var ocr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额", Words = [new OcrWord { Text = "积分余额", X = 30, Y = 350, Width = 80, Height = 18 }] },
+                new OcrLine { Text = "1324.67", Words = [new OcrWord { Text = "1324.67", X = 198, Y = 350, Width = 58, Height = 18 }] },
+                new OcrLine { Text = "签到领积分", Words = [new OcrWord { Text = "签到领积分", X = 52, Y = 292, Width = 98, Height = 22 }] },
+                new OcrLine { Text = "领取说明", Words = [new OcrWord { Text = "领取说明", X = 52, Y = 150, Width = 90, Height = 18 }] }
+            ]
+        };
+        var balance = TryReadBalance(ocr) ?? throw new InvalidOperationException("积分余额 OCR 锚点校验失败。");
+        if (balance.Fingerprint != "132467") throw new InvalidOperationException("积分余额 OCR 指纹校验失败。");
+        var actions = FindClaimActions(ocr, balance, Config.DefaultClaimActionKeywords);
+        if (actions.Count != 1 || actions[0].Keyword != "签到领积分")
+            throw new InvalidOperationException("动态领取文字 OCR 路由校验失败。");
+        var claimedOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "本期已领", Words = [new OcrWord { Text = "本期已领", X = 45, Y = 278, Width = 68, Height = 18 }] },
+                new OcrLine { Text = "+100", Words = [new OcrWord { Text = "+100", X = 70, Y = 314, Width = 45, Height = 18 }] }
+            ]
+        };
+        if (!HasClaimSuccessText(claimedOcr, balance))
+            throw new InvalidOperationException("领取成功 OCR 文本校验失败。");
         Log("Self test OK.");
         return 0;
     }
@@ -885,12 +1188,14 @@ internal static class Program
 
 internal sealed class Config
 {
+    internal static readonly string[] DefaultClaimActionKeywords = ["签到领积分", "立即领取", "去签到", "签到", "领积分", "领取", "体验"];
     public string WorkBuddyPath { get; set; } = @"D:\Program Files\WorkBuddy\WorkBuddy.exe";
     public string ClaimTime { get; set; } = "00:00";
     public int RetryIntervalSeconds { get; set; } = 60;
     public int MaxAttempts { get; set; } = 5;
     public int LaunchWaitSeconds { get; set; } = 20;
     public int CardReadyTimeoutSeconds { get; set; } = 30;
+    public List<string> ClaimActionKeywords { get; set; } = [.. DefaultClaimActionKeywords];
     public int ProfileX { get; set; } = 44;
     public int ProfileBottomOffset { get; set; } = 35;
     public int ClaimClickX { get; set; } = 92;
