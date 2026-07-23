@@ -50,6 +50,7 @@ internal static class Program
                 "--test-buddy-card" => TestBuddyCard(config),
                 "--test-menu" => TestMenuClick(config),
                 "--test-personal-center" => TestPersonalCenter(config),
+                "--probe-checkin-entry" => ProbeCheckInEntry(config),
                 "--self-test" => SelfTest(config),
                 "--daemon" => RunDaemon(config),
                 _ => 2
@@ -306,13 +307,19 @@ internal static class Program
         foreach (var checkIn in evidence.Actions.Where(action => action.Kind == ClaimActionKind.CheckIn))
         {
             if (!triedCandidateIds.Add(checkIn.CandidateId)) continue;
+            if (!TryGetStableBalanceBeforeAction(window, config, beforeBalance, out var stableBeforeEntry))
+            {
+                result = "签到入口点击前未能稳定读取积分余额；为避免误报，本次未点击入口";
+                continue;
+            }
             Log($"OCR 识别签到入口：{checkIn.Keyword}，文本={checkIn.Text}，位置=({checkIn.CenterX},{checkIn.CenterY})。");
             SaveBuddyDiagnosticCapture(window, "before-checkin");
             ClickWindowPoint(window, checkIn.CenterX, checkIn.CenterY);
-            if (TryFindImmediateClaimAfterCheckIn(window, config, beforeBalance.Bounds, preExistingImmediateCandidateIds,
-                    out var discoveredImmediate, out var balanceBeforeImmediate) &&
+            if (TryFindImmediateClaimAfterCheckIn(window, config, stableBeforeEntry, preExistingImmediateCandidateIds,
+                    out var discoveredImmediate, out var balanceBeforeImmediate, out bool popupRoute) &&
                 discoveredImmediate is not null && balanceBeforeImmediate is not null)
-                return ClickImmediateClaimAndVerify(window, config, discoveredImmediate, balanceBeforeImmediate, out result);
+                return ClickImmediateClaimAndVerify(window, config, discoveredImmediate, balanceBeforeImmediate,
+                    out result, balanceAlreadyStabilized: popupRoute);
         }
 
         result = "未识别到立即领取；已点击签到入口但未出现立即领取按钮";
@@ -320,14 +327,16 @@ internal static class Program
     }
 
     private static bool ClickImmediateClaimAndVerify(
-        IntPtr window, Config config, ClaimAction immediate, BalanceReading beforeBalance, out string result)
+        IntPtr window, Config config, ClaimAction immediate, BalanceReading beforeBalance,
+        out string result, bool balanceAlreadyStabilized = false)
     {
-        if (!TryGetStableBalanceBeforeImmediate(window, config, beforeBalance, out var stableBeforeBalance))
+        var stableBeforeBalance = beforeBalance;
+        if (!balanceAlreadyStabilized && !TryGetStableBalanceBeforeAction(window, config, beforeBalance, out stableBeforeBalance))
         {
             result = "立即领取出现，但点击前未能稳定读取积分余额；为避免误报，本次未点击最终领取按钮";
             return false;
         }
-        beforeBalance = stableBeforeBalance;
+        if (!balanceAlreadyStabilized) beforeBalance = stableBeforeBalance;
         Log($"OCR 识别最终立即领取：文本={immediate.Text}，位置=({immediate.CenterX},{immediate.CenterY})，点击前积分余额={beforeBalance.RawText}。");
         SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
@@ -342,10 +351,11 @@ internal static class Program
     private static bool TryFindImmediateClaimAfterCheckIn(
         IntPtr window,
         Config config,
-        OcrBounds expectedBalanceBounds,
+        BalanceReading expectedBeforeBalance,
         IReadOnlySet<string> preExistingImmediateCandidateIds,
         out ClaimAction? immediate,
-        out BalanceReading? balanceBeforeImmediate)
+        out BalanceReading? balanceBeforeImmediate,
+        out bool popupRoute)
     {
         var until = DateTime.UtcNow.AddSeconds(10);
         do
@@ -357,11 +367,22 @@ internal static class Program
                 // The final button must be new and must remain tied to the same personal-center
                 // balance anchor. A popup that hides that anchor is deliberately not clicked.
                 var found = SelectNewImmediateAction(
-                    evidence, expectedBalanceBounds, preExistingImmediateCandidateIds, config);
+                    evidence, expectedBeforeBalance.Bounds, preExistingImmediateCandidateIds, config);
                 if (found is not null)
                 {
                     immediate = found;
                     balanceBeforeImmediate = evidence.Balance;
+                    popupRoute = false;
+                    return true;
+                }
+                // WorkBuddy v5.3 opens the Buddy 加油站 mini card after clicking the
+                // personal-center entry. It has no visible balance row, so it is accepted
+                // only when its own card markers and its enlarged OCR “立即领取” are present.
+                if (TryFindBuddyPopupImmediateClaim(image, config, out var popupImmediate) && popupImmediate is not null)
+                {
+                    immediate = popupImmediate;
+                    balanceBeforeImmediate = expectedBeforeBalance;
+                    popupRoute = true;
                     return true;
                 }
             }
@@ -370,6 +391,7 @@ internal static class Program
         while (DateTime.UtcNow < until);
         immediate = null;
         balanceBeforeImmediate = null;
+        popupRoute = false;
         return false;
     }
 
@@ -384,6 +406,51 @@ internal static class Program
         return evidence.Actions.FirstOrDefault(action =>
             action.Kind == ClaimActionKind.Immediate &&
             !preExistingImmediateCandidateIds.Contains(action.CandidateId));
+    }
+
+    private static bool TryFindBuddyPopupImmediateClaim(Bitmap bitmap, Config config, out ClaimAction? immediate)
+    {
+        immediate = null;
+        var pageOcr = ReadOcr(bitmap);
+        var anchor = pageOcr.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Text: NormalizeOcrText(line.Text)))
+            .FirstOrDefault(item => item.Line.Words.Count > 0 &&
+                                    item.Bounds.Left < bitmap.Width / 2 &&
+                                    item.Bounds.Top > bitmap.Height / 2 &&
+                                    item.Text.Contains("本期", StringComparison.Ordinal));
+        if (anchor.Line is null) return false;
+
+        int sourceLeft = Math.Max(0, anchor.Bounds.Left - config.PopupCardAnchorLeftOffsetPixels);
+        int sourceTop = Math.Max(0, anchor.Bounds.Top - config.PopupCardAnchorTopOffsetPixels);
+        int sourceWidth = Math.Min(config.PopupCardWidthPixels, bitmap.Width - sourceLeft);
+        int sourceHeight = Math.Min(config.PopupCardHeightPixels, bitmap.Height - sourceTop);
+        if (sourceWidth <= 0 || sourceHeight <= 0) return false;
+        using var enlarged = CreateScaledCrop(bitmap, new Rectangle(sourceLeft, sourceTop, sourceWidth, sourceHeight),
+            config.PopupCardOcrScale);
+        var popupOcr = ReadOcr(enlarged);
+        bool hasPopupIdentity = popupOcr.Lines.Any(line =>
+            NormalizeOcrText(line.Text).Contains("Buddy加油站", StringComparison.Ordinal) ||
+            NormalizeOcrText(line.Text).Contains("8uddy加油站", StringComparison.Ordinal)) &&
+            popupOcr.Lines.Any(line => NormalizeOcrText(line.Text).Contains("本期", StringComparison.Ordinal));
+        if (!hasPopupIdentity) return false;
+
+        var immediateKeywords = GetNormalizedKeywords(config.ImmediateClaimKeywords, Config.DefaultImmediateClaimKeywords);
+        var button = popupOcr.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Text: NormalizeOcrText(line.Text)))
+            .FirstOrDefault(item => item.Line.Words.Count > 0 &&
+                                    immediateKeywords.Any(keyword => item.Text.Contains(keyword, StringComparison.Ordinal)));
+        if (button.Line is null) return false;
+
+        int scale = Math.Max(1, config.PopupCardOcrScale);
+        var sourceBounds = new OcrBounds(
+            sourceLeft + button.Bounds.Left / scale,
+            sourceTop + button.Bounds.Top / scale,
+            sourceLeft + button.Bounds.Right / scale,
+            sourceTop + button.Bounds.Bottom / scale);
+        immediate = new ClaimAction("立即领取", button.Line.Text, sourceBounds.CenterX, sourceBounds.CenterY,
+            GetCandidateId(sourceBounds, config.ClaimCandidatePositionTolerancePixels), ClaimActionKind.Immediate);
+        Log($"Buddy 加油站弹层 OCR 识别最终立即领取：文本={button.Line.Text}，位置=({sourceBounds.CenterX},{sourceBounds.CenterY})。");
+        return true;
     }
 
     private static bool TryOpenPersonalCenterAndReadEvidence(IntPtr window, Config config, out MenuEvidence evidence)
@@ -502,7 +569,7 @@ internal static class Program
         return false;
     }
 
-    private static bool TryGetStableBalanceBeforeImmediate(
+    private static bool TryGetStableBalanceBeforeAction(
         IntPtr window, Config config, BalanceReading observed, out BalanceReading stable)
     {
         stable = observed;
@@ -774,8 +841,18 @@ internal static class Program
         int sourceTop = Math.Max(0, labelBounds.Top - above);
         int sourceRight = Math.Min(bitmap.Width, sourceLeft + width);
         int sourceBottom = Math.Min(bitmap.Height, labelBounds.Bottom + below);
-        int sourceWidth = Math.Max(1, sourceRight - sourceLeft);
-        int sourceHeight = Math.Max(1, sourceBottom - sourceTop);
+        return CreateScaledCrop(bitmap, new Rectangle(sourceLeft, sourceTop,
+            Math.Max(1, sourceRight - sourceLeft), Math.Max(1, sourceBottom - sourceTop)), scale);
+    }
+
+    private static Bitmap CreateScaledCrop(Bitmap bitmap, Rectangle source, int scale)
+    {
+        int sourceLeft = Math.Clamp(source.Left, 0, Math.Max(0, bitmap.Width - 1));
+        int sourceTop = Math.Clamp(source.Top, 0, Math.Max(0, bitmap.Height - 1));
+        int sourceRight = Math.Clamp(source.Right, sourceLeft + 1, bitmap.Width);
+        int sourceBottom = Math.Clamp(source.Bottom, sourceTop + 1, bitmap.Height);
+        int sourceWidth = sourceRight - sourceLeft;
+        int sourceHeight = sourceBottom - sourceTop;
         int safeScale = Math.Max(1, scale);
         var enlarged = new Bitmap(sourceWidth * safeScale, sourceHeight * safeScale, PixelFormat.Format32bppArgb);
         using var graphics = Graphics.FromImage(enlarged);
@@ -994,7 +1071,11 @@ internal static class Program
     }
 
     private static string NormalizeOcrText(string text) =>
-        Regex.Replace(text, "[\\s\\p{P}\\p{S}]", string.Empty);
+        Regex.Replace(text, "[\\s\\p{P}\\p{S}]", string.Empty)
+            // Windows OCR sometimes emits the Traditional glyphs from the same Simplified UI.
+            // Normalize the action words before routing; raw OCR is retained in diagnostics.
+            .Replace('領', '领')
+            .Replace('簽', '签');
 
     private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
         windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
@@ -1417,6 +1498,41 @@ internal static class Program
         return 0;
     }
 
+    // Controlled compatibility probe: it clicks one OCR-confirmed entry once, captures
+    // the resulting layer, and never clicks any “立即领取” control.
+    private static int ProbeCheckInEntry(Config config)
+    {
+        var window = EnsureWorkBuddyWindow(config);
+        if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+        bool wasForeground = Native.GetForegroundWindow() == window;
+        try
+        {
+            Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
+            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var before))
+                throw new InvalidOperationException("探测前未能打开个人中心。");
+            var entry = before.Actions.FirstOrDefault(action => action.Kind == ClaimActionKind.CheckIn)
+                        ?? throw new InvalidOperationException("探测前未识别到签到入口。");
+            SaveBuddyDiagnosticCapture(window, "probe-before-checkin");
+            Log($"签到入口探测：仅点击一次 {entry.Text}，位置=({entry.CenterX},{entry.CenterY})，不会点击最终领取。");
+            ClickWindowPoint(window, entry.CenterX, entry.CenterY);
+            Thread.Sleep(1_200);
+            using var afterImage = CaptureWindow(window) ?? throw new InvalidOperationException("入口点击后无法捕获 WorkBuddy。");
+            var afterEvidence = ReadMenuEvidence(afterImage, config);
+            bool popupImmediate = TryFindBuddyPopupImmediateClaim(afterImage, config, out var popupAction) && popupAction is not null;
+            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+            Directory.CreateDirectory(folder);
+            var output = Path.Combine(folder, "workbuddy-probe-after-checkin.png");
+            afterImage.Save(output, ImageFormat.Png);
+            Log($"签到入口探测完成：余额锚点={(afterEvidence.Balance is null ? "无" : afterEvidence.Balance.RawText)}，" +
+                $"个人中心={afterEvidence.IsPersonalCenter}，弹层立即领取={popupImmediate}，截图={output}；未执行最终领取点击。");
+            return 0;
+        }
+        finally
+        {
+            if (!wasForeground) Native.ShowWindow(window, Native.SW_MINIMIZE);
+        }
+    }
+
     private static Bitmap? CaptureWindow(IntPtr hwnd)
     {
         Native.GetWindowRect(hwnd, out var rect);
@@ -1585,6 +1701,11 @@ internal sealed class Config
     public int BalanceAnchorDriftPixels { get; set; } = 48;
     public int VisualBalanceSameFrameMaxChangedCells { get; set; } = 4;
     public int VisualBalanceChangeMinimumChangedCells { get; set; } = 5;
+    public int PopupCardAnchorLeftOffsetPixels { get; set; } = 90;
+    public int PopupCardAnchorTopOffsetPixels { get; set; } = 35;
+    public int PopupCardWidthPixels { get; set; } = 340;
+    public int PopupCardHeightPixels { get; set; } = 235;
+    public int PopupCardOcrScale { get; set; } = 4;
     public int PersonalCenterEvidenceAboveBalancePixels { get; set; } = 80;
     public int PersonalCenterEvidenceBelowBalancePixels { get; set; } = 300;
     public int ProfileX { get; set; } = 44;
