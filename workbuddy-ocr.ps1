@@ -33,10 +33,17 @@ $decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s
 $bitmap = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 
 try {
+    $actualLanguage = $Language
     $engine = if ($Language -eq 'profile') {
         [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
     } else {
         [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($Language))
+    }
+    # The cropped numeric retry prefers en-US, but that OCR language pack is optional.
+    # Fall back to the logged-in user's installed OCR languages before giving up.
+    if ($null -eq $engine -and $Language -ne 'profile') {
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+        $actualLanguage = 'profile-fallback'
     }
     if ($null -eq $engine) { throw 'Windows OCR is unavailable for the current user profile.' }
     $result = Await-WinRt ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
@@ -56,7 +63,7 @@ try {
         }
     })
     $payload = [pscustomobject]@{
-        Language = $Language
+        Language = $actualLanguage
         Lines = $lines
     } | ConvertTo-Json -Depth 5 -Compress
     # The parent process receives only ASCII. This avoids Windows PowerShell 5
