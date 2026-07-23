@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$ImagePath
+    [string]$ImagePath,
+    [string]$Language = 'profile'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +12,7 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
 $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
 $null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
 
 $asTaskDefinition = [System.WindowsRuntimeSystemExtensions].GetMethods() |
     Where-Object {
@@ -31,7 +33,11 @@ $decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s
 $bitmap = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 
 try {
-    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    $engine = if ($Language -eq 'profile') {
+        [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    } else {
+        [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($Language))
+    }
     if ($null -eq $engine) { throw 'Windows OCR is unavailable for the current user profile.' }
     $result = Await-WinRt ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
     $lines = @($result.Lines | ForEach-Object {
@@ -50,7 +56,7 @@ try {
         }
     })
     $payload = [pscustomobject]@{
-        Language = 'profile'
+        Language = $Language
         Lines = $lines
     } | ConvertTo-Json -Depth 5 -Compress
     # The parent process receives only ASCII. This avoids Windows PowerShell 5

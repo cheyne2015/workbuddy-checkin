@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -288,50 +289,62 @@ internal static class Program
             result = "WorkBuddy 今日已领取";
             return true;
         }
-        if (evidence.Actions.Count == 0)
-        {
-            result = "OCR 未识别到 签到/领取/体验 等可领取按钮文字";
-            return false;
-        }
+        var beforeBalance = evidence.Balance ?? throw new InvalidOperationException("领取前丢失了积分余额 OCR 锚点。");
+        var immediate = evidence.Actions.FirstOrDefault(action => action.Kind == ClaimActionKind.Immediate);
+        if (immediate is not null)
+            return ClickImmediateClaimAndVerify(window, config, immediate, beforeBalance, out result);
 
+        // “签到”只被视为进入领取流程的入口，不把它本身当作领取成功。
+        // 每个入口最多点一次；只有随后真实出现“立即领取”才会继续。
         var triedCandidateIds = new HashSet<string>(StringComparer.Ordinal);
-        while (true)
+        foreach (var checkIn in evidence.Actions.Where(action => action.Kind == ClaimActionKind.CheckIn))
         {
-            var action = evidence.Actions.FirstOrDefault(candidate =>
-                !triedCandidateIds.Contains(candidate.CandidateId));
-            if (action is null) break;
-            triedCandidateIds.Add(action.CandidateId);
-
-            // 每一次点击都使用该次点击前刚读到的余额指纹，绝不把上一次截图当作本次基线。
-            var beforeBalance = evidence.Balance ?? throw new InvalidOperationException("领取前丢失了积分余额 OCR 锚点。");
-            Log($"OCR 识别领取候选：{action.Keyword}，文本={action.Text}，位置=({action.CenterX},{action.CenterY})，积分余额记录={beforeBalance.RawText}。");
-            SaveBuddyDiagnosticCapture(window, "before-claim");
-            ClickWindowPoint(window, action.CenterX, action.CenterY);
-            var verification = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
-            bool claimed = verification != ClaimVerification.NotConfirmed;
-            SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
-            if (claimed)
-            {
-                result = verification switch
-                {
-                    ClaimVerification.ClaimedText => "领取成功，OCR 已识别今日已领或领取成功文字",
-                    ClaimVerification.ClaimedRewardMarker => "领取成功，OCR 已识别领取后的 +积分奖励标记",
-                    ClaimVerification.BalanceChanged => "领取成功，OCR 识别到积分余额变化",
-                    _ => "领取成功"
-                };
-                return true;
-            }
-
-            // 失败后重新从个人中心和余额锚点读取当前页面，再处理还未点击过的文字候选。
-            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out evidence)) break;
-            if (evidence.HasSuccessText)
-            {
-                result = "领取成功，OCR 已识别今日已领或领取成功文字";
-                return true;
-            }
+            if (!triedCandidateIds.Add(checkIn.CandidateId)) continue;
+            Log($"OCR 识别签到入口：{checkIn.Keyword}，文本={checkIn.Text}，位置=({checkIn.CenterX},{checkIn.CenterY})。");
+            SaveBuddyDiagnosticCapture(window, "before-checkin");
+            ClickWindowPoint(window, checkIn.CenterX, checkIn.CenterY);
+            if (TryFindImmediateClaimAfterCheckIn(window, config, out var discoveredImmediate) && discoveredImmediate is not null)
+                return ClickImmediateClaimAndVerify(window, config, discoveredImmediate, beforeBalance, out result);
         }
 
-        result = "已依次点击 OCR 识别到的领取候选，但未识别到成功状态或积分余额变化";
+        result = "未识别到立即领取；已点击签到入口但未出现立即领取按钮";
+        return false;
+    }
+
+    private static bool ClickImmediateClaimAndVerify(
+        IntPtr window, Config config, ClaimAction immediate, BalanceReading beforeBalance, out string result)
+    {
+        Log($"OCR 识别最终立即领取：文本={immediate.Text}，位置=({immediate.CenterX},{immediate.CenterY})，点击前积分余额={beforeBalance.RawText}。");
+        SaveBuddyDiagnosticCapture(window, "before-claim");
+        ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
+        bool claimed = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
+        SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
+        result = claimed
+            ? "领取成功，点击立即领取后 OCR 识别到积分余额变化"
+            : "点击立即领取后未识别到积分余额变化";
+        return claimed;
+    }
+
+    private static bool TryFindImmediateClaimAfterCheckIn(IntPtr window, Config config, out ClaimAction? immediate)
+    {
+        var until = DateTime.UtcNow.AddSeconds(10);
+        do
+        {
+            using var image = CaptureWindow(window);
+            if (image is not null)
+            {
+                var ocr = ReadOcr(image);
+                var found = FindImmediateClaimAction(ocr, config);
+                if (found is not null)
+                {
+                    immediate = found;
+                    return true;
+                }
+            }
+            Thread.Sleep(500);
+        }
+        while (DateTime.UtcNow < until);
+        immediate = null;
         return false;
     }
 
@@ -401,7 +414,7 @@ internal static class Program
         return false;
     }
 
-    private static ClaimVerification WaitForClaimResult(
+    private static bool WaitForClaimResult(
         IntPtr window, Config config, BalanceReading beforeBalance, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
@@ -416,14 +429,10 @@ internal static class Program
                 {
                     var evidence = ReadMenuEvidence(image, config);
                     hasPersonalCenter = evidence.IsPersonalCenter;
-                    if (evidence.HasSuccessText) return ClaimVerification.ClaimedText;
-                    // A reward marker is only accepted here, after this method has sent a
-                    // dynamic claim click. It is never used to skip a pending click.
-                    if (evidence.HasRewardMarker) return ClaimVerification.ClaimedRewardMarker;
                     if (evidence.Balance is not null && !StringComparer.Ordinal.Equals(beforeBalance.Fingerprint, evidence.Balance.Fingerprint))
                     {
                         Log($"OCR 积分余额变化：{beforeBalance.RawText} -> {evidence.Balance.RawText}。");
-                        return ClaimVerification.BalanceChanged;
+                        return true;
                     }
                 }
             }
@@ -439,7 +448,7 @@ internal static class Program
             Thread.Sleep(650);
         }
         while (DateTime.UtcNow < until);
-        return ClaimVerification.NotConfirmed;
+        return false;
     }
 
     // 领取是不可逆操作。保留最近一次点击前后的窗口截图，便于区分“未点到”、
@@ -454,8 +463,6 @@ internal static class Program
         image.Save(output, ImageFormat.Png);
         Log($"领取诊断截图已保存: {output}");
     }
-
-    private enum ClaimVerification { NotConfirmed, ClaimedText, ClaimedRewardMarker, BalanceChanged }
 
     private readonly record struct BuddyCard(int Left, int HeaderTop, int Width)
     {
@@ -492,21 +499,20 @@ internal static class Program
 
     // Bounds is deliberately the “积分余额” label position, not the numeric value position:
     // action text is normally aligned with the label on the left side of the card.
-    private sealed record BalanceReading(string RawText, string Fingerprint, OcrBounds Bounds);
-    private sealed record ClaimAction(string Keyword, string Text, int CenterX, int CenterY)
-    {
-        // OCR wording can become more or less specific after a re-render. The relative
-        // position is the stable identity, so two same-text buttons may still both run.
-        public string CandidateId => $"{CenterX / 24}:{CenterY / 24}";
-    }
+    private sealed record BalanceReading(string RawText, string Fingerprint, OcrBounds Bounds, bool IsVisualFingerprint = false);
+    private enum ClaimActionKind { Other, CheckIn, Immediate }
+
+    // OCR wording can become more or less specific after a re-render. The relative
+    // position is the stable identity, so two same-text buttons may still both run.
+    private sealed record ClaimAction(
+        string Keyword, string Text, int CenterX, int CenterY, string CandidateId, ClaimActionKind Kind);
     private sealed record MenuEvidence(
         BalanceReading? Balance,
         IReadOnlyList<ClaimAction> Actions,
         bool HasSuccessText,
-        bool HasRewardMarker,
         bool IsPersonalCenter)
     {
-        public static readonly MenuEvidence Empty = new(null, [], false, false, false);
+        public static readonly MenuEvidence Empty = new(null, [], false, false);
     }
 
     private static int OcrScreenshot(string? imagePath)
@@ -529,14 +535,14 @@ internal static class Program
         var evidence = ReadMenuEvidence(bitmap, config);
         if (evidence.Balance is null)
             throw new InvalidOperationException("OCR 未读取到积分余额。\n");
-        if (!evidence.HasSuccessText && !evidence.HasRewardMarker && evidence.Actions.Count == 0)
+        if (!evidence.HasSuccessText && evidence.Actions.Count == 0)
             throw new InvalidOperationException("OCR 未识别到成功状态或可领取文字。\n");
         Console.WriteLine($"余额={evidence.Balance.RawText}; 成功文字={evidence.HasSuccessText}; 候选={string.Join(", ", evidence.Actions.Select(action => action.Text))}");
         Log($"OCR 领取截图验证通过：余额={evidence.Balance.RawText}，成功文字={evidence.HasSuccessText}，候选数量={evidence.Actions.Count}。\n");
         return 0;
     }
 
-    private static OcrSnapshot ReadOcr(Bitmap bitmap)
+    private static OcrSnapshot ReadOcr(Bitmap bitmap, string language = "profile")
     {
         var script = Path.Combine(BaseDir, "workbuddy-ocr.ps1");
         if (!File.Exists(script)) throw new FileNotFoundException("找不到 Windows OCR 脚本。", script);
@@ -564,6 +570,8 @@ internal static class Program
             start.ArgumentList.Add(script);
             start.ArgumentList.Add("-ImagePath");
             start.ArgumentList.Add(imagePath);
+            start.ArgumentList.Add("-Language");
+            start.ArgumentList.Add(language);
             using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Windows OCR。\n");
             var outputTask = process.StandardOutput.ReadToEndAsync();
             var errorTask = process.StandardError.ReadToEndAsync();
@@ -584,33 +592,65 @@ internal static class Program
     private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, Config config)
     {
         var ocr = ReadOcr(bitmap);
-        var balance = TryReadBalance(ocr, config);
+        var balance = TryReadBalance(bitmap, ocr, config);
         var actions = balance is null ? [] : FindClaimActions(ocr, balance, config);
         bool hasSuccessText = balance is not null && HasClaimSuccessText(ocr, balance, config);
-        bool hasRewardMarker = balance is not null && HasClaimRewardMarker(ocr, balance, config);
         bool isPersonalCenter = balance is not null && HasPersonalCenterMarker(ocr, balance, config);
-        return new MenuEvidence(balance, actions, hasSuccessText, hasRewardMarker, isPersonalCenter);
+        return new MenuEvidence(balance, actions, hasSuccessText, isPersonalCenter);
+    }
+
+    private sealed record BalanceLabel(OcrLine Line, OcrBounds Bounds);
+
+    private static BalanceReading? TryReadBalance(Bitmap bitmap, OcrSnapshot snapshot, Config config)
+    {
+        var direct = TryReadBalance(snapshot, config);
+        if (direct is not null) return direct;
+
+        var label = FindBalanceLabel(snapshot);
+        if (label is null) return null;
+
+        var broadValue = TryReadBalanceFromCrop(bitmap, label, config, leftOffset: -4,
+            width: config.BalanceValueCropWidthPixels, scale: config.BalanceValueCropScale,
+            above: config.BalanceValueCropAbovePixels, below: config.BalanceValueCropBelowPixels, highContrast: false);
+        if (broadValue is not null) return broadValue;
+
+        // The value can be a single small digit at the far right of the row. A focused,
+        // higher-resolution retry prevents a visible 0 balance from being treated as missing.
+        return TryReadBalanceFromCrop(bitmap, label, config,
+            config.BalanceValueFocusedCropLeftOffsetPixels,
+            config.BalanceValueFocusedCropWidthPixels,
+            config.BalanceValueFocusedCropScale,
+            config.BalanceValueFocusedCropAbovePixels,
+            config.BalanceValueFocusedCropBelowPixels,
+            highContrast: true)
+            ?? CreateVisualBalanceReading(bitmap, label.Bounds, config);
     }
 
     private static BalanceReading? TryReadBalance(OcrSnapshot snapshot, Config config)
     {
-        var label = snapshot.Lines
-            .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
-            .FirstOrDefault(item => NormalizeOcrText(item.Line.Text).Contains("积分余额", StringComparison.Ordinal));
-        if (label.Line is null) return null;
+        var label = FindBalanceLabel(snapshot);
+        if (label is null) return null;
 
-        // Some versions put the value on the same OCR line as the label.
-        var sameLineDigits = new string(label.Line.Text.Where(char.IsDigit).ToArray());
-        if (sameLineDigits.Length >= 2)
+        // The left-side icon is sometimes OCR'd as 0, so only accept digits that
+        // occur after the “积分余额” text on the same line.
+        var normalizedLabelLine = NormalizeOcrText(label.Line.Text);
+        const string labelText = "积分余额";
+        int labelTextIndex = normalizedLabelLine.IndexOf(labelText, StringComparison.Ordinal);
+        var sameLineDigits = labelTextIndex < 0
+            ? string.Empty
+            : new string(normalizedLabelLine[(labelTextIndex + labelText.Length)..].Where(char.IsDigit).ToArray());
+        if (sameLineDigits.Length >= 1)
             return new BalanceReading(label.Line.Text, sameLineDigits, label.Bounds);
 
         var candidate = snapshot.Lines
             .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
             .Where(item => !ReferenceEquals(item.Line, label.Line) && item.Line.Words.Count > 0 &&
-                           item.Line.Text.Count(char.IsDigit) >= 2 &&
+                           item.Line.Text.Count(char.IsDigit) >= 1 &&
                            ((item.Bounds.Left >= label.Bounds.Right - 12 &&
-                             Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY) <= config.BalanceValueVerticalTolerance) ||
+                             item.Bounds.Left <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
+                             Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY) <= config.BalanceValueSameRowTolerance) ||
                             (item.Bounds.Top >= label.Bounds.Bottom &&
+                             item.Bounds.Left <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
                              item.Bounds.Top - label.Bounds.Bottom <= config.BalanceValueVerticalTolerance)))
             .OrderBy(item => Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY))
             .ThenBy(item => item.Bounds.Left)
@@ -618,7 +658,86 @@ internal static class Program
         if (candidate.Line is null) return null;
 
         var fingerprint = new string(candidate.Line.Text.Where(char.IsDigit).ToArray());
-        return fingerprint.Length >= 2 ? new BalanceReading(candidate.Line.Text, fingerprint, label.Bounds) : null;
+        return fingerprint.Length >= 1 ? new BalanceReading(candidate.Line.Text, fingerprint, label.Bounds) : null;
+    }
+
+    private static BalanceLabel? FindBalanceLabel(OcrSnapshot snapshot)
+    {
+        var label = snapshot.Lines
+            .Select(line => new BalanceLabel(line, GetOcrBounds(line)))
+            .FirstOrDefault(item => NormalizeOcrText(item.Line.Text).Contains("积分余额", StringComparison.Ordinal));
+        return label?.Line is null ? null : label;
+    }
+
+    private static BalanceReading? TryReadBalanceFromCrop(
+        Bitmap bitmap, BalanceLabel label, Config config, int leftOffset, int width, int scale, int above, int below,
+        bool highContrast)
+    {
+        using var enlargedValueArea = CreateBalanceValueCrop(bitmap, label.Bounds, leftOffset, width, scale, above, below);
+        if (highContrast) IncreaseOcrContrast(enlargedValueArea);
+        var enlargedOcr = ReadOcr(enlargedValueArea, "en-US");
+        var value = enlargedOcr.Lines
+            .Where(line => line.Words.Count > 0 && line.Text.Count(char.IsDigit) >= 1)
+            .OrderBy(line => GetOcrBounds(line).Top)
+            .FirstOrDefault();
+        if (value is null) return null;
+        var fingerprint = new string(value.Text.Where(char.IsDigit).ToArray());
+        return fingerprint.Length >= 1 ? new BalanceReading(value.Text, fingerprint, label.Bounds) : null;
+    }
+
+    private static Bitmap CreateBalanceValueCrop(
+        Bitmap bitmap, OcrBounds labelBounds, int leftOffset, int width, int scale, int above, int below)
+    {
+        int sourceLeft = Math.Max(0, labelBounds.Right + leftOffset);
+        int sourceTop = Math.Max(0, labelBounds.Top - above);
+        int sourceRight = Math.Min(bitmap.Width, sourceLeft + width);
+        int sourceBottom = Math.Min(bitmap.Height, labelBounds.Bottom + below);
+        int sourceWidth = Math.Max(1, sourceRight - sourceLeft);
+        int sourceHeight = Math.Max(1, sourceBottom - sourceTop);
+        int safeScale = Math.Max(1, scale);
+        var enlarged = new Bitmap(sourceWidth * safeScale, sourceHeight * safeScale, PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(enlarged);
+        graphics.Clear(Color.White);
+        graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        graphics.DrawImage(bitmap, new Rectangle(0, 0, enlarged.Width, enlarged.Height),
+            new Rectangle(sourceLeft, sourceTop, sourceWidth, sourceHeight), GraphicsUnit.Pixel);
+        return enlarged;
+    }
+
+    private static void IncreaseOcrContrast(Bitmap bitmap)
+    {
+        const int threshold = 220;
+        for (int y = 0; y < bitmap.Height; y++)
+        for (int x = 0; x < bitmap.Width; x++)
+        {
+            var color = bitmap.GetPixel(x, y);
+            int luma = (color.R * 299 + color.G * 587 + color.B * 114) / 1000;
+            bitmap.SetPixel(x, y, luma < threshold ? Color.Black : Color.White);
+        }
+    }
+
+    private static BalanceReading CreateVisualBalanceReading(Bitmap bitmap, OcrBounds labelBounds, Config config)
+    {
+        // WorkBuddy v5.3 can render a one-character balance that Windows OCR refuses to
+        // transcribe. The crop is anchored to “积分余额” and produces a local visual
+        // fingerprint, so a displayed-number change remains verifiable without guessing.
+        using var crop = CreateBalanceValueCrop(bitmap, labelBounds,
+            config.BalanceValueFocusedCropLeftOffsetPixels,
+            config.BalanceValueFocusedCropWidthPixels,
+            1,
+            config.BalanceValueFocusedCropAbovePixels,
+            config.BalanceValueFocusedCropBelowPixels);
+        var bytes = new byte[crop.Width * crop.Height];
+        int index = 0;
+        for (int y = 0; y < crop.Height; y++)
+        for (int x = 0; x < crop.Width; x++)
+        {
+            var color = crop.GetPixel(x, y);
+            int luma = (color.R * 299 + color.G * 587 + color.B * 114) / 1000;
+            bytes[index++] = (byte)(luma / 32);
+        }
+        var fingerprint = Convert.ToHexString(SHA256.HashData(bytes))[..16];
+        return new BalanceReading("视觉余额指纹", fingerprint, labelBounds, IsVisualFingerprint: true);
     }
 
     private static IReadOnlyList<ClaimAction> FindClaimActions(
@@ -644,14 +763,48 @@ internal static class Program
             .Select(item =>
             {
                 var keyword = keywords.FirstOrDefault(value => item.Normalized.Contains(value, StringComparison.Ordinal));
-                return string.IsNullOrWhiteSpace(keyword) ? null : new ClaimAction(keyword, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY);
+                return string.IsNullOrWhiteSpace(keyword)
+                    ? null
+                    : new ClaimAction(keyword, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY,
+                        GetCandidateId(item.Bounds, config.ClaimCandidatePositionTolerancePixels),
+                        ClassifyClaimAction(item.Normalized, config));
             })
             .Where(action => action is not null)
             .Select(action => action!)
-            .GroupBy(action => (action.CenterX / 8, action.CenterY / 8))
+            .GroupBy(action => action.CandidateId)
             .Select(group => group.First())
             .ToArray();
     }
+
+    private static ClaimAction? FindImmediateClaimAction(OcrSnapshot snapshot, Config config)
+    {
+        var immediateKeywords = GetNormalizedKeywords(config.ImmediateClaimKeywords, Config.DefaultImmediateClaimKeywords);
+        return snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
+            .Where(item => item.Line.Words.Count > 0 && item.Bounds.Top >= 60 &&
+                           immediateKeywords.Any(keyword => item.Normalized.Contains(keyword, StringComparison.Ordinal)))
+            .Select(item => new ClaimAction("立即领取", item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY,
+                GetCandidateId(item.Bounds, config.ClaimCandidatePositionTolerancePixels), ClaimActionKind.Immediate))
+            .FirstOrDefault();
+    }
+
+    private static ClaimActionKind ClassifyClaimAction(string normalizedText, Config config)
+    {
+        if (GetNormalizedKeywords(config.ImmediateClaimKeywords, Config.DefaultImmediateClaimKeywords)
+            .Any(keyword => normalizedText.Contains(keyword, StringComparison.Ordinal)))
+            return ClaimActionKind.Immediate;
+        if (GetNormalizedKeywords(config.CheckInKeywords, Config.DefaultCheckInKeywords)
+            .Any(keyword => normalizedText.Contains(keyword, StringComparison.Ordinal)))
+            return ClaimActionKind.CheckIn;
+        return ClaimActionKind.Other;
+    }
+
+    private static string[] GetNormalizedKeywords(IEnumerable<string>? configured, IEnumerable<string> fallback) =>
+        (configured ?? fallback)
+            .Select(NormalizeOcrText)
+            .Where(keyword => !string.IsNullOrWhiteSpace(keyword))
+            .OrderByDescending(keyword => keyword.Length)
+            .ToArray();
 
     private static bool HasClaimSuccessText(OcrSnapshot snapshot, BalanceReading balance, Config config)
     {
@@ -665,15 +818,6 @@ internal static class Program
                          item.Normalized.Contains("领取成功", StringComparison.Ordinal) ||
                          item.Normalized.Contains("领成功", StringComparison.Ordinal) ||
                          item.Normalized.Contains("签到成功", StringComparison.Ordinal));
-    }
-
-    private static bool HasClaimRewardMarker(OcrSnapshot snapshot, BalanceReading balance, Config config)
-    {
-        var region = GetBalanceRegion(balance, config, config.ClaimActionAboveBalancePixels, config.ClaimActionBelowBalancePixels);
-        return snapshot.Lines
-            .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
-            .Any(item => item.Line.Words.Count > 0 && region.Contains(item.Bounds) &&
-                         Regex.IsMatch(item.Line.Text, @"\+\s*\d{2,4}"));
     }
 
     private static bool HasPersonalCenterMarker(OcrSnapshot snapshot, BalanceReading balance, Config config)
@@ -700,6 +844,12 @@ internal static class Program
             Math.Max(0, balance.Bounds.Top - above),
             balance.Bounds.Right + config.ClaimActionRightPixels,
             balance.Bounds.Bottom + below);
+
+    private static string GetCandidateId(OcrBounds bounds, int tolerancePixels)
+    {
+        int tolerance = Math.Max(1, tolerancePixels);
+        return $"{bounds.CenterX / tolerance}:{bounds.CenterY / tolerance}";
+    }
 
     private static OcrBounds GetOcrBounds(OcrLine line)
     {
@@ -1183,8 +1333,14 @@ internal static class Program
         var balance = TryReadBalance(ocr, selfTestConfig) ?? throw new InvalidOperationException("积分余额 OCR 锚点校验失败。");
         if (balance.Fingerprint != "132467") throw new InvalidOperationException("积分余额 OCR 指纹校验失败。");
         var actions = FindClaimActions(ocr, balance, selfTestConfig);
-        if (actions.Count != 1 || actions[0].Keyword != "签到领积分")
+        if (actions.Count != 1 || actions[0].Keyword != "签到领积分" || actions[0].Kind != ClaimActionKind.CheckIn)
             throw new InvalidOperationException("动态领取文字 OCR 路由校验失败。");
+        var immediateOcr = new OcrSnapshot
+        {
+            Lines = [new OcrLine { Text = "立即领取", Words = [new OcrWord { Text = "立即领取", X = 360, Y = 240, Width = 74, Height = 22 }] }]
+        };
+        if (FindImmediateClaimAction(immediateOcr, selfTestConfig) is null)
+            throw new InvalidOperationException("立即领取 OCR 优先路由校验失败。");
         var claimedOcr = new OcrSnapshot
         {
             Lines =
@@ -1193,7 +1349,7 @@ internal static class Program
                 new OcrLine { Text = "+100", Words = [new OcrWord { Text = "+100", X = 70, Y = 314, Width = 45, Height = 18 }] }
             ]
         };
-        if (!HasClaimSuccessText(claimedOcr, balance, selfTestConfig) || !HasClaimRewardMarker(claimedOcr, balance, selfTestConfig))
+        if (!HasClaimSuccessText(claimedOcr, balance, selfTestConfig))
             throw new InvalidOperationException("领取成功 OCR 文本校验失败。");
         Log("Self test OK.");
         return 0;
@@ -1243,6 +1399,8 @@ internal sealed class Config
 {
     internal static readonly string[] DefaultClaimActionKeywords = ["签到领积分", "立即领取", "去签到", "签到", "领积分", "领取", "体验"];
     internal static readonly string[] DefaultClaimActionExclusions = ["体验版"];
+    internal static readonly string[] DefaultImmediateClaimKeywords = ["立即领取"];
+    internal static readonly string[] DefaultCheckInKeywords = ["签到领积分", "去签到", "签到"];
     public string WorkBuddyPath { get; set; } = @"D:\Program Files\WorkBuddy\WorkBuddy.exe";
     public string ClaimTime { get; set; } = "00:00";
     public int RetryIntervalSeconds { get; set; } = 60;
@@ -1251,11 +1409,25 @@ internal sealed class Config
     public int CardReadyTimeoutSeconds { get; set; } = 30;
     public List<string> ClaimActionKeywords { get; set; } = [.. DefaultClaimActionKeywords];
     public List<string> ClaimActionExclusions { get; set; } = [.. DefaultClaimActionExclusions];
+    public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
+    public List<string> CheckInKeywords { get; set; } = [.. DefaultCheckInKeywords];
     public int BalanceValueVerticalTolerance { get; set; } = 80;
+    public int BalanceValueSameRowTolerance { get; set; } = 32;
+    public int BalanceValueDirectRightPixels { get; set; } = 360;
+    public int BalanceValueCropWidthPixels { get; set; } = 300;
+    public int BalanceValueCropAbovePixels { get; set; } = 30;
+    public int BalanceValueCropBelowPixels { get; set; } = 34;
+    public int BalanceValueCropScale { get; set; } = 3;
+    public int BalanceValueFocusedCropLeftOffsetPixels { get; set; } = 80;
+    public int BalanceValueFocusedCropWidthPixels { get; set; } = 140;
+    public int BalanceValueFocusedCropScale { get; set; } = 8;
+    public int BalanceValueFocusedCropAbovePixels { get; set; } = 8;
+    public int BalanceValueFocusedCropBelowPixels { get; set; } = 12;
     public int ClaimActionLeftPixels { get; set; } = 60;
     public int ClaimActionRightPixels { get; set; } = 360;
     public int ClaimActionAboveBalancePixels { get; set; } = 220;
     public int ClaimActionBelowBalancePixels { get; set; } = 100;
+    public int ClaimCandidatePositionTolerancePixels { get; set; } = 24;
     public int PersonalCenterEvidenceAboveBalancePixels { get; set; } = 80;
     public int PersonalCenterEvidenceBelowBalancePixels { get; set; } = 300;
     public int ProfileX { get; set; } = 44;
