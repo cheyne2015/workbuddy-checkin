@@ -44,4 +44,5 @@ release\WorkBuddyAutoClaim.exe --verify-claim-ocr "C:\path\to\screenshot.png"
 
 ## 上游参考
 
-项目保留 `GitOfUser/workbuddy-checkin` 为 `upstream` 参考。它的账户入口和领取流程思路已复用；固定屏幕坐标没有用于本工具的正常领取路径。
+本项目是独立实现，不是 `GitOfUser/workbuddy-checkin` 的 Fork，也不与它共享提交历史。
+`GitOfUser/workbuddy-checkin` 仅作为流程参考：账户入口和领取步骤的思路曾被参考；固定屏幕坐标、真实鼠标移动和其余实现没有用于本工具的正常领取路径。
