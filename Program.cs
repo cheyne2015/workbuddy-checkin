@@ -81,7 +81,12 @@ internal static class Program
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    SleepUntil(scheduledToday.AddDays(1), "今天已成功领取");
+                    SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取");
+                    continue;
+                }
+                if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
+                {
+                    SleepUntil(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天");
                     continue;
                 }
 
@@ -95,14 +100,39 @@ internal static class Program
                 {
                     Log($"桌面已锁定；将在 {retryDelay.TotalSeconds:0} 秒后重试。");
                 }
-                else if (RunOnce(config, notify: true) != 0)
+                else
                 {
-                    Log($"领取未成功；将在 {retryDelay.TotalSeconds:0} 秒后重试。");
+                    int exitCode = RunOnce(config, notify: true);
+                    if (exitCode == 0)
+                    {
+                        SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取");
+                        continue;
+                    }
+                    if (exitCode == 3)
+                    {
+                        Log($"领取过程中桌面锁定；将在 {retryDelay.TotalSeconds:0} 秒后重试。");
+                    }
+                    else
+                    {
+                        // RunOnce has already completed the configured five consecutive
+                        // attempts and sent the one terminal-failure notification. Do not
+                        // start another five-attempt batch every minute for the rest of today.
+                        state.TerminalFailureDate = DateOnly.FromDateTime(now);
+                        SaveState(state);
+                        SleepUntil(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试");
+                        continue;
+                    }
                 }
             }
             catch (Exception ex) { Log("守护错误: " + ex.Message); }
             Thread.Sleep(retryDelay);
         }
+    }
+
+    private static DateTime NextClaimTime(DateTime now, TimeSpan claimTime)
+    {
+        var scheduledToday = now.Date.Add(claimTime);
+        return now < scheduledToday ? scheduledToday : scheduledToday.AddDays(1);
     }
 
     private static void SleepUntil(DateTime wakeAt, string reason)
@@ -1556,6 +1586,9 @@ internal static class Program
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
         if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
+        var nextAfterTerminalFailure = NextClaimTime(new DateTime(2026, 7, 26, 12, 0, 0), TimeSpan.Zero);
+        if (nextAfterTerminalFailure != new DateTime(2026, 7, 27, 0, 0, 0))
+            throw new InvalidOperationException("领取失败后应休眠至下一天领取时间。");
         if (!IsClaimedButtonBackground(new[] { Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242), Color.FromArgb(242, 242, 242) }))
             throw new InvalidOperationException("已领取按钮颜色校验失败。");
         if (IsClaimedButtonBackground(new[] { Color.White, Color.White, Color.White }))
@@ -1722,7 +1755,11 @@ internal sealed class Config
     public int PersonalCenterInfoX { get; set; } = 250;
     public int PersonalCenterInfoY { get; set; } = 500;
 }
-internal sealed class State { public DateOnly? SuccessDate { get; set; } }
+internal sealed class State
+{
+    public DateOnly? SuccessDate { get; set; }
+    public DateOnly? TerminalFailureDate { get; set; }
+}
 
 internal static class Native
 {
