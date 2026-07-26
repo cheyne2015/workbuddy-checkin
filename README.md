@@ -42,6 +42,8 @@ release\WorkBuddyAutoClaim.exe --verify-claim-ocr "C:\path\to\screenshot.png"
 
 `--test-personal-center` 会打开个人中心、验证余额识别并保存截图；`--verify-claim-ocr` 只检查已有截图的余额与领取文字。
 
+`release\WorkBuddyAutoClaim.exe --manual-test`（兼容旧命令 `--run-now`）会临时暂停守护进程并执行一次真实领取测试。无论成功或失败，它都不写入当天自动领取状态；失败立即停止、保存证据并等待确认，随后自动恢复守护进程。
+
 ## 上游参考
 
 本项目是独立实现，不是 `GitOfUser/workbuddy-checkin` 的 Fork，也不与它共享提交历史。

@@ -15,6 +15,7 @@ internal static class Program
     private const string TaskName = "WorkBuddy Auto Claim";
     private const string SingletonName = "WorkBuddyAutoClaim.Singleton";
     private const string ManualTestRequestName = "WorkBuddyAutoClaim.ManualTestRequest";
+    private static readonly TimeSpan ManualTestHandoffTimeout = TimeSpan.FromSeconds(90);
     private static readonly string BaseDir = AppContext.BaseDirectory;
     private static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
     private static readonly string StatePath = Path.Combine(
@@ -25,7 +26,7 @@ internal static class Program
     private static int Main(string[] args)
     {
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
-        if (command == "--run-now") return RunManualTest();
+        if (command is "--run-now" or "--manual-test") return RunManualTest();
 
         _mutex = new Mutex(true, SingletonName, out bool firstInstance);
         if (!firstInstance) return 0;
@@ -80,28 +81,24 @@ internal static class Program
         {
             try
             {
-                if (manualTestRequest.WaitOne(0))
-                {
-                    Log("收到手动测试请求，后台守护暂停并交出执行权。");
-                    return 0;
-                }
+                if (WaitForManualTestRequest(manualTestRequest, TimeSpan.Zero)) return 0;
                 var now = DateTime.Now;
                 var state = LoadState();
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
                     continue;
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntil(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天", manualTestRequest)) return 0;
                     continue;
                 }
 
                 if (now < scheduledToday)
                 {
-                    if (SleepUntil(scheduledToday, "尚未到领取时间", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(scheduledToday, "尚未到领取时间", manualTestRequest)) return 0;
                     continue;
                 }
 
@@ -114,7 +111,7 @@ internal static class Program
                     int exitCode = RunOnce(config, ClaimRunMode.Automatic);
                     if (exitCode == 0)
                     {
-                        if (SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
                         continue;
                     }
                     if (exitCode == 3)
@@ -128,17 +125,13 @@ internal static class Program
                         // start another five-attempt batch every minute for the rest of today.
                         state.TerminalFailureDate = DateOnly.FromDateTime(now);
                         SaveState(state);
-                        if (SleepUntil(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest)) return 0;
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest)) return 0;
                         continue;
                     }
                 }
             }
             catch (Exception ex) { Log("守护错误: " + ex.Message); }
-            if (manualTestRequest.WaitOne(retryDelay))
-            {
-                Log("收到手动测试请求，后台守护暂停并交出执行权。");
-                return 0;
-            }
+            if (WaitForManualTestRequest(manualTestRequest, retryDelay)) return 0;
         }
     }
 
@@ -148,7 +141,7 @@ internal static class Program
         return now < scheduledToday ? scheduledToday : scheduledToday.AddDays(1);
     }
 
-    private static bool SleepUntil(DateTime wakeAt, string reason, WaitHandle? interrupt = null)
+    private static bool SleepUntilOrManualTestRequest(DateTime wakeAt, string reason, WaitHandle? interrupt = null)
     {
         while (true)
         {
@@ -164,11 +157,21 @@ internal static class Program
             }
             if (interrupt.WaitOne((int)Math.Ceiling(milliseconds)))
             {
-                Log("收到手动测试请求，后台守护暂停并交出执行权。");
+                LogManualTestYield();
                 return true;
             }
         }
     }
+
+    private static bool WaitForManualTestRequest(WaitHandle request, TimeSpan timeout)
+    {
+        if (!request.WaitOne(timeout)) return false;
+        LogManualTestYield();
+        return true;
+    }
+
+    private static void LogManualTestYield() =>
+        Log("收到手动测试请求，后台守护暂停并交出执行权。");
 
     private static int RunManualTest()
     {
@@ -184,7 +187,7 @@ internal static class Program
             {
                 Log("手动测试请求已发出，等待后台守护暂停。");
                 request.Set();
-                if (!_mutex.WaitOne(TimeSpan.FromSeconds(90)))
+                if (!_mutex.WaitOne(ManualTestHandoffTimeout))
                     throw new TimeoutException("后台守护未能在 90 秒内暂停，手动测试未执行。");
                 ownsMutex = true;
                 restartDaemon = true;
@@ -237,6 +240,8 @@ internal static class Program
         if (!IsInteractiveDesktop())
         {
             Log("桌面已锁定，跳过本次尝试。");
+            if (isManualTest)
+                NotifyManualTestFailure("桌面已锁定，测试未执行");
             return 3;
         }
 
@@ -309,11 +314,14 @@ internal static class Program
 
         Log("领取失败: " + result);
         if (isManualTest)
-            Notify("WorkBuddy 手动测试失败", $"{result}。已停止测试并等待确认。", ToolTipIcon.Error);
+            NotifyManualTestFailure(result);
         else
             Notify("WorkBuddy 自动领取失败", "已连续尝试 5 次仍未成功，请手动领取。", ToolTipIcon.Error);
         return 1;
     }
+
+    private static void NotifyManualTestFailure(string result) =>
+        Notify("WorkBuddy 手动测试失败", $"{result}。已停止测试并等待确认。", ToolTipIcon.Error);
 
     private static IntPtr EnsureWorkBuddyWindow(Config config)
     {
