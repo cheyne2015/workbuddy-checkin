@@ -371,12 +371,13 @@ internal static class Program
         SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
         var verification = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
-        bool claimed = verification is not null;
+        bool claimed = verification != ClaimVerification.NotConfirmed;
         SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
         result = verification switch
         {
             ClaimVerification.ClaimedText => "领取成功，OCR 检测到“今日已领”状态",
             ClaimVerification.BalanceChanged => "领取成功，点击立即领取后 OCR 识别到积分余额变化",
+            ClaimVerification.NotConfirmed => "点击立即领取后未识别到积分余额变化或“今日已领”状态",
             _ => "点击立即领取后未识别到积分余额变化或“今日已领”状态"
         };
         return claimed;
@@ -553,7 +554,7 @@ internal static class Program
         return false;
     }
 
-    private static ClaimVerification? WaitForClaimResult(
+    private static ClaimVerification WaitForClaimResult(
         IntPtr window, Config config, BalanceReading beforeBalance, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
@@ -605,7 +606,7 @@ internal static class Program
             Thread.Sleep(650);
         }
         while (DateTime.UtcNow < until);
-        return null;
+        return ClaimVerification.NotConfirmed;
     }
 
     private static bool TryGetStableBalanceBeforeAction(
@@ -685,7 +686,7 @@ internal static class Program
         bool IsVisualFingerprint = false,
         string? VisualSignature = null);
     private enum ClaimActionKind { CheckIn, Immediate }
-    private enum ClaimVerification { BalanceChanged, ClaimedText }
+    private enum ClaimVerification { NotConfirmed, BalanceChanged, ClaimedText }
 
     // OCR wording can become more or less specific after a re-render. The relative
     // position is the stable identity, so two same-text buttons may still both run.
@@ -1064,8 +1065,8 @@ internal static class Program
         return snapshot.Lines
             .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
             .Where(item => item.Line.Words.Count > 0 && region.Contains(item.Bounds))
-            .Any(item => config.SuccessTextKeywords.Any(keyword =>
-                item.Normalized.Contains(NormalizeOcrText(keyword), StringComparison.Ordinal)));
+            .Any(item => item.Normalized.Contains("今日已领", StringComparison.Ordinal) ||
+                         item.Normalized.Contains("本期已领", StringComparison.Ordinal));
     }
 
     private static bool HasPersonalCenterMarker(OcrSnapshot snapshot, BalanceReading balance, Config config)
@@ -1711,7 +1712,6 @@ internal sealed class Config
     internal static readonly string[] DefaultClaimActionExclusions = ["体验版"];
     internal static readonly string[] DefaultImmediateClaimKeywords = ["立即领取"];
     internal static readonly string[] DefaultCheckInKeywords = ["签到领积分", "去签到", "签到"];
-    internal static readonly string[] DefaultSuccessTextKeywords = ["今日已领", "本期已领", "已领取", "领取成功", "领成功", "签到成功"];
     public string WorkBuddyPath { get; set; } = @"D:\Program Files\WorkBuddy\WorkBuddy.exe";
     public string ClaimTime { get; set; } = "00:00";
     public int RetryIntervalSeconds { get; set; } = 60;
@@ -1721,7 +1721,6 @@ internal sealed class Config
     public List<string> ClaimActionExclusions { get; set; } = [.. DefaultClaimActionExclusions];
     public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
     public List<string> CheckInKeywords { get; set; } = [.. DefaultCheckInKeywords];
-    public List<string> SuccessTextKeywords { get; set; } = [.. DefaultSuccessTextKeywords];
     public int BalanceValueVerticalTolerance { get; set; } = 80;
     public int BalanceValueSameRowTolerance { get; set; } = 32;
     public int BalanceValueDirectRightPixels { get; set; } = 360;

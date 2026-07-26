@@ -24,7 +24,6 @@
 - `RetryIntervalSeconds`：到点后失败或锁屏的重试间隔，默认 `60`。
 - `ImmediateClaimKeywords`：最终领取按钮文字，默认 `立即领取`。
 - `CheckInKeywords`：进入领取流程的入口文字，默认 `签到领积分`、`去签到`、`签到`。
-- `SuccessTextKeywords`：领取成功状态文字，默认包括 `今日已领`、`本期已领`；识别到后不再点击。
 - `ClaimActionExclusions`：排除相似但不是领取动作的文字，默认排除“体验版”。
 - `BalanceAnchorDriftPixels` 与 `VisualBalance*`：个人中心余额锚点和视觉余额采样的防抖容差；正常无需修改。
 - `PopupCard*`：Buddy 加油站弹层的 OCR 放大裁剪范围；仅在 WorkBuddy 更新了弹层尺寸后校准。
