@@ -8,6 +8,7 @@
   "ClaimActionExclusions": ["体验版"],
   "ImmediateClaimKeywords": ["立即领取"],
   "CheckInKeywords": ["签到领积分", "去签到", "签到"],
+  "SuccessTextKeywords": ["今日已领", "本期已领", "已领取", "领取成功", "领成功", "签到成功"],
   "BalanceValueVerticalTolerance": 80,
   "BalanceValueSameRowTolerance": 32,
   "BalanceValueDirectRightPixels": 360,

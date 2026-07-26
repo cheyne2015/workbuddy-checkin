@@ -370,11 +370,15 @@ internal static class Program
         Log($"OCR 识别最终立即领取：文本={immediate.Text}，位置=({immediate.CenterX},{immediate.CenterY})，点击前积分余额={beforeBalance.RawText}。");
         SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
-        bool claimed = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
+        var verification = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20));
+        bool claimed = verification is not null;
         SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
-        result = claimed
-            ? "领取成功，点击立即领取后 OCR 识别到积分余额变化"
-            : "点击立即领取后未识别到积分余额变化";
+        result = verification switch
+        {
+            ClaimVerification.ClaimedText => "领取成功，OCR 检测到“今日已领”状态",
+            ClaimVerification.BalanceChanged => "领取成功，点击立即领取后 OCR 识别到积分余额变化",
+            _ => "点击立即领取后未识别到积分余额变化或“今日已领”状态"
+        };
         return claimed;
     }
 
@@ -549,7 +553,7 @@ internal static class Program
         return false;
     }
 
-    private static bool WaitForClaimResult(
+    private static ClaimVerification? WaitForClaimResult(
         IntPtr window, Config config, BalanceReading beforeBalance, TimeSpan timeout)
     {
         var until = DateTime.UtcNow.Add(timeout);
@@ -566,6 +570,11 @@ internal static class Program
                 {
                     var evidence = ReadMenuEvidence(image, config);
                     hasPersonalCenter = evidence.IsPersonalCenter;
+                    if (evidence.HasSuccessText)
+                    {
+                        Log("OCR 检测到“今日已领”状态。");
+                        return ClaimVerification.ClaimedText;
+                    }
                     if (evidence.Balance is not null && IsBalanceChanged(beforeBalance, evidence.Balance, config))
                     {
                         consecutiveChangedFrames = lastChangedBalance is not null &&
@@ -578,7 +587,7 @@ internal static class Program
                         if (!beforeBalance.IsVisualFingerprint || consecutiveChangedFrames >= 2)
                         {
                             Log($"OCR 积分余额变化：{beforeBalance.RawText} -> {evidence.Balance.RawText}。");
-                            return true;
+                            return ClaimVerification.BalanceChanged;
                         }
                     }
                     else { lastChangedBalance = null; consecutiveChangedFrames = 0; }
@@ -596,7 +605,7 @@ internal static class Program
             Thread.Sleep(650);
         }
         while (DateTime.UtcNow < until);
-        return false;
+        return null;
     }
 
     private static bool TryGetStableBalanceBeforeAction(
@@ -676,6 +685,7 @@ internal static class Program
         bool IsVisualFingerprint = false,
         string? VisualSignature = null);
     private enum ClaimActionKind { CheckIn, Immediate }
+    private enum ClaimVerification { BalanceChanged, ClaimedText }
 
     // OCR wording can become more or less specific after a re-render. The relative
     // position is the stable identity, so two same-text buttons may still both run.
@@ -1054,12 +1064,8 @@ internal static class Program
         return snapshot.Lines
             .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
             .Where(item => item.Line.Words.Count > 0 && region.Contains(item.Bounds))
-            .Any(item => item.Normalized.Contains("今日已领", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("本期已领", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("已领取", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("领取成功", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("领成功", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("签到成功", StringComparison.Ordinal));
+            .Any(item => config.SuccessTextKeywords.Any(keyword =>
+                item.Normalized.Contains(NormalizeOcrText(keyword), StringComparison.Ordinal)));
     }
 
     private static bool HasPersonalCenterMarker(OcrSnapshot snapshot, BalanceReading balance, Config config)
@@ -1650,12 +1656,12 @@ internal static class Program
         {
             Lines =
             [
-                new OcrLine { Text = "本期已领", Words = [new OcrWord { Text = "本期已领", X = 45, Y = 278, Width = 68, Height = 18 }] },
+                new OcrLine { Text = "今日已领", Words = [new OcrWord { Text = "今日已领", X = 45, Y = 278, Width = 68, Height = 18 }] },
                 new OcrLine { Text = "+100", Words = [new OcrWord { Text = "+100", X = 70, Y = 314, Width = 45, Height = 18 }] }
             ]
         };
         if (!HasClaimSuccessText(claimedOcr, balance, selfTestConfig))
-            throw new InvalidOperationException("领取成功 OCR 文本校验失败。");
+            throw new InvalidOperationException("今日已领 OCR 文本校验失败。");
         Log("Self test OK.");
         return 0;
     }
@@ -1705,6 +1711,7 @@ internal sealed class Config
     internal static readonly string[] DefaultClaimActionExclusions = ["体验版"];
     internal static readonly string[] DefaultImmediateClaimKeywords = ["立即领取"];
     internal static readonly string[] DefaultCheckInKeywords = ["签到领积分", "去签到", "签到"];
+    internal static readonly string[] DefaultSuccessTextKeywords = ["今日已领", "本期已领", "已领取", "领取成功", "领成功", "签到成功"];
     public string WorkBuddyPath { get; set; } = @"D:\Program Files\WorkBuddy\WorkBuddy.exe";
     public string ClaimTime { get; set; } = "00:00";
     public int RetryIntervalSeconds { get; set; } = 60;
@@ -1714,6 +1721,7 @@ internal sealed class Config
     public List<string> ClaimActionExclusions { get; set; } = [.. DefaultClaimActionExclusions];
     public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
     public List<string> CheckInKeywords { get; set; } = [.. DefaultCheckInKeywords];
+    public List<string> SuccessTextKeywords { get; set; } = [.. DefaultSuccessTextKeywords];
     public int BalanceValueVerticalTolerance { get; set; } = 80;
     public int BalanceValueSameRowTolerance { get; set; } = 32;
     public int BalanceValueDirectRightPixels { get; set; } = 360;
