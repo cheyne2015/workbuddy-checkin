@@ -13,6 +13,8 @@ namespace WorkBuddyAutoClaim;
 internal static class Program
 {
     private const string TaskName = "WorkBuddy Auto Claim";
+    private const string SingletonName = "WorkBuddyAutoClaim.Singleton";
+    private const string ManualTestRequestName = "WorkBuddyAutoClaim.ManualTestRequest";
     private static readonly string BaseDir = AppContext.BaseDirectory;
     private static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
     private static readonly string StatePath = Path.Combine(
@@ -22,12 +24,14 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        _mutex = new Mutex(true, "WorkBuddyAutoClaim.Singleton", out bool firstInstance);
+        var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
+        if (command == "--run-now") return RunManualTest();
+
+        _mutex = new Mutex(true, SingletonName, out bool firstInstance);
         if (!firstInstance) return 0;
 
         try
         {
-            var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
             var config = LoadConfig();
             if (command == "--install")
             {
@@ -41,7 +45,6 @@ internal static class Program
             return command switch
             {
                 "--uninstall" => Uninstall(),
-                "--run-now" => RunOnce(config, notify: true),
                 "--dry-run" => DryRun(config),
                 "--verify-layout" => VerifyLayout(config),
                 "--verify-card" => VerifyBuddyCard(args.Skip(1).FirstOrDefault()),
@@ -72,27 +75,33 @@ internal static class Program
             throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
 
         var retryDelay = TimeSpan.FromSeconds(Math.Max(10, config.RetryIntervalSeconds));
+        using var manualTestRequest = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
         while (true)
         {
             try
             {
+                if (manualTestRequest.WaitOne(0))
+                {
+                    Log("收到手动测试请求，后台守护暂停并交出执行权。");
+                    return 0;
+                }
                 var now = DateTime.Now;
                 var state = LoadState();
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取");
+                    if (SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
                     continue;
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
                 {
-                    SleepUntil(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天");
+                    if (SleepUntil(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天", manualTestRequest)) return 0;
                     continue;
                 }
 
                 if (now < scheduledToday)
                 {
-                    SleepUntil(scheduledToday, "尚未到领取时间");
+                    if (SleepUntil(scheduledToday, "尚未到领取时间", manualTestRequest)) return 0;
                     continue;
                 }
 
@@ -102,10 +111,10 @@ internal static class Program
                 }
                 else
                 {
-                    int exitCode = RunOnce(config, notify: true);
+                    int exitCode = RunOnce(config, ClaimRunMode.Automatic);
                     if (exitCode == 0)
                     {
-                        SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取");
+                        if (SleepUntil(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
                         continue;
                     }
                     if (exitCode == 3)
@@ -119,13 +128,17 @@ internal static class Program
                         // start another five-attempt batch every minute for the rest of today.
                         state.TerminalFailureDate = DateOnly.FromDateTime(now);
                         SaveState(state);
-                        SleepUntil(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试");
+                        if (SleepUntil(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest)) return 0;
                         continue;
                     }
                 }
             }
             catch (Exception ex) { Log("守护错误: " + ex.Message); }
-            Thread.Sleep(retryDelay);
+            if (manualTestRequest.WaitOne(retryDelay))
+            {
+                Log("收到手动测试请求，后台守护暂停并交出执行权。");
+                return 0;
+            }
         }
     }
 
@@ -135,21 +148,92 @@ internal static class Program
         return now < scheduledToday ? scheduledToday : scheduledToday.AddDays(1);
     }
 
-    private static void SleepUntil(DateTime wakeAt, string reason)
+    private static bool SleepUntil(DateTime wakeAt, string reason, WaitHandle? interrupt = null)
     {
         while (true)
         {
             var remaining = wakeAt - DateTime.Now;
-            if (remaining <= TimeSpan.Zero) return;
+            if (remaining <= TimeSpan.Zero) return false;
 
             Log($"{reason}；休眠至 {wakeAt:yyyy-MM-dd HH:mm:ss}。");
             var milliseconds = Math.Min(remaining.TotalMilliseconds, int.MaxValue);
-            Thread.Sleep((int)Math.Ceiling(milliseconds));
+            if (interrupt is null)
+            {
+                Thread.Sleep((int)Math.Ceiling(milliseconds));
+                continue;
+            }
+            if (interrupt.WaitOne((int)Math.Ceiling(milliseconds)))
+            {
+                Log("收到手动测试请求，后台守护暂停并交出执行权。");
+                return true;
+            }
         }
     }
 
-    private static int RunOnce(Config config, bool notify)
+    private static int RunManualTest()
     {
+        bool ownsMutex = false;
+        bool restartDaemon = false;
+        try
+        {
+            var config = LoadConfig();
+            using var request = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
+            _mutex = new Mutex(true, SingletonName, out bool noOtherInstance);
+            ownsMutex = noOtherInstance;
+            if (!noOtherInstance)
+            {
+                Log("手动测试请求已发出，等待后台守护暂停。");
+                request.Set();
+                if (!_mutex.WaitOne(TimeSpan.FromSeconds(90)))
+                    throw new TimeoutException("后台守护未能在 90 秒内暂停，手动测试未执行。");
+                ownsMutex = true;
+                restartDaemon = true;
+            }
+
+            Log("开始手动测试：仅执行一次，不修改自动领取状态。");
+            return RunOnce(config, ClaimRunMode.ManualTest);
+        }
+        catch (Exception ex)
+        {
+            Log("手动测试错误: " + ex);
+            Notify("WorkBuddy 手动测试失败", "测试未执行或发生错误，已停止并等待确认。", ToolTipIcon.Error);
+            return 1;
+        }
+        finally
+        {
+            if (ownsMutex) _mutex?.ReleaseMutex();
+            _mutex?.Dispose();
+            _mutex = null;
+            if (restartDaemon)
+            {
+                try { StartDaemonAfterManualTest(); }
+                catch (Exception ex)
+                {
+                    Log("手动测试结束后恢复后台守护失败: " + ex);
+                    Notify("WorkBuddy 手动测试", "测试结束，但后台守护恢复失败，请手动启动工具。", ToolTipIcon.Error);
+                }
+            }
+        }
+    }
+
+    private static void StartDaemonAfterManualTest()
+    {
+        var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
+        Process.Start(new ProcessStartInfo(exe, "--daemon") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+        Log("手动测试结束，已恢复后台守护。");
+    }
+
+    private enum ClaimRunMode { Automatic, ManualTest }
+
+    private static int GetAttemptLimit(Config config, ClaimRunMode mode) =>
+        mode == ClaimRunMode.ManualTest ? 1 : config.MaxAttempts;
+
+    private static bool ShouldPersistDailyState(ClaimRunMode mode) => mode == ClaimRunMode.Automatic;
+
+    private static int RunOnce(Config config, ClaimRunMode mode)
+    {
+        bool isManualTest = mode == ClaimRunMode.ManualTest;
+        int maxAttempts = GetAttemptLimit(config, mode);
         if (!IsInteractiveDesktop())
         {
             Log("桌面已锁定，跳过本次尝试。");
@@ -184,11 +268,11 @@ internal static class Program
                 Log("WorkBuddy 原本在后台，领取后将恢复最小化状态。");
             }
 
-            for (int attempt = 1; attempt <= config.MaxAttempts && !succeeded; attempt++)
+            for (int attempt = 1; attempt <= maxAttempts && !succeeded; attempt++)
             {
                 try
                 {
-                    Log($"开始领取，第 {attempt}/{config.MaxAttempts} 次。");
+                    Log($"开始{(isManualTest ? "手动测试" : "领取")}，第 {attempt}/{maxAttempts} 次。");
                     succeeded = TryClaimFromPersonalCenter(window, config, out result);
                 }
                 catch (Exception ex)
@@ -217,14 +301,17 @@ internal static class Program
 
         if (succeeded)
         {
-            SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
+            if (ShouldPersistDailyState(mode)) SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
             Log("完成: " + result);
-            if (notify) Notify("WorkBuddy 自动领取", result, ToolTipIcon.Info);
+            Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取", result, ToolTipIcon.Info);
             return 0;
         }
 
         Log("领取失败: " + result);
-        if (notify) Notify("WorkBuddy 自动领取失败", "已连续尝试 5 次仍未成功，请手动领取。", ToolTipIcon.Error);
+        if (isManualTest)
+            Notify("WorkBuddy 手动测试失败", $"{result}。已停止测试并等待确认。", ToolTipIcon.Error);
+        else
+            Notify("WorkBuddy 自动领取失败", "已连续尝试 5 次仍未成功，请手动领取。", ToolTipIcon.Error);
         return 1;
     }
 
@@ -1593,6 +1680,11 @@ internal static class Program
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
         if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
+        if (GetAttemptLimit(config, ClaimRunMode.ManualTest) != 1 ||
+            GetAttemptLimit(config, ClaimRunMode.Automatic) != config.MaxAttempts)
+            throw new InvalidOperationException("手动测试必须只尝试一次，自动领取必须使用配置次数。");
+        if (ShouldPersistDailyState(ClaimRunMode.ManualTest) || !ShouldPersistDailyState(ClaimRunMode.Automatic))
+            throw new InvalidOperationException("手动测试不得写入每日状态，自动领取必须写入每日状态。");
         var nextAfterTerminalFailure = NextClaimTime(new DateTime(2026, 7, 26, 12, 0, 0), TimeSpan.Zero);
         if (nextAfterTerminalFailure != new DateTime(2026, 7, 27, 0, 0, 0))
             throw new InvalidOperationException("领取失败后应休眠至下一天领取时间。");
