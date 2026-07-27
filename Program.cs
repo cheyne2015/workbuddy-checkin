@@ -1,3 +1,4 @@
+using CommunityToolkit.WinUI.Notifications;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -7,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using Windows.UI.Notifications;
 
 namespace WorkBuddyAutoClaim;
 
@@ -15,6 +17,7 @@ internal static class Program
     private const string TaskName = "WorkBuddy Auto Claim";
     private const string SingletonName = "WorkBuddyAutoClaim.Singleton";
     private const string ManualTestRequestName = "WorkBuddyAutoClaim.ManualTestRequest";
+    private const int PersistentNotificationRetentionDays = 3;
     private static readonly TimeSpan ManualTestHandoffTimeout = TimeSpan.FromSeconds(90);
     private static readonly string BaseDir = AppContext.BaseDirectory;
     private static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
@@ -1628,8 +1631,23 @@ internal static class Program
 
     private static int Uninstall()
     {
-        RunProcess("schtasks.exe", $"/Delete /TN \"{TaskName}\" /F");
-        Log("已删除开机自启任务。\n");
+        try
+        {
+            RunProcess("schtasks.exe", $"/Delete /TN \"{TaskName}\" /F");
+            Log("已删除开机自启任务。\n");
+        }
+        finally
+        {
+            try
+            {
+                ToastNotificationManagerCompat.Uninstall();
+                Log("已清理通知中心 Toast 注册与历史。");
+            }
+            catch (Exception ex)
+            {
+                Log($"通知中心 Toast 清理失败：{ex.Message}");
+            }
+        }
         return 0;
     }
 
@@ -1747,8 +1765,8 @@ internal static class Program
         return 0;
     }
 
-    // Sends one real tray notification with the currently OCR-read balance. It never
-    // clicks a claim or check-in control.
+    // Sends one real Windows notification with the currently OCR-read balance. It never
+    // clicks a claim or check-in control; it falls back to a tray balloon only when Toast is blocked.
     private static int TestNotification(Config config)
     {
         bool launchedByTool = false;
@@ -1965,6 +1983,14 @@ internal static class Program
         if (ClassifyClaimOutcome(verifiedBalance, verifiedBalance, hasAlreadyClaimedText: true, config: selfTestConfig) !=
             ClaimOutcomeKind.AlreadyClaimed)
             throw new InvalidOperationException("余额不变且出现已领取文字必须报告今日已领取。");
+        var toastRequest = BuildPersistentNotificationRequest("WorkBuddy 自动领取", "领取成功",
+            new DateTimeOffset(2026, 7, 28, 0, 0, 0, TimeSpan.FromHours(8)));
+        if (toastRequest.Title != "WorkBuddy 自动领取" || toastRequest.Text != "领取成功" ||
+            toastRequest.ExpiresAt != new DateTimeOffset(2026, 7, 31, 0, 0, 0, TimeSpan.FromHours(8)))
+            throw new InvalidOperationException("通知中心消息必须保留标题、正文，并在三天后过期。");
+        if (PersistentNotificationRetentionDays != 3 ||
+            !CanUseToastNotificationSetting(NotificationSetting.Enabled))
+            throw new InvalidOperationException("通知中心只应在 Windows 允许时投递，并保留三天。");
         Log("Self test OK.");
         return 0;
     }
@@ -1996,11 +2022,48 @@ internal static class Program
     }
     private static void Notify(string title, string text, ToolTipIcon icon)
     {
+        var request = BuildPersistentNotificationRequest(title, text, DateTimeOffset.Now);
+        try
+        {
+            var notifier = ToastNotificationManagerCompat.CreateToastNotifier();
+            if (!CanUseToastNotificationSetting(notifier.Setting))
+            {
+                Log($"通知中心 Toast 被 Windows 阻止：状态={notifier.Setting}；将回退为临时托盘气泡。");
+            }
+            else
+            {
+                var content = new ToastContentBuilder()
+                    .AddText(request.Title)
+                    .AddText(request.Text)
+                    .GetToastContent();
+                var toast = new ToastNotification(content.GetXml())
+                {
+                    ExpirationTime = request.ExpiresAt
+                };
+                notifier.Show(toast);
+                Log($"通知中心 Toast 已投递：标题={title}，保留至 {request.ExpiresAt:yyyy-MM-dd HH:mm:ss}。");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"通知中心 Toast 投递失败，将回退为临时托盘气泡：{ex.Message}");
+        }
+
         using var tray = new NotifyIcon { Icon = SystemIcons.Information, Visible = true, BalloonTipTitle = title, BalloonTipText = text, BalloonTipIcon = icon };
         tray.ShowBalloonTip(8000);
         Application.DoEvents();
         Thread.Sleep(8500);
     }
+
+    private readonly record struct PersistentNotificationRequest(string Title, string Text, DateTimeOffset ExpiresAt);
+
+    private static PersistentNotificationRequest BuildPersistentNotificationRequest(
+        string title, string text, DateTimeOffset now) =>
+        new(title, text, now.AddDays(PersistentNotificationRetentionDays));
+
+    private static bool CanUseToastNotificationSetting(NotificationSetting setting) =>
+        setting == NotificationSetting.Enabled;
 
     private static string BuildClaimNotificationText(ClaimOutcomeKind outcome, string? beforeBalance, string? afterBalance) =>
         outcome switch
