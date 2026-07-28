@@ -1941,12 +1941,20 @@ internal static class Program
         };
         if (!HasClaimSuccessText(claimedOcr))
             throw new InvalidOperationException("今日已领 OCR 文本校验失败。");
-        if (BuildClaimNotificationText(ClaimOutcomeKind.Claimed, "100", "200") != "领取成功\n积分余额：100 → 200")
-            throw new InvalidOperationException("领取成功通知必须包含领取前后余额。");
-        if (BuildClaimNotificationText(ClaimOutcomeKind.AlreadyClaimed, "200", "200") != "今日已领取\n当前余额：200")
-            throw new InvalidOperationException("今日已领取通知必须包含当前余额。");
-        if (BuildClaimNotificationText(ClaimOutcomeKind.Failed, "100", null) != "领取失败\n最后读取余额：100")
-            throw new InvalidOperationException("领取失败通知必须包含最后读取余额。");
+        if (BuildClaimNotificationText(ClaimOutcomeKind.Claimed, "100", "200") != "领取成功 · 积分余额：100 → 200")
+            throw new InvalidOperationException("领取成功通知必须在同一正文中显示领取前后余额。");
+        if (BuildClaimNotificationText(ClaimOutcomeKind.AlreadyClaimed, "200", "200") != "今日已领取 · 当前余额：200")
+            throw new InvalidOperationException("今日已领取通知必须在同一正文中显示当前余额。");
+        if (BuildClaimNotificationText(ClaimOutcomeKind.Failed, "100", null) != "领取失败 · 最后读取余额：100")
+            throw new InvalidOperationException("领取失败通知必须在同一正文中显示最后读取余额。");
+        var claimNotificationRequest = BuildPersistentNotificationRequest(
+            "WorkBuddy 自动领取", BuildClaimNotificationText(ClaimOutcomeKind.Claimed, "100", "200"),
+            new DateTimeOffset(2026, 7, 28, 0, 0, 0, TimeSpan.FromHours(8)));
+        var claimNotificationXml = BuildToastXml(claimNotificationRequest).GetXml();
+        if (Regex.Matches(claimNotificationXml, "<text").Count != 2 ||
+            !claimNotificationXml.Contains(">WorkBuddy 自动领取<", StringComparison.Ordinal) ||
+            !claimNotificationXml.Contains(">领取成功 · 积分余额：100 → 200<", StringComparison.Ordinal))
+            throw new InvalidOperationException("领取通知必须在首个 Toast 正文中同时显示状态和余额。");
         var misreadBalanceOcr = new OcrSnapshot
         {
             Lines =
@@ -2032,11 +2040,7 @@ internal static class Program
             }
             else
             {
-                var content = new ToastContentBuilder()
-                    .AddText(request.Title)
-                    .AddText(request.Text)
-                    .GetToastContent();
-                var toast = new ToastNotification(content.GetXml())
+                var toast = new ToastNotification(BuildToastXml(request))
                 {
                     ExpirationTime = request.ExpiresAt
                 };
@@ -2062,15 +2066,22 @@ internal static class Program
         string title, string text, DateTimeOffset now) =>
         new(title, text, now.AddDays(PersistentNotificationRetentionDays));
 
+    private static Windows.Data.Xml.Dom.XmlDocument BuildToastXml(PersistentNotificationRequest request) =>
+        new ToastContentBuilder()
+            .AddText(request.Title)
+            .AddText(request.Text)
+            .GetToastContent()
+            .GetXml();
+
     private static bool CanUseToastNotificationSetting(NotificationSetting setting) =>
         setting == NotificationSetting.Enabled;
 
     private static string BuildClaimNotificationText(ClaimOutcomeKind outcome, string? beforeBalance, string? afterBalance) =>
         outcome switch
         {
-            ClaimOutcomeKind.Claimed => $"领取成功\n积分余额：{beforeBalance ?? "未读取到"} → {afterBalance ?? "未读取到"}",
-            ClaimOutcomeKind.AlreadyClaimed => $"今日已领取\n当前余额：{afterBalance ?? beforeBalance ?? "未读取到"}",
-            _ => $"领取失败\n最后读取余额：{beforeBalance ?? afterBalance ?? "未读取到"}"
+            ClaimOutcomeKind.Claimed => $"领取成功 · 积分余额：{beforeBalance ?? "未读取到"} → {afterBalance ?? "未读取到"}",
+            ClaimOutcomeKind.AlreadyClaimed => $"今日已领取 · 当前余额：{afterBalance ?? beforeBalance ?? "未读取到"}",
+            _ => $"领取失败 · 最后读取余额：{beforeBalance ?? afterBalance ?? "未读取到"}"
         };
 
     private static string? FormatNotificationBalance(BalanceReading? balance)
