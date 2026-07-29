@@ -1,50 +1,133 @@
 # WorkBuddy 自动领取
 
-运行 `build.ps1` 生成 `release\WorkBuddyAutoClaim.exe`，再双击 `install.cmd`。它会为当前用户创建登录自启动任务并立即启动后台守护进程；默认每天 `00:00` 执行一次。
+在 Windows 后台按计划领取 WorkBuddy 积分的本地工具。它复用已经登录的 WorkBuddy 会话，通过个人中心读取“积分余额”并核验结果；不会保存账号密码，也不会上传截图或 OCR 文字。
 
-当天确认成功后，进程会休眠到下一个 `00:00`，不会继续轮询。到点后遇到锁屏、睡眠时才每 60 秒等待重试；一轮连续 5 次领取仍失败则通知一次，并休眠到次日 `00:00`，不会整天反复点击。
+## 它会做什么
 
-## 领取策略
+- 默认每天 `00:00` 尝试领取一次；时间可在 `config.json` 的 `ClaimTime` 中修改。
+- 电脑锁屏、睡眠或桌面暂不可操作时，等恢复后每 `60` 秒重试；当天最多尝试 `5` 次。
+- 成功、确认“今日已领取”或达到当天失败上限后，守护进程休眠到下一天，不会全天轮询或反复点击。
+- WorkBuddy 未运行时会后台启动；由工具启动的 WorkBuddy 会在流程结束后关闭。原本在前台运行的窗口保持前台，原本最小化的窗口会恢复为最小化。
+- 成功、今日已领取、失败都会发送 Windows 通知中心通知，并保留三天。
 
-正常领取不依赖 Buddy 加油站卡片颜色、固定按钮位置或真实鼠标：
+## 领取与核验逻辑
 
-1. 点击左下个人中心入口，并在后台截图中同时确认“积分余额”与“设置 / 外观 / 浅色 / 深色”等个人中心文字。
-2. 读取并记录积分余额的数字指纹。若当前版本把一个很小的数字（例如 `0`）绘制得 Windows OCR 无法转写，工具会改为记录同一数字区域的本机视觉指纹；点击前必须连续稳定采样，点击后也必须连续两帧确认同一变化，绝不猜测余额数值。
-3. 优先寻找并点击“立即领取”。
-4. 若没有“立即领取”，才依次点击“签到领积分”“去签到”“签到”等入口文字；入口本身不算领取成功。
-5. 入口后，识别 Buddy 加油站弹层中新增的“立即领取”。弹层不承担余额读取：余额始终以个人中心入口前的稳定记录为基线；点击最终按钮后重新打开个人中心核验。积分余额变化或识别到“今日已领”（兼容“本期已领”等状态文字）任一成立，才报告领取成功并写入当天成功记录。
+每次尝试严格按以下顺序执行：
 
-截图完全在本机由 Windows OCR 处理，不会上传。由工具启动的 WorkBuddy 会在结束后关闭；原本前台的窗口保持前台，原本后台/最小化的窗口会恢复最小化。
+1. 打开左下角个人中心。
+2. 找到并记录“积分余额”。
+3. 优先识别并点击“立即领取”。
+4. 若已出现“今日已领”或“已领取”等状态，判定为当天已领取。
+5. 没有“立即领取”时，识别并点击“签到领积分”“去签到”或“签到”；若随后出现“立即领取”，再点击它。
+6. 点击“立即领取”后重新回到个人中心：余额变化才判定为领取成功；余额未变化且看到已领取状态才判定为“今日已领取”。其余情况报告失败，不猜测成功。
 
-## 配置与检查
+按钮与余额均由 OCR 动态识别，不依赖固定领取按钮坐标、Buddy 加油站期数或界面颜色。因此 WorkBuddy 的浅色/深色模式和普通布局变化都有适配空间。
 
-`release\config.json` 首次运行时由 `config.example.json` 创建。常用字段：
+## 通知内容
 
-- `ClaimTime`：每日领取时间，默认 `00:00`。
-- `RetryIntervalSeconds`：到点后失败或锁屏的重试间隔，默认 `60`。
-- `ImmediateClaimKeywords`：最终领取按钮文字，默认 `立即领取`。
-- `CheckInKeywords`：进入领取流程的入口文字，默认 `签到领积分`、`去签到`、`签到`。
-- `ClaimActionExclusions`：排除相似但不是领取动作的文字，默认排除“体验版”。
-- `BalanceAnchorDriftPixels` 与 `VisualBalance*`：个人中心余额锚点和视觉余额采样的防抖容差；正常无需修改。
-- `PopupCard*`：Buddy 加油站弹层的 OCR 放大裁剪范围；仅在 WorkBuddy 更新了弹层尺寸后校准。
-- `BalanceValue*` 与 `ClaimAction*Pixels`：余额和按钮相对于“积分余额”文字的容差。界面改版后可按诊断截图调整。
-- `ProfileX`、`ProfileBottomOffset`：左下个人中心入口位置；领取按钮位置始终由 OCR 动态决定。
+通知正文将状态与余额放在同一行，避免 Windows 通知中心折叠后遗漏余额：
 
-日志、当天成功记录与点击前/后的诊断截图都在 `%LOCALAPPDATA%\WorkBuddyAutoClaim\`。
+- `领取成功 · 积分余额：领取前 → 领取后`
+- `今日已领取 · 当前余额：余额`
+- `领取失败 · 最后读取余额：余额`
 
-这些命令均不会点击领取：
+如果 Windows 禁止应用通知，工具会写入日志并退回为临时托盘气泡；请在 Windows 设置中允许 WorkBuddy Auto Claim 通知。
+
+## 安装与启动
+
+### 前提
+
+- Windows 10 版本 19041 或更高。
+- 已安装并登录 WorkBuddy。
+- 已安装 .NET 8 Desktop Runtime（如果双击程序没有任何反应，先安装它）。
+
+### 首次安装
+
+1. 打开 PowerShell，进入项目目录并构建：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+   ```
+
+2. 双击 `install.cmd`，或运行：
+
+   ```powershell
+   .\install.cmd
+   ```
+
+这会为当前用户创建开机自启任务，并启动后台守护。首次运行会在 `release\` 内从 `config.example.json` 创建 `config.json`。
+
+要删除开机自启任务，双击 `uninstall.cmd`。它不会强制结束已经运行的守护进程；当前进程会在退出登录或下次重启后停止。
+
+## 配置
+
+编辑 `release\config.json`，修改后重新启动守护进程才会生效。
+
+常用项如下：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WorkBuddyPath` | `D:\Program Files\WorkBuddy\WorkBuddy.exe` | WorkBuddy 程序路径 |
+| `ClaimTime` | `00:00` | 每日领取时间，格式 `HH:mm` |
+| `RetryIntervalSeconds` | `60` | 锁屏、睡眠恢复或失败后的重试等待秒数 |
+| `MaxAttempts` | `5` | 每日自动领取的最多尝试次数 |
+| `LaunchWaitSeconds` | `20` | 启动 WorkBuddy 后的等待秒数 |
+| `CardReadyTimeoutSeconds` | `30` | 等待个人中心余额区域加载的最长秒数 |
+| `ImmediateClaimKeywords` | `立即领取` | 最终领取按钮的识别文字 |
+| `CheckInKeywords` | `签到领积分`、`去签到`、`签到` | 进入领取流程的入口文字 |
+
+其余 `Balance*`、`VisualBalance*`、`Profile*` 配置用于 OCR 兼容和截图校准。正常使用无需修改；只有 WorkBuddy 大版本改版、日志和诊断截图显示定位失败时才调整。
+
+## 测试与常用命令
+
+所有命令均从 `release\` 目录运行：
 
 ```powershell
-release\WorkBuddyAutoClaim.exe --self-test
-release\WorkBuddyAutoClaim.exe --test-personal-center
-release\WorkBuddyAutoClaim.exe --verify-claim-ocr "C:\path\to\screenshot.png"
+cd .\release
+
+# 运行内置回归检查；不会领取
+.\WorkBuddyAutoClaim.exe --self-test
+
+# 读取当前余额并发送一条真实 Windows 通知；不会点击签到或领取
+.\WorkBuddyAutoClaim.exe --test-notification
+
+# 打开个人中心、验证“积分余额”并保存截图；不会领取
+.\WorkBuddyAutoClaim.exe --test-personal-center
+
+# 对已有截图检查余额和领取文字；不会控制 WorkBuddy
+.\WorkBuddyAutoClaim.exe --verify-claim-ocr "C:\path\to\screenshot.png"
 ```
 
-`--test-personal-center` 会打开个人中心、验证余额识别并保存截图；`--verify-claim-ocr` 只检查已有截图的余额与领取文字。
+以下命令会执行一次真实领取流程，适合在需要人工验证时使用：
 
-`release\WorkBuddyAutoClaim.exe --manual-test`（兼容旧命令 `--run-now`）会临时暂停守护进程并执行一次真实领取测试。无论成功或失败，它都不写入当天自动领取状态；失败立即停止、保存证据并等待确认，随后自动恢复守护进程。
+```powershell
+.\WorkBuddyAutoClaim.exe --manual-test
+```
 
-## 上游参考
+手动测试只尝试一次，不会写入当天的自动领取成功状态；失败后会停止并等待处理，后台守护随后恢复。
 
-本项目是独立实现，不是 `GitOfUser/workbuddy-checkin` 的 Fork，也不与它共享提交历史。
-`GitOfUser/workbuddy-checkin` 仅作为流程参考：账户入口和领取步骤的思路曾被参考；固定屏幕坐标、真实鼠标移动和其余实现没有用于本工具的正常领取路径。
+## 日志与排错
+
+工具的运行数据都在：
+
+```text
+%LOCALAPPDATA%\WorkBuddyAutoClaim\
+```
+
+重点文件：
+
+- `workbuddy-auto-claim.log`：运行、OCR、通知与失败原因。
+- `state.json`：当天自动领取的成功或终止失败状态。
+- `workbuddy-*.png`：领取前后、个人中心识别失败等诊断截图。
+- `workbuddy-personal-center-ocr-failure.txt`：识别失败时保存的 OCR 原文。
+
+常见检查顺序：
+
+1. 运行 `--test-notification`，确认通知中心能看到“当前余额”。
+2. 运行 `--test-personal-center`，确认个人中心截图中可见“积分余额”。
+3. 若每日未运行，检查 `workbuddy-auto-claim.log` 中是否有“桌面已锁定”“未发现积分余额”或“通知中心 Toast 被 Windows 阻止”。
+4. 发生界面改版时，保留对应诊断截图和日志，再调整 OCR 配置或更新工具。
+
+## 项目关系
+
+本项目是独立仓库实现，不是 `GitOfUser/workbuddy-checkin` 的 Fork，也不共享提交历史。早期仅参考了其流程思路；本工具的后台行为、OCR 校验、通知和维护均独立实现。
