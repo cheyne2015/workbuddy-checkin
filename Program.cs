@@ -348,12 +348,13 @@ internal static class Program
     private static IntPtr EnsureWorkBuddyWindow(Config config, out bool launchedByTool)
     {
         var existing = FindWorkBuddyWindow();
+        bool hadExistingProcess = HasExistingWorkBuddyProcess();
         if (existing != IntPtr.Zero)
         {
             launchedByTool = false;
             return existing;
         }
-        launchedByTool = true;
+        launchedByTool = ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess);
         if (!File.Exists(config.WorkBuddyPath)) throw new FileNotFoundException("找不到 WorkBuddy.exe", config.WorkBuddyPath);
         Process.Start(new ProcessStartInfo(config.WorkBuddyPath) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Minimized });
         var until = DateTime.UtcNow.AddSeconds(config.LaunchWaitSeconds);
@@ -364,6 +365,25 @@ internal static class Program
             if (window != IntPtr.Zero) return window;
         }
         return IntPtr.Zero;
+    }
+
+    private static bool ShouldTreatWorkBuddyAsToolLaunched(bool hadVisibleWindow, bool hadExistingProcess) =>
+        !hadVisibleWindow && !hadExistingProcess;
+
+    private static bool HasExistingWorkBuddyProcess()
+    {
+        foreach (var process in Process.GetProcessesByName("WorkBuddy"))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (!process.HasExited) return true;
+                }
+                catch { }
+            }
+        }
+        return false;
     }
 
     // Chromium/Electron 会把内容放在子窗口。领取按钮需要完整地处理按下和松开事件，
@@ -2071,7 +2091,7 @@ internal static class Program
     private static int TestPersonalCenter(Config config)
     {
         var originalWindow = FindWorkBuddyWindow();
-        bool wasRunning = originalWindow != IntPtr.Zero;
+        bool wasRunning = originalWindow != IntPtr.Zero || HasExistingWorkBuddyProcess();
         bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
         bool launchedByTool = false;
         IntPtr window = IntPtr.Zero;
@@ -2199,6 +2219,11 @@ internal static class Program
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
         if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
+        if (ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: true))
+            throw new InvalidOperationException("已有后台 WorkBuddy 进程时不得被视为工具启动并关闭。");
+        if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
+            ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: true, hadExistingProcess: true))
+            throw new InvalidOperationException("WorkBuddy 启动归属判定回归失败。");
         if (GetAttemptLimit(config, ClaimRunMode.ManualTest) != 1 ||
             GetAttemptLimit(config, ClaimRunMode.Automatic) != config.MaxAttempts)
             throw new InvalidOperationException("手动测试必须只尝试一次，自动领取必须使用配置次数。");
