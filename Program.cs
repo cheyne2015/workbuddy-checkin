@@ -53,7 +53,9 @@ internal static class Program
                 "--verify-layout" => VerifyLayout(config),
                 "--verify-card" => VerifyBuddyCard(args.Skip(1).FirstOrDefault()),
                 "--ocr-screenshot" => OcrScreenshot(args.Skip(1).FirstOrDefault()),
-                "--verify-claim-ocr" => VerifyClaimOcr(args.Skip(1).FirstOrDefault(), config),
+                "--verify-claim-ocr" => VerifyClaimOcr(args.Skip(1).FirstOrDefault(), config, args.Skip(2).FirstOrDefault()),
+                "--verify-profile-entry" => VerifyProfileEntry(args.Skip(1).FirstOrDefault(), args.Skip(2).FirstOrDefault(), args.Skip(3).FirstOrDefault()),
+                "--verify-profile-recovery" => VerifyProfileRecovery(args.Skip(1).FirstOrDefault()),
                 "--test-buddy-card" => TestBuddyCard(config),
                 "--test-menu" => TestMenuClick(config),
                 "--test-personal-center" => TestPersonalCenter(config),
@@ -445,12 +447,32 @@ internal static class Program
             return ClickImmediateClaimAndVerify(window, config, immediate, beforeBalance, out result, out outcomeKind,
                 out afterNotificationBalance);
 
-        if (HasClaimSuccessText(currentOcr))
+        if (HasClaimSuccessText(currentOcr) &&
+            TryConfirmAlreadyClaimed(window, config, beforeBalance,
+                ReadMenuEvidence(currentImage, currentOcr, config), out var confirmedBalance))
         {
             result = "WorkBuddy 今日已领取";
             outcomeKind = ClaimOutcomeKind.AlreadyClaimed;
-            afterNotificationBalance = beforeBalance;
+            afterNotificationBalance = confirmedBalance ?? beforeBalance;
             return true;
+        }
+
+        // A transient frame can contain stale text from the previous state. If its
+        // “already claimed” text was not stable, discard that frame before routing.
+        if (HasClaimSuccessText(currentOcr))
+        {
+            Log("单帧“今日已领”未通过余额核验；重新读取个人中心后继续领取流程。");
+            using var refreshedImage = CaptureWindow(window);
+            if (refreshedImage is null)
+            {
+                result = "“今日已领”状态未通过稳定核验，且无法重新读取个人中心。";
+                return false;
+            }
+            currentOcr = ReadOcr(refreshedImage);
+            immediate = FindImmediateClaimAction(refreshedImage, currentOcr, config);
+            if (immediate is not null)
+                return ClickImmediateClaimAndVerify(window, config, immediate, beforeBalance, out result, out outcomeKind,
+                    out afterNotificationBalance);
         }
 
         // “签到”只被视为进入领取流程的入口，不把它本身当作领取成功。
@@ -480,19 +502,23 @@ internal static class Program
                     result = "签到后识别到今日已领取，但未能回个人中心读取余额核验。";
                     return false;
                 }
-                afterNotificationBalance = afterEvidence.Balance;
-                var classified = ClassifyClaimOutcome(stableBeforeEntry, afterEvidence.Balance,
-                    hasAlreadyClaimedText: true, config: config);
-                if (classified is null)
+                if (TryConfirmAlreadyClaimed(window, config, stableBeforeEntry, afterEvidence,
+                    out var confirmedPostCheckInBalance))
                 {
-                    result = "签到后余额状态无法确认，未将本次判断为领取成功或今日已领取。";
-                    return false;
+                    afterNotificationBalance = confirmedPostCheckInBalance ?? afterEvidence.Balance;
+                    outcomeKind = ClaimOutcomeKind.AlreadyClaimed;
+                    result = "WorkBuddy 今日已领取";
+                    return true;
                 }
-                outcomeKind = classified.Value;
-                result = outcomeKind == ClaimOutcomeKind.Claimed
-                    ? "领取成功，签到后个人中心积分余额发生变化"
-                    : "WorkBuddy 今日已领取";
-                return true;
+                if (IsBalanceChanged(stableBeforeEntry, afterEvidence.Balance, config))
+                {
+                    afterNotificationBalance = afterEvidence.Balance;
+                    outcomeKind = ClaimOutcomeKind.Claimed;
+                    result = "领取成功，签到后个人中心积分余额发生变化";
+                    return true;
+                }
+                result = "签到后“今日已领”状态未通过两帧余额核验。";
+                return false;
             }
         }
 
@@ -575,16 +601,62 @@ internal static class Program
     {
         int profileX = config.ProfileX;
         int profileY = GetWindowHeight(window) - config.ProfileBottomOffset;
+        bool personalCenterAlreadyOpen = false;
+        bool profileEntryLocated = false;
+        var balanceFrames = new List<BalanceReading?>();
         using (var current = CaptureWindow(window))
         {
             if (current is not null)
             {
-                evidence = ReadMenuEvidence(current, config);
-                if (evidence.IsPersonalCenter) return true;
+                var currentOcr = ReadOcr(current);
+                evidence = ReadMenuEvidence(current, currentOcr, config);
+                if (evidence.IsPersonalCenter)
+                {
+                    if (TryConfirmBalanceAcrossFrames(balanceFrames, evidence.Balance, out var confirmedBalance))
+                    {
+                        evidence = evidence with { Balance = confirmedBalance };
+                        return true;
+                    }
+                    personalCenterAlreadyOpen = true;
+                }
                 if (TryFindProfileEntryPoint(current, out var profilePoint))
                 {
                     profileX = profilePoint.X;
                     profileY = profilePoint.Y;
+                    profileEntryLocated = true;
+                }
+                else if (!personalCenterAlreadyOpen &&
+                         TryDismissBottomLeftUpdateBanner(window, current, currentOcr, out var dismissedPoint))
+                {
+                    // The banner previously hid the avatar and caused a green button in the
+                    // banner to be clicked as if it were the personal-center entry point.
+                    Log($"已关闭遮挡个人中心入口的更新提示：({dismissedPoint.X},{dismissedPoint.Y})。");
+                    var revealDeadline = DateTime.UtcNow.AddSeconds(Math.Min(5, config.CardReadyTimeoutSeconds));
+                    do
+                    {
+                        Thread.Sleep(250);
+                        using var afterDismissal = CaptureWindow(window);
+                        if (afterDismissal is null) continue;
+                        var afterDismissalOcr = ReadOcr(afterDismissal);
+                        evidence = ReadMenuEvidence(afterDismissal, afterDismissalOcr, config);
+                        if (evidence.IsPersonalCenter)
+                        {
+                            if (TryConfirmBalanceAcrossFrames(balanceFrames, evidence.Balance, out var confirmedBalance))
+                            {
+                                evidence = evidence with { Balance = confirmedBalance };
+                                return true;
+                            }
+                            personalCenterAlreadyOpen = true;
+                        }
+                        if (TryFindProfileEntryPoint(afterDismissal, out var revealedProfilePoint))
+                        {
+                            profileX = revealedProfilePoint.X;
+                            profileY = revealedProfilePoint.Y;
+                            profileEntryLocated = true;
+                            break;
+                        }
+                    }
+                    while (DateTime.UtcNow < revealDeadline);
                 }
             }
         }
@@ -596,8 +668,19 @@ internal static class Program
             return false;
         }
 
-        Log("未发现积分余额；打开左下个人中心并等待 OCR 锚点加载。");
-        ClickWindowPoint(window, profileX, profileY);
+        if (personalCenterAlreadyOpen)
+            Log("个人中心已打开，但尚未读取到明确数字余额；继续等待 OCR，不重复点击入口。");
+        else
+        {
+            if (!profileEntryLocated)
+            {
+                evidence = MenuEvidence.Empty;
+                Log("未确认左下头像入口；拒绝使用被横幅遮挡时可能误点的固定坐标。");
+                return false;
+            }
+            Log("未发现积分余额；打开左下个人中心并等待 OCR 锚点加载。");
+            ClickWindowPoint(window, profileX, profileY);
+        }
         var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
         Bitmap? lastCapture = null;
         OcrSnapshot? lastOcr = null;
@@ -613,7 +696,12 @@ internal static class Program
                     lastCapture?.Dispose();
                     lastCapture = (Bitmap)image.Clone();
                     lastOcr = ocr;
-                    if (evidence.IsPersonalCenter) return true;
+                    if (evidence.IsPersonalCenter &&
+                        TryConfirmBalanceAcrossFrames(balanceFrames, evidence.Balance, out var confirmedBalance))
+                    {
+                        evidence = evidence with { Balance = confirmedBalance };
+                        return true;
+                    }
                 }
                 Thread.Sleep(650);
             }
@@ -621,7 +709,7 @@ internal static class Program
 
             evidence = MenuEvidence.Empty;
             SavePersonalCenterFailureEvidence(lastCapture, lastOcr);
-            Log("打开个人中心后仍未通过 OCR 识别到积分余额。");
+            Log("打开个人中心后仍未通过 OCR 识别到明确数字余额。");
             return false;
         }
         finally { lastCapture?.Dispose(); }
@@ -632,26 +720,148 @@ internal static class Program
         int left = 0;
         int right = Math.Min(bitmap.Width, 220);
         int top = Math.Max(0, bitmap.Height - 70);
-        var greenPixels = new List<Point>();
-        for (int y = top; y < bitmap.Height; y += 2)
-        {
-            for (int x = left; x < right; x += 2)
-            {
-                if (IsBuddyGreen(bitmap.GetPixel(x, y))) greenPixels.Add(new Point(x, y));
-            }
-        }
-        if (greenPixels.Count < 8)
+        var avatar = FindBuddyGreenComponents(bitmap, left, right, top, bitmap.Height)
+            .Where(component => component.Left <= 60 && component.Right <= 90 &&
+                                component.Width is >= 18 and <= 70 && component.Height is >= 18 and <= 70 &&
+                                component.Width * 10 >= component.Height * 6 &&
+                                component.Height * 10 >= component.Width * 6)
+            .OrderByDescending(component => component.PixelCount)
+            .FirstOrDefault();
+        if (avatar.PixelCount == 0)
         {
             point = default;
             return false;
         }
 
-        int avatarRight = greenPixels.Max(pixel => pixel.X);
-        int avatarCenterY = (int)Math.Round(greenPixels.Average(pixel => pixel.Y));
-        point = new Point(Math.Min(right - 1, avatarRight + 35), avatarCenterY);
+        point = new Point(avatar.Left + avatar.Width / 2, avatar.Top + avatar.Height / 2);
         Log($"动态定位个人中心入口：({point.X},{point.Y})。");
         return true;
     }
+
+    private readonly record struct GreenComponent(int Left, int Top, int Right, int Bottom, int PixelCount)
+    {
+        public int Width => Right - Left + 1;
+        public int Height => Bottom - Top + 1;
+    }
+
+    private static IEnumerable<GreenComponent> FindBuddyGreenComponents(
+        Bitmap bitmap, int left, int right, int top, int bottom)
+    {
+        int boundedLeft = Math.Clamp(left, 0, bitmap.Width);
+        int boundedRight = Math.Clamp(right, boundedLeft, bitmap.Width);
+        int boundedTop = Math.Clamp(top, 0, bitmap.Height);
+        int boundedBottom = Math.Clamp(bottom, boundedTop, bitmap.Height);
+        var seen = new bool[Math.Max(1, boundedRight - boundedLeft), Math.Max(1, boundedBottom - boundedTop)];
+        for (int y = boundedTop; y < boundedBottom; y++)
+        for (int x = boundedLeft; x < boundedRight; x++)
+        {
+            if (seen[x - boundedLeft, y - boundedTop] || !IsBuddyGreen(bitmap.GetPixel(x, y))) continue;
+            var pending = new Queue<Point>();
+            pending.Enqueue(new Point(x, y));
+            seen[x - boundedLeft, y - boundedTop] = true;
+            int count = 0, minX = x, maxX = x, minY = y, maxY = y;
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                count++;
+                minX = Math.Min(minX, current.X);
+                maxX = Math.Max(maxX, current.X);
+                minY = Math.Min(minY, current.Y);
+                maxY = Math.Max(maxY, current.Y);
+                for (int offsetY = -1; offsetY <= 1; offsetY++)
+                for (int offsetX = -1; offsetX <= 1; offsetX++)
+                {
+                    if (offsetX == 0 && offsetY == 0) continue;
+                    int nextX = current.X + offsetX;
+                    int nextY = current.Y + offsetY;
+                    if (nextX < boundedLeft || nextX >= boundedRight || nextY < boundedTop || nextY >= boundedBottom ||
+                        seen[nextX - boundedLeft, nextY - boundedTop] || !IsBuddyGreen(bitmap.GetPixel(nextX, nextY))) continue;
+                    seen[nextX - boundedLeft, nextY - boundedTop] = true;
+                    pending.Enqueue(new Point(nextX, nextY));
+                }
+            }
+            yield return new GreenComponent(minX, minY, maxX, maxY, count);
+        }
+    }
+
+    private static bool TryDismissBottomLeftUpdateBanner(
+        IntPtr window, Bitmap bitmap, OcrSnapshot ocr, out Point dismissedPoint)
+    {
+        if (!TryFindBottomLeftUpdateBannerClosePoint(bitmap, ocr, out dismissedPoint)) return false;
+        ClickWindowPoint(window, dismissedPoint.X, dismissedPoint.Y);
+        return true;
+    }
+
+    // WorkBuddy's optional update banner can cover the avatar at the very point used
+    // to reopen the personal center. Identify it by its text and its nearby gray ×,
+    // rather than treating any green pixels in that strip as an avatar.
+    private static bool TryFindBottomLeftUpdateBannerClosePoint(Bitmap bitmap, OcrSnapshot ocr, out Point point)
+    {
+        var updateLabel = ocr.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
+            .FirstOrDefault(item => item.Bounds.Left < Math.Min(bitmap.Width, 160) &&
+                                    item.Bounds.Top >= Math.Max(0, bitmap.Height - 90) &&
+                                    item.Normalized.Contains("新版本", StringComparison.Ordinal));
+        if (updateLabel.Line is null)
+        {
+            point = default;
+            return false;
+        }
+
+        int left = Math.Clamp(updateLabel.Bounds.Right + 20, 0, bitmap.Width);
+        int right = Math.Clamp(updateLabel.Bounds.Right + 400, left, bitmap.Width);
+        int top = Math.Clamp(updateLabel.Bounds.Top - 32, 0, bitmap.Height);
+        int bottom = Math.Clamp(updateLabel.Bounds.Top, top, bitmap.Height);
+        var seen = new bool[Math.Max(1, right - left), Math.Max(1, bottom - top)];
+        var glyphs = new List<GreenComponent>();
+        for (int y = top; y < bottom; y++)
+        for (int x = left; x < right; x++)
+        {
+            if (seen[x - left, y - top] || !IsCloseGlyphPixel(bitmap.GetPixel(x, y))) continue;
+            var pending = new Queue<Point>();
+            pending.Enqueue(new Point(x, y));
+            seen[x - left, y - top] = true;
+            int count = 0, minX = x, maxX = x, minY = y, maxY = y;
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                count++;
+                minX = Math.Min(minX, current.X);
+                maxX = Math.Max(maxX, current.X);
+                minY = Math.Min(minY, current.Y);
+                maxY = Math.Max(maxY, current.Y);
+                for (int offsetY = -1; offsetY <= 1; offsetY++)
+                for (int offsetX = -1; offsetX <= 1; offsetX++)
+                {
+                    if (offsetX == 0 && offsetY == 0) continue;
+                    int nextX = current.X + offsetX;
+                    int nextY = current.Y + offsetY;
+                    if (nextX < left || nextX >= right || nextY < top || nextY >= bottom ||
+                        seen[nextX - left, nextY - top] || !IsCloseGlyphPixel(bitmap.GetPixel(nextX, nextY))) continue;
+                    seen[nextX - left, nextY - top] = true;
+                    pending.Enqueue(new Point(nextX, nextY));
+                }
+            }
+            glyphs.Add(new GreenComponent(minX, minY, maxX, maxY, count));
+        }
+
+        var closeGlyph = glyphs
+            .Where(glyph => glyph.Width is >= 5 and <= 14 && glyph.Height is >= 5 and <= 14 && glyph.PixelCount >= 8)
+            .OrderByDescending(glyph => glyph.PixelCount)
+            .FirstOrDefault();
+        if (closeGlyph.PixelCount == 0)
+        {
+            point = default;
+            return false;
+        }
+
+        point = new Point(closeGlyph.Left + closeGlyph.Width / 2, closeGlyph.Top + closeGlyph.Height / 2);
+        return true;
+    }
+
+    private static bool IsCloseGlyphPixel(Color color) =>
+        Math.Max(color.R, Math.Max(color.G, color.B)) <= 240 &&
+        Math.Max(color.R, Math.Max(color.G, color.B)) - Math.Min(color.R, Math.Min(color.G, color.B)) <= 5;
 
     // 领取统一从左下个人菜单进行。主界面检查只用于避免菜单已经打开时被再次点击关闭，
     // 领取按钮、今日已领状态和积分余额均必须来自菜单内的 Buddy 加油站卡片。
@@ -689,10 +899,9 @@ internal static class Program
         var until = DateTime.UtcNow.Add(timeout);
         var reopenMenuAfter = DateTime.UtcNow.AddSeconds(2);
         bool reopenedMenu = false;
-        bool sawSuccessText = false;
-        BalanceReading? lastChangedBalance = null;
+        var alreadyClaimedSamples = new List<MenuEvidence>();
         BalanceReading? lastObservedBalance = null;
-        int consecutiveChangedFrames = 0;
+        var changedBalanceFrames = new List<BalanceReading?>();
         do
         {
             bool hasPersonalCenter = false;
@@ -702,40 +911,34 @@ internal static class Program
                 {
                     var evidence = ReadMenuEvidence(image, config);
                     hasPersonalCenter = evidence.IsPersonalCenter;
+                    alreadyClaimedSamples.Add(evidence);
                     if (evidence.HasSuccessText)
                     {
                         Log("OCR 检测到“今日已领”状态。");
-                        sawSuccessText = true;
                     }
                     if (evidence.Balance is not null)
                     {
                         lastObservedBalance = evidence.Balance;
                         if (IsBalanceChanged(beforeBalance, evidence.Balance, config))
                         {
-                            consecutiveChangedFrames = lastChangedBalance is not null &&
-                                                       AreSameBalance(lastChangedBalance, evidence.Balance, config)
-                                ? consecutiveChangedFrames + 1
-                                : 1;
-                            lastChangedBalance = evidence.Balance;
-                            // Numeric OCR is already an exact value. A visual fallback needs two
-                            // matching post-click frames so a repaint or OCR-anchor jitter cannot win.
-                            if (!beforeBalance.IsVisualFingerprint || consecutiveChangedFrames >= 2)
+                            if (TryConfirmBalanceAcrossFrames(changedBalanceFrames, evidence.Balance,
+                                    out var confirmedChangedBalance))
                             {
-                                afterBalance = evidence.Balance;
-                                Log($"OCR 积分余额变化：{beforeBalance.RawText} -> {evidence.Balance.RawText}。");
+                                afterBalance = confirmedChangedBalance;
+                                Log($"OCR 积分余额变化：{beforeBalance.RawText} -> {confirmedChangedBalance!.RawText}。");
                                 return ClaimVerification.BalanceChanged;
                             }
                         }
                         else
                         {
-                            lastChangedBalance = null;
-                            consecutiveChangedFrames = 0;
-                            if (sawSuccessText && hasPersonalCenter && AreSameBalance(beforeBalance, evidence.Balance, config))
-                            {
-                                afterBalance = evidence.Balance;
-                                return ClaimVerification.ClaimedText;
-                            }
+                            TryConfirmBalanceAcrossFrames(changedBalanceFrames, null, out _);
                         }
+                    }
+                    else TryConfirmBalanceAcrossFrames(changedBalanceFrames, null, out _);
+                    if (IsConfirmedAlreadyClaimed(alreadyClaimedSamples, beforeBalance, config, out var confirmedBalance))
+                    {
+                        afterBalance = confirmedBalance;
+                        return ClaimVerification.ClaimedText;
                     }
                 }
             }
@@ -752,7 +955,6 @@ internal static class Program
         }
         while (DateTime.UtcNow < until);
         afterBalance = lastObservedBalance;
-        if (sawSuccessText) return ClaimVerification.ClaimedText;
         return ClaimVerification.NotConfirmed;
     }
 
@@ -760,22 +962,7 @@ internal static class Program
         IntPtr window, Config config, BalanceReading observed, out BalanceReading stable)
     {
         stable = observed;
-        // Text/numeric OCR is an exact number. The visual fallback intentionally asks for
-        // two additional compatible captures before a non-reversible click.
-        if (!observed.IsVisualFingerprint) return true;
-
-        for (int sample = 0; sample < 2; sample++)
-        {
-            Thread.Sleep(250);
-            using var image = CaptureWindow(window);
-            if (image is null) return false;
-            var current = ReadMenuEvidence(image, config).Balance;
-            if (current is null || !IsSameBalanceAnchor(observed.Bounds, current.Bounds, config) ||
-                !AreSameBalance(observed, current, config))
-                return false;
-            stable = current;
-        }
-        return true;
+        return HasConfirmedNumericBalance(observed);
     }
 
     // 领取是不可逆操作。保留最近一次点击前后的窗口截图，便于区分“未点到”、
@@ -832,6 +1019,12 @@ internal static class Program
         OcrBounds Bounds,
         bool IsVisualFingerprint = false,
         string? VisualSignature = null);
+
+    private static bool HasConfirmedNumericBalance(BalanceReading? balance) =>
+        balance is { IsVisualFingerprint: false } &&
+        !string.IsNullOrWhiteSpace(balance.Fingerprint) &&
+        balance.Fingerprint.All(char.IsDigit);
+
     private enum ClaimActionKind { CheckIn, Immediate }
     private enum ClaimVerification { NotConfirmed, BalanceChanged, ClaimedText }
     private enum ClaimOutcomeKind { Claimed, AlreadyClaimed, Failed }
@@ -862,7 +1055,7 @@ internal static class Program
         return 0;
     }
 
-    private static int VerifyClaimOcr(string? imagePath, Config config)
+    private static int VerifyClaimOcr(string? imagePath, Config config, string? expectedBalance = null)
     {
         if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
             throw new FileNotFoundException("请提供可读取的截图路径。", imagePath);
@@ -870,10 +1063,49 @@ internal static class Program
         var ocr = ReadOcr(bitmap);
         var evidence = ReadMenuEvidence(bitmap, ocr, config);
         var immediate = FindImmediateClaimAction(bitmap, ocr, config);
+        if (!HasConfirmedNumericBalance(evidence.Balance))
+            throw new InvalidOperationException("未读取到明确数字的积分余额，OCR 领取验证不通过。\n");
+        var numericBalance = FormatNotificationBalance(evidence.Balance);
+        if (!string.IsNullOrWhiteSpace(expectedBalance) &&
+            !StringComparer.Ordinal.Equals(numericBalance, expectedBalance))
+            throw new InvalidOperationException($"积分余额 OCR 校验失败：期望 {expectedBalance}，实际 {numericBalance ?? "未读取到"}。\n");
         if (evidence.Balance is null && !evidence.HasSuccessText && immediate is null && evidence.Actions.Count == 0)
             throw new InvalidOperationException("OCR 未识别到成功状态或可领取文字。\n");
-        Console.WriteLine($"余额={evidence.Balance?.RawText ?? "无"}; 成功文字={evidence.HasSuccessText}; 立即领取={immediate?.Text ?? "无"}; 签到入口={string.Join(", ", evidence.Actions.Select(action => action.Text))}");
+        Console.WriteLine($"余额={numericBalance ?? "无"}; 成功文字={evidence.HasSuccessText}; 立即领取={immediate?.Text ?? "无"}; 签到入口={string.Join(", ", evidence.Actions.Select(action => action.Text))}");
         Log($"OCR 领取截图验证通过：余额={evidence.Balance?.RawText ?? "无"}，成功文字={evidence.HasSuccessText}，立即领取={immediate?.Text ?? "无"}，签到入口数量={evidence.Actions.Count}。\n");
+        return 0;
+    }
+
+    // Offline regression seam for the exact post-claim failure frame. It does not
+    // touch WorkBuddy: the profile avatar is deliberately hidden, so the verifier
+    // requires a safe update-banner close target instead of a guessed green click.
+    private static int VerifyProfileRecovery(string? imagePath)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+            throw new FileNotFoundException("请提供可读取的领取后截图路径。", imagePath);
+        using var bitmap = new Bitmap(imagePath);
+        var ocr = ReadOcr(bitmap);
+        if (TryFindProfileEntryPoint(bitmap, out var falseProfilePoint))
+            throw new InvalidOperationException($"领取后遮挡截图不应把绿色横幅识别成头像：({falseProfilePoint.X},{falseProfilePoint.Y})。\n");
+        if (!TryFindBottomLeftUpdateBannerClosePoint(bitmap, ocr, out var closePoint))
+            throw new InvalidOperationException("领取后遮挡截图未找到可安全关闭的新版本提示。\n");
+        Log($"领取后个人中心恢复截图验证通过：未误识别头像，更新提示关闭点=({closePoint.X},{closePoint.Y})。\n");
+        return 0;
+    }
+
+    private static int VerifyProfileEntry(string? imagePath, string? expectedXText, string? expectedYText)
+    {
+        if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+            throw new FileNotFoundException("请提供可读取的个人中心入口截图路径。", imagePath);
+        if (!int.TryParse(expectedXText, out var expectedX) || !int.TryParse(expectedYText, out var expectedY))
+            throw new ArgumentException("请提供头像入口的预期 X 与 Y 坐标。");
+        using var bitmap = new Bitmap(imagePath);
+        if (!TryFindProfileEntryPoint(bitmap, out var profilePoint))
+            throw new InvalidOperationException("截图中未识别到左下头像入口。\n");
+        const int tolerance = 12;
+        if (Math.Abs(profilePoint.X - expectedX) > tolerance || Math.Abs(profilePoint.Y - expectedY) > tolerance)
+            throw new InvalidOperationException($"头像入口坐标错误：预期约 ({expectedX},{expectedY})，实际 ({profilePoint.X},{profilePoint.Y})。\n");
+        Log($"个人中心入口截图验证通过：头像入口=({profilePoint.X},{profilePoint.Y})。\n");
         return 0;
     }
 
@@ -934,8 +1166,9 @@ internal static class Program
         var balance = TryReadBalance(bitmap, ocr, config);
         var actions = FindCheckInActions(ocr, config);
         bool hasSuccessText = HasClaimSuccessText(ocr);
-        // The user-defined personal-center evidence is the visible balance itself.
-        bool isPersonalCenter = balance is not null;
+        // “积分余额” confirms that the personal center is open. A separate numeric
+        // check is required before any claim action or successful result is accepted.
+        bool isPersonalCenter = FindBalanceLabel(ocr) is not null;
         return new MenuEvidence(balance, actions, hasSuccessText, isPersonalCenter);
     }
 
@@ -965,26 +1198,45 @@ internal static class Program
         if (direct is not null) readings.Add(direct);
         var broadValue = TryReadBalanceFromCrop(bitmap, label, config, leftOffset: -4,
             width: config.BalanceValueCropWidthPixels, scale: config.BalanceValueCropScale,
-            above: config.BalanceValueCropAbovePixels, below: config.BalanceValueCropBelowPixels, highContrast: false);
+            above: config.BalanceValueCropAbovePixels, below: config.BalanceValueCropBelowPixels,
+            treatment: BalanceCropTreatment.Raw);
         if (broadValue is not null) readings.Add(broadValue);
 
         // The value can be a single small digit at the far right of the row. A focused,
         // higher-resolution retry prevents a visible 0 balance from being treated as missing.
+        var focusedRawValue = TryReadBalanceFromCrop(bitmap, label, config,
+            config.BalanceValueFocusedCropLeftOffsetPixels,
+            config.BalanceValueFocusedCropWidthPixels,
+            config.BalanceValueFocusedCropScale,
+            config.BalanceValueFocusedCropAbovePixels,
+            config.BalanceValueFocusedCropBelowPixels,
+            treatment: BalanceCropTreatment.Raw);
+        if (focusedRawValue is not null) readings.Add(focusedRawValue);
+
         var focusedValue = TryReadBalanceFromCrop(bitmap, label, config,
             config.BalanceValueFocusedCropLeftOffsetPixels,
             config.BalanceValueFocusedCropWidthPixels,
             config.BalanceValueFocusedCropScale,
             config.BalanceValueFocusedCropAbovePixels,
             config.BalanceValueFocusedCropBelowPixels,
-            highContrast: true);
+            treatment: BalanceCropTreatment.LightContrast);
         if (focusedValue is not null) readings.Add(focusedValue);
+
+        var darkThemeFocusedValue = TryReadBalanceFromCrop(bitmap, label, config,
+            config.BalanceValueFocusedCropLeftOffsetPixels,
+            config.BalanceValueFocusedCropWidthPixels,
+            config.BalanceValueFocusedCropScale,
+            config.BalanceValueFocusedCropAbovePixels,
+            config.BalanceValueFocusedCropBelowPixels,
+            treatment: BalanceCropTreatment.DarkContrast);
+        if (darkThemeFocusedValue is not null) readings.Add(darkThemeFocusedValue);
 
         var confirmed = SelectConfirmedNumericBalance(readings);
         if (confirmed is not null)
             return confirmed with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
 
-        Log("积分余额多路 OCR 未形成一致数字；仅保留视觉余额指纹，不在通知中显示猜测数值。");
-        return CreateVisualBalanceReading(bitmap, label.Bounds, config);
+        Log("积分余额多路 OCR 未形成一致数字；本轮不将视觉指纹视为可用余额。");
+        return null;
     }
 
     private static BalanceReading? SelectConfirmedNumericBalance(IEnumerable<BalanceReading> readings) =>
@@ -996,6 +1248,29 @@ internal static class Program
             .ThenByDescending(group => group.First().RawText.Length)
             .Select(group => group.First())
             .FirstOrDefault();
+
+    // A single frame must already contain a multi-route OCR confirmation. This
+    // second layer requires that value to recur in the latest three frames.
+    private static BalanceReading? SelectConfirmedBalanceAcrossFrames(IEnumerable<BalanceReading?> readings) =>
+        readings
+            .TakeLast(3)
+            .Where(HasConfirmedNumericBalance)
+            .Cast<BalanceReading>()
+            .GroupBy(reading => reading.Fingerprint, StringComparer.Ordinal)
+            .Where(group => group.Count() >= 2)
+            .OrderByDescending(group => group.Count())
+            .ThenByDescending(group => group.First().RawText.Length)
+            .Select(group => group.First())
+            .FirstOrDefault();
+
+    private static bool TryConfirmBalanceAcrossFrames(
+        List<BalanceReading?> frames, BalanceReading? candidate, out BalanceReading? confirmedBalance)
+    {
+        frames.Add(candidate);
+        if (frames.Count > 3) frames.RemoveAt(0);
+        confirmedBalance = SelectConfirmedBalanceAcrossFrames(frames);
+        return confirmedBalance is not null;
+    }
 
     private static BalanceReading? TryReadBalance(OcrSnapshot snapshot, Config config)
     {
@@ -1042,12 +1317,15 @@ internal static class Program
         return label?.Line is null ? null : label;
     }
 
+    private enum BalanceCropTreatment { Raw, LightContrast, DarkContrast }
+
     private static BalanceReading? TryReadBalanceFromCrop(
         Bitmap bitmap, BalanceLabel label, Config config, int leftOffset, int width, int scale, int above, int below,
-        bool highContrast)
+        BalanceCropTreatment treatment)
     {
         using var enlargedValueArea = CreateBalanceValueCrop(bitmap, label.Bounds, leftOffset, width, scale, above, below);
-        if (highContrast) IncreaseOcrContrast(enlargedValueArea);
+        if (treatment == BalanceCropTreatment.LightContrast) IncreaseOcrContrast(enlargedValueArea);
+        else if (treatment == BalanceCropTreatment.DarkContrast) NormalizeDarkThemeOcr(enlargedValueArea);
         var enlargedOcr = ReadOcr(enlargedValueArea, "en-US");
         var value = enlargedOcr.Lines
             .Where(line => line.Words.Count > 0 && line.Text.Count(char.IsDigit) >= 1)
@@ -1136,6 +1414,14 @@ internal static class Program
             int luma = (color.R * 299 + color.G * 587 + color.B * 114) / 1000;
             bitmap.SetPixel(x, y, luma < threshold ? Color.Black : Color.White);
         }
+    }
+
+    private static void NormalizeDarkThemeOcr(Bitmap bitmap)
+    {
+        IncreaseOcrContrast(bitmap);
+        for (int y = 0; y < bitmap.Height; y++)
+        for (int x = 0; x < bitmap.Width; x++)
+            bitmap.SetPixel(x, y, bitmap.GetPixel(x, y).ToArgb() == Color.Black.ToArgb() ? Color.White : Color.Black);
     }
 
     private static BalanceReading CreateVisualBalanceReading(Bitmap bitmap, OcrBounds labelBounds, Config config)
@@ -1255,19 +1541,13 @@ internal static class Program
 
     private static bool AreSameBalance(BalanceReading expected, BalanceReading actual, Config config)
     {
-        if (!expected.IsVisualFingerprint && !actual.IsVisualFingerprint)
-            return StringComparer.Ordinal.Equals(expected.Fingerprint, actual.Fingerprint);
-        return GetVisualBalanceDifference(GetVisualSignature(expected), GetVisualSignature(actual)) <=
-               config.VisualBalanceSameFrameMaxChangedCells;
+        return HasConfirmedNumericBalance(expected) && HasConfirmedNumericBalance(actual) &&
+               StringComparer.Ordinal.Equals(expected.Fingerprint, actual.Fingerprint);
     }
 
-    private static bool IsBalanceChanged(BalanceReading before, BalanceReading after, Config config)
-    {
-        if (!before.IsVisualFingerprint && !after.IsVisualFingerprint)
-            return !StringComparer.Ordinal.Equals(before.Fingerprint, after.Fingerprint);
-        return GetVisualBalanceDifference(GetVisualSignature(before), GetVisualSignature(after)) >=
-               config.VisualBalanceChangeMinimumChangedCells;
-    }
+    private static bool IsBalanceChanged(BalanceReading before, BalanceReading after, Config config) =>
+        HasConfirmedNumericBalance(before) && HasConfirmedNumericBalance(after) &&
+        !StringComparer.Ordinal.Equals(before.Fingerprint, after.Fingerprint);
 
     private static ClaimOutcomeKind? ClassifyClaimOutcome(
         BalanceReading before, BalanceReading after, bool hasAlreadyClaimedText, Config config)
@@ -1275,6 +1555,45 @@ internal static class Program
         if (IsBalanceChanged(before, after, config)) return ClaimOutcomeKind.Claimed;
         if (hasAlreadyClaimedText && AreSameBalance(before, after, config)) return ClaimOutcomeKind.AlreadyClaimed;
         return null;
+    }
+
+    private static bool IsConfirmedAlreadyClaimed(
+        IReadOnlyList<MenuEvidence> samples, BalanceReading beforeBalance, Config config,
+        out BalanceReading? confirmedBalance)
+    {
+        confirmedBalance = null;
+        int stableSamples = 0;
+        foreach (var sample in samples)
+        {
+            if (!sample.IsPersonalCenter || !sample.HasSuccessText || sample.Balance is null ||
+                !HasConfirmedNumericBalance(sample.Balance) ||
+                !AreSameBalance(beforeBalance, sample.Balance, config))
+            {
+                stableSamples = 0;
+                continue;
+            }
+
+            stableSamples++;
+            if (stableSamples < 2) continue;
+            confirmedBalance = sample.Balance;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryConfirmAlreadyClaimed(
+        IntPtr window, Config config, BalanceReading beforeBalance, MenuEvidence firstEvidence,
+        out BalanceReading? confirmedBalance)
+    {
+        var samples = new List<MenuEvidence> { firstEvidence };
+        for (int sampleIndex = 1; sampleIndex < 2; sampleIndex++)
+        {
+            Thread.Sleep(650);
+            using var image = CaptureWindow(window);
+            if (image is null) continue;
+            samples.Add(ReadMenuEvidence(image, config));
+        }
+        return IsConfirmedAlreadyClaimed(samples, beforeBalance, config, out confirmedBalance);
     }
 
     private static string GetVisualSignature(BalanceReading reading) =>
@@ -1751,18 +2070,34 @@ internal static class Program
     // 不点击领取，仅验证个人中心入口、领取状态卡片和后台截图。
     private static int TestPersonalCenter(Config config)
     {
-        var window = EnsureWorkBuddyWindow(config);
-        if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
-        Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
-        Thread.Sleep(800);
-        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence))
-            throw new InvalidOperationException("个人中心未完成加载或 OCR 未识别到积分余额。");
-        using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。");
-        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
-        Directory.CreateDirectory(folder);
-        image.Save(Path.Combine(folder, "workbuddy-personal-center-test.png"), ImageFormat.Png);
-        Log($"个人中心测试完成：余额={evidence.Balance!.RawText}，已领状态={evidence.HasSuccessText}，未执行领取点击。");
-        return 0;
+        var originalWindow = FindWorkBuddyWindow();
+        bool wasRunning = originalWindow != IntPtr.Zero;
+        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool launchedByTool = false;
+        IntPtr window = IntPtr.Zero;
+        try
+        {
+            window = EnsureWorkBuddyWindow(config, out launchedByTool);
+            if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+            Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
+            Thread.Sleep(800);
+            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence))
+                throw new InvalidOperationException("个人中心未完成加载或 OCR 未识别到积分余额。");
+            using var image = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。");
+            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
+            Directory.CreateDirectory(folder);
+            image.Save(Path.Combine(folder, "workbuddy-personal-center-test.png"), ImageFormat.Png);
+            Log($"个人中心测试完成：余额={evidence.Balance!.RawText}，已领状态={evidence.HasSuccessText}，未执行领取点击。");
+            return 0;
+        }
+        finally
+        {
+            if (window != IntPtr.Zero)
+            {
+                if (launchedByTool) CloseWorkBuddy();
+                else if (!wasForeground) Native.ShowWindow(window, Native.SW_MINIMIZE);
+            }
+        }
     }
 
     // Sends one real Windows notification with the currently OCR-read balance. It never
@@ -1884,6 +2219,20 @@ internal static class Program
             throw new InvalidOperationException("+100 领取成功按钮颜色校验失败。");
         if (!IsPersonalMenuCard(new BuddyCard(34, 180, 216), 600) || IsPersonalMenuCard(new BuddyCard(22, 366, 218), 600))
             throw new InvalidOperationException("个人菜单卡片位置路由校验失败。");
+        using (var profileEntryBitmap = new Bitmap(220, 100))
+        {
+            for (int y = 40; y <= 72; y++)
+            for (int x = 24; x <= 60; x++)
+                profileEntryBitmap.SetPixel(x, y, Color.FromArgb(20, 170, 130));
+            // The update banner can contain a much larger green control in the same
+            // bottom strip. It must never pull the account-entry click away from the avatar.
+            for (int y = 74; y <= 98; y++)
+            for (int x = 176; x <= 219; x++)
+                profileEntryBitmap.SetPixel(x, y, Color.FromArgb(20, 170, 130));
+            if (!TryFindProfileEntryPoint(profileEntryBitmap, out var profileEntryPoint) ||
+                profileEntryPoint.X < 24 || profileEntryPoint.X > 60)
+                throw new InvalidOperationException("动态个人中心入口必须落在绿色头像本体内。");
+        }
 
         var selfTestConfig = new Config();
         var ocr = new OcrSnapshot
@@ -1925,12 +2274,27 @@ internal static class Program
         };
         if (FindImmediateClaimAction(immediateOnlyOcr, selfTestConfig) is null)
             throw new InvalidOperationException("立即领取不得依赖余额、本期、Buddy 加油站或固定区域。");
+        var labelOnlyOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额", Words = [new OcrWord { Text = "积分余额", X = 30, Y = 350, Width = 80, Height = 18 }] }
+            ]
+        };
+        using (var labelOnlyImage = new Bitmap(500, 500))
+        using (var labelOnlyGraphics = Graphics.FromImage(labelOnlyImage))
+        {
+            labelOnlyGraphics.Clear(Color.White);
+            if (TryReadBalance(labelOnlyImage, labelOnlyOcr, selfTestConfig) is not null)
+                throw new InvalidOperationException("未读到明确数字的积分余额不得以视觉指纹继续领取流程。");
+        }
         var visualBefore = new BalanceReading("视觉余额指纹", "V:000000000000", immediateBalance.Bounds, true);
         var visualSame = new BalanceReading("视觉余额指纹", "V:000100000000", immediateBalance.Bounds, true);
         var visualChanged = new BalanceReading("视觉余额指纹", "V:010101010101", immediateBalance.Bounds, true);
-        if (!AreSameBalance(visualBefore, visualSame, selfTestConfig) ||
-            !IsBalanceChanged(visualBefore, visualChanged, selfTestConfig))
-            throw new InvalidOperationException("视觉余额稳定性校验失败。");
+        if (HasConfirmedNumericBalance(visualBefore) ||
+            AreSameBalance(visualBefore, visualSame, selfTestConfig) ||
+            IsBalanceChanged(visualBefore, visualChanged, selfTestConfig))
+            throw new InvalidOperationException("视觉余额指纹不得作为领取或今日已领的余额证据。");
         var claimedOcr = new OcrSnapshot
         {
             Lines =
@@ -1941,6 +2305,20 @@ internal static class Program
         };
         if (!HasClaimSuccessText(claimedOcr))
             throw new InvalidOperationException("今日已领 OCR 文本校验失败。");
+        var staleAlreadyClaimedSamples = new[]
+        {
+            new MenuEvidence(immediateBalance, [], true, true),
+            new MenuEvidence(immediateBalance, [], false, true)
+        };
+        if (IsConfirmedAlreadyClaimed(staleAlreadyClaimedSamples, immediateBalance, selfTestConfig, out _))
+            throw new InvalidOperationException("单帧“今日已领”文字不得直接判定为今日已领取。");
+        var stableAlreadyClaimedSamples = new[]
+        {
+            new MenuEvidence(immediateBalance, [], true, true),
+            new MenuEvidence(immediateBalance, [], true, true)
+        };
+        if (!IsConfirmedAlreadyClaimed(stableAlreadyClaimedSamples, immediateBalance, selfTestConfig, out _))
+            throw new InvalidOperationException("个人中心连续两帧“今日已领”且余额不变必须判定为今日已领取。");
         if (BuildClaimNotificationText(ClaimOutcomeKind.Claimed, "100", "200") != "领取成功 · 积分余额：100 → 200")
             throw new InvalidOperationException("领取成功通知必须在同一正文中显示领取前后余额。");
         if (BuildClaimNotificationText(ClaimOutcomeKind.AlreadyClaimed, "200", "200") != "今日已领取 · 当前余额：200")
@@ -1984,6 +2362,20 @@ internal static class Program
             throw new InvalidOperationException("余额多路读取必须接受两个一致值，并忽略一个异常值。");
         if (SelectConfirmedNumericBalance([verifiedBalance, outlierBalance]) is not null)
             throw new InvalidOperationException("余额多路读取没有一致结果时不得显示猜测数值。");
+        if (SelectConfirmedBalanceAcrossFrames([verifiedBalance, outlierBalance, verifiedBalance])?.RawText != "398.49")
+            throw new InvalidOperationException("三帧余额读取中两个相同明确数字必须形成跨帧共识。");
+        if (SelectConfirmedBalanceAcrossFrames([verifiedBalance, outlierBalance,
+                new BalanceReading("498.49", "49849", correctedBalance.Bounds)]) is not null)
+            throw new InvalidOperationException("三帧余额读取互不一致时不得形成跨帧共识。");
+        using (var darkThemeBalance = new Bitmap(2, 1))
+        {
+            darkThemeBalance.SetPixel(0, 0, Color.FromArgb(20, 20, 20));
+            darkThemeBalance.SetPixel(1, 0, Color.White);
+            NormalizeDarkThemeOcr(darkThemeBalance);
+            if (darkThemeBalance.GetPixel(0, 0).ToArgb() != Color.White.ToArgb() ||
+                darkThemeBalance.GetPixel(1, 0).ToArgb() != Color.Black.ToArgb())
+                throw new InvalidOperationException("深色主题余额预处理必须输出黑字白底供 OCR 读取。");
+        }
         var changedBalance = new BalanceReading("498.49", "49849", correctedBalance.Bounds);
         if (ClassifyClaimOutcome(verifiedBalance, changedBalance, hasAlreadyClaimedText: false, config: selfTestConfig) !=
             ClaimOutcomeKind.Claimed)
@@ -2086,9 +2478,8 @@ internal static class Program
 
     private static string? FormatNotificationBalance(BalanceReading? balance)
     {
-        if (balance is null) return null;
-        if (balance.IsVisualFingerprint) return "视觉余额已记录";
-        var match = Regex.Match(balance.RawText, @"\d+(?:[.,]\d+)?");
+        if (!HasConfirmedNumericBalance(balance)) return null;
+        var match = Regex.Match(balance!.RawText, @"\d+(?:[.,]\d+)?");
         return match.Success ? match.Value.Replace(',', '.') : balance.RawText.Trim();
     }
     private static void RunProcess(string fileName, string arguments)

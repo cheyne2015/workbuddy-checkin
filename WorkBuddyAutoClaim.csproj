@@ -9,6 +9,7 @@
     <SelfContained>false</SelfContained>
   </PropertyGroup>
   <ItemGroup>
+    <None Update="config.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Update="workbuddy-ocr.ps1" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
