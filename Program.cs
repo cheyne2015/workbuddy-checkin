@@ -2,6 +2,7 @@ using CommunityToolkit.WinUI.Notifications;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
@@ -17,19 +18,38 @@ internal static class Program
     private const string TaskName = "WorkBuddy Auto Claim";
     private const string SingletonName = "WorkBuddyAutoClaim.Singleton";
     private const string ManualTestRequestName = "WorkBuddyAutoClaim.ManualTestRequest";
+    private const string DaemonReadyEventName = "WorkBuddyAutoClaim.DaemonReady";
+    private const string LoginRequiredResultPrefix = "检测到 WorkBuddy 登录失效";
     private const int PersistentNotificationRetentionDays = 3;
+    private const int LogRetentionDays = 30;
+    private const int FailureDiagnosticRetentionCount = 20;
+    private const int ExpectedOcrProcessTimeoutSeconds = 8;
+    private const int UiFrameSignatureColumns = 12;
+    private const int UiFrameSignatureRows = 8;
+    private const int UiFrameLumaQuantization = 32;
+    private const int UiTransitionMinimumCellDelta = 2;
+    private const int UiTransitionMinimumChangedCells = 3;
     private static readonly TimeSpan ManualTestHandoffTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan DaemonRestartConfirmationTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan OcrProcessTimeout = TimeSpan.FromSeconds(ExpectedOcrProcessTimeoutSeconds);
     private static readonly string BaseDir = AppContext.BaseDirectory;
+    private static readonly string DataDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
     private static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
-    private static readonly string StatePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim", "state.json");
+    private static readonly string StatePath = Path.Combine(DataDirectory, "state.json");
+    private static readonly string StateBackupPath = StatePath + ".bak";
     private static Mutex? _mutex;
+    private static DateOnly? _lastRetentionMaintenanceDate;
 
     [STAThread]
     private static int Main(string[] args)
     {
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
+        if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
+        if (command == "--self-test") return RunSelfTest();
+        if (command == "--verify-claim-ocr") return RunClaimOcrVerification(args);
         if (command is "--run-now" or "--manual-test") return RunManualTest();
+        if (IsInteractiveNonClaimTest(command)) return RunInteractiveNonClaimTest(command);
 
         _mutex = new Mutex(true, SingletonName, out bool firstInstance);
         if (!firstInstance) return 0;
@@ -42,8 +62,7 @@ internal static class Program
                 var exitCode = Install(config);
                 _mutex.ReleaseMutex();
                 _mutex = null;
-                var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
-                Process.Start(new ProcessStartInfo(exe, "--daemon") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+                StartDaemonAfterExclusiveOperation("安装");
                 return exitCode;
             }
             return command switch
@@ -53,7 +72,6 @@ internal static class Program
                 "--verify-layout" => VerifyLayout(config),
                 "--verify-card" => VerifyBuddyCard(args.Skip(1).FirstOrDefault()),
                 "--ocr-screenshot" => OcrScreenshot(args.Skip(1).FirstOrDefault()),
-                "--verify-claim-ocr" => VerifyClaimOcr(args.Skip(1).FirstOrDefault(), config, args.Skip(2).FirstOrDefault()),
                 "--verify-profile-entry" => VerifyProfileEntry(args.Skip(1).FirstOrDefault(), args.Skip(2).FirstOrDefault(), args.Skip(3).FirstOrDefault()),
                 "--verify-profile-recovery" => VerifyProfileRecovery(args.Skip(1).FirstOrDefault()),
                 "--test-buddy-card" => TestBuddyCard(config),
@@ -61,7 +79,6 @@ internal static class Program
                 "--test-personal-center" => TestPersonalCenter(config),
                 "--test-notification" => TestNotification(config),
                 "--probe-checkin-entry" => ProbeCheckInEntry(config),
-                "--self-test" => SelfTest(config),
                 "--daemon" => RunDaemon(config),
                 _ => 2
             };
@@ -75,11 +92,69 @@ internal static class Program
         finally { _mutex?.ReleaseMutex(); }
     }
 
+    private static bool IsInteractiveNonClaimTest(string command) =>
+        command is "--test-buddy-card" or "--test-menu" or "--test-personal-center" or
+            "--test-notification" or "--probe-checkin-entry";
+
+    private static int RunInteractiveNonClaimTest(string command)
+    {
+        bool ownsMutex = false;
+        bool restartDaemon = false;
+        try
+        {
+            var config = LoadConfig();
+            using var request = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
+            _mutex = new Mutex(true, SingletonName, out bool noOtherInstance);
+            ownsMutex = noOtherInstance;
+            if (!noOtherInstance)
+            {
+                Log($"Non-claim test {command} requested; waiting for daemon handoff.");
+                request.Set();
+                if (!_mutex.WaitOne(ManualTestHandoffTimeout))
+                    throw new TimeoutException($"Daemon did not yield within {ManualTestHandoffTimeout.TotalSeconds:0} seconds; test was not executed.");
+                ownsMutex = true;
+                restartDaemon = true;
+            }
+            return command switch
+            {
+                "--test-buddy-card" => TestBuddyCard(config),
+                "--test-menu" => TestMenuClick(config),
+                "--test-personal-center" => TestPersonalCenter(config),
+                "--test-notification" => TestNotification(config),
+                "--probe-checkin-entry" => ProbeCheckInEntry(config),
+                _ => 2
+            };
+        }
+        catch (Exception ex)
+        {
+            Log($"Non-claim test {command} failed or was not executed: {ex}");
+            Notify("WorkBuddy 安全测试失败", "测试未执行或发生错误；已停止并等待确认。", ToolTipIcon.Error);
+            return 1;
+        }
+        finally
+        {
+            if (ownsMutex) _mutex?.ReleaseMutex();
+            _mutex?.Dispose();
+            _mutex = null;
+            if (restartDaemon)
+            {
+                try { StartDaemonAfterExclusiveOperation("安全测试"); }
+                catch (Exception ex)
+                {
+                    Log("Failed to restore daemon after non-claim test: " + ex);
+                    Notify("WorkBuddy 安全测试", "测试结束，但后台守护恢复失败，请手动启动工具。", ToolTipIcon.Error);
+                }
+            }
+        }
+    }
+
     private static int RunDaemon(Config config)
     {
-        Log("后台守护已启动，领取时间: " + config.ClaimTime);
         if (!TimeSpan.TryParse(config.ClaimTime, out var claimTime))
             throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
+        using var daemonReady = new EventWaitHandle(false, EventResetMode.AutoReset, DaemonReadyEventName);
+        daemonReady.Set();
+        Log("后台守护已启动并发出就绪信号，领取时间: " + config.ClaimTime);
 
         var retryDelay = TimeSpan.FromSeconds(Math.Max(10, config.RetryIntervalSeconds));
         using var manualTestRequest = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
@@ -89,7 +164,27 @@ internal static class Program
             {
                 if (WaitForManualTestRequest(manualTestRequest, TimeSpan.Zero)) return 0;
                 var now = DateTime.Now;
-                var state = LoadState();
+                var stateLoad = LoadState();
+                if (!stateLoad.IsUsable)
+                {
+                    Log("State file and backup are invalid; claim is stopped safely for today.");
+                    Notify("WorkBuddy 自动领取", "状态文件与备份均无法读取；今日未执行领取，请查看诊断日志。", ToolTipIcon.Error);
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态文件损坏，等待明天", manualTestRequest)) return 0;
+                    continue;
+                }
+                var state = stateLoad.State!;
+                if (stateLoad.Source == StateLoadSource.Backup)
+                {
+                    Log("State primary file was invalid; restored the last verified backup.");
+                    SaveState(state);
+                    if (!HasDailyTerminalState(state, DateOnly.FromDateTime(now)))
+                    {
+                        Log("Recovered state cannot prove today's claim status; stopped safely for today.");
+                        Notify("WorkBuddy 自动领取", "状态文件已从备份恢复，但无法确认今日状态；今日未执行领取。", ToolTipIcon.Error);
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态恢复待确认，等待明天", manualTestRequest)) return 0;
+                        continue;
+                    }
+                }
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
@@ -146,6 +241,9 @@ internal static class Program
         var scheduledToday = now.Date.Add(claimTime);
         return now < scheduledToday ? scheduledToday : scheduledToday.AddDays(1);
     }
+
+    private static bool HasDailyTerminalState(State state, DateOnly date) =>
+        state.SuccessDate == date || state.TerminalFailureDate == date;
 
     private static bool SleepUntilOrManualTestRequest(DateTime wakeAt, string reason, WaitHandle? interrupt = null)
     {
@@ -227,9 +325,104 @@ internal static class Program
 
     private static void StartDaemonAfterManualTest()
     {
-        var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
-        Process.Start(new ProcessStartInfo(exe, "--daemon") { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+        RequestDaemonRestart();
         Log("手动测试结束，已恢复后台守护。");
+    }
+
+    private static void StartDaemonAfterExclusiveOperation(string operationName)
+    {
+        RequestDaemonRestart();
+        Log($"{operationName} ended; background daemon restarted.");
+    }
+
+    private static void RequestDaemonRestart()
+    {
+        using var daemonReady = new EventWaitHandle(false, EventResetMode.AutoReset, DaemonReadyEventName);
+        DrainReadySignal(daemonReady);
+        if (TryRequestDaemonRestartViaScheduledTask(daemonReady)) return;
+
+        var exe = Environment.ProcessPath ?? throw new InvalidOperationException("Executable path is unavailable.");
+        DrainReadySignal(daemonReady);
+        using var fallback = Process.Start(new ProcessStartInfo(exe, "--daemon")
+        {
+            UseShellExecute = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        }) ?? throw new InvalidOperationException("无法直接启动后台守护。");
+        if (!daemonReady.WaitOne(DaemonRestartConfirmationTimeout))
+            throw new InvalidOperationException("计划任务与直接启动均未收到后台守护就绪信号。");
+        Log("未能通过计划任务恢复守护；已直接启动并确认守护就绪。");
+    }
+
+    private static bool TryRequestDaemonRestartViaScheduledTask(WaitHandle daemonReady)
+    {
+        try
+        {
+            using var process = Process.Start(CreateScheduledTaskDaemonStartInfo())
+                ?? throw new InvalidOperationException("无法启动 schtasks.exe。");
+            if (!process.WaitForExit(10_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                Log("计划任务恢复守护超时；将回退为直接启动。");
+                return false;
+            }
+            if (process.ExitCode == 0 && daemonReady.WaitOne(DaemonRestartConfirmationTimeout))
+            {
+                Log("已请求任务计划恢复后台守护，并确认守护进程已启动。");
+                return true;
+            }
+            if (process.ExitCode == 0)
+            {
+                Log("任务计划已接受守护恢复请求，但未确认守护进程启动；将回退为直接启动。");
+                return false;
+            }
+            Log($"任务计划恢复守护失败，退出码 {process.ExitCode}；将回退为直接启动。");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log("任务计划恢复守护异常；将回退为直接启动：" + ex.Message);
+            return false;
+        }
+    }
+
+    private static ProcessStartInfo CreateScheduledTaskDaemonStartInfo()
+    {
+        var start = new ProcessStartInfo("schtasks.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        start.ArgumentList.Add("/Run");
+        start.ArgumentList.Add("/TN");
+        start.ArgumentList.Add(TaskName);
+        return start;
+    }
+
+    private static void DrainReadySignal(WaitHandle readySignal)
+    {
+        while (readySignal.WaitOne(0)) { }
+    }
+
+    private static ProcessStartInfo CreateDaemonReadyProbeStartInfo(string eventName)
+    {
+        var exe = Environment.ProcessPath ?? throw new InvalidOperationException("Executable path is unavailable.");
+        var start = new ProcessStartInfo(exe)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        start.ArgumentList.Add("--daemon-ready-probe");
+        start.ArgumentList.Add(eventName);
+        return start;
+    }
+
+    private static int RunDaemonReadyProbe(string[] args)
+    {
+        var eventName = args.Skip(1).FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(eventName)) return 2;
+        using var ready = EventWaitHandle.OpenExisting(eventName);
+        ready.Set();
+        return 0;
     }
 
     private enum ClaimRunMode { Automatic, ManualTest }
@@ -243,6 +436,7 @@ internal static class Program
     {
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         int maxAttempts = GetAttemptLimit(config, mode);
+        MaintainDiagnosticRetention();
         if (!IsInteractiveDesktop())
         {
             Log("桌面已锁定，跳过本次尝试。");
@@ -258,6 +452,7 @@ internal static class Program
         bool launchedByTool = false;
         IntPtr window = IntPtr.Zero;
         bool succeeded = false;
+        int attemptsPerformed = 0;
         string result = "未能确认领取成功";
         ClaimOutcomeKind outcomeKind = ClaimOutcomeKind.Failed;
         BalanceReading? notificationBeforeBalance = null;
@@ -285,11 +480,19 @@ internal static class Program
 
             for (int attempt = 1; attempt <= maxAttempts && !succeeded; attempt++)
             {
+                attemptsPerformed = attempt;
                 try
                 {
                     Log($"开始{(isManualTest ? "手动测试" : "领取")}，第 {attempt}/{maxAttempts} 次。");
                     succeeded = TryClaimFromPersonalCenter(window, config, out result, out outcomeKind,
                         out notificationBeforeBalance, out notificationAfterBalance);
+                }
+                catch (LoginRequiredException ex)
+                {
+                    result = LoginRequiredResultPrefix + "；请手动登录后再试。";
+                    outcomeKind = ClaimOutcomeKind.Failed;
+                    notificationAfterBalance = null;
+                    Log($"第 {attempt} 次安全停止: {ex.Message}");
                 }
                 catch (Exception ex)
                 {
@@ -297,6 +500,13 @@ internal static class Program
                     outcomeKind = ClaimOutcomeKind.Failed;
                     notificationAfterBalance = null;
                     Log($"第 {attempt} 次失败: {ex.Message}");
+                    if (window != IntPtr.Zero)
+                        SaveFailureDiagnostic(window, config, "attempt-exception", ex.Message);
+                }
+                if (!succeeded && IsLoginRequiredResult(result))
+                {
+                    Log("检测到登录失效；停止本日后续领取尝试。");
+                    break;
                 }
             }
         }
@@ -322,14 +532,16 @@ internal static class Program
             if (ShouldPersistDailyState(mode)) SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
             Log("完成: " + result);
             Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
-                BuildClaimNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
-                    FormatNotificationBalance(notificationAfterBalance)), ToolTipIcon.Info);
+                BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
+                    FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, maxAttempts,
+                    DescribeWorkBuddyLifecycle(launchedByTool, wasForeground), result), ToolTipIcon.Info);
             return 0;
         }
 
         Log("领取失败: " + result);
-        var failureNotification = BuildClaimNotificationText(ClaimOutcomeKind.Failed,
-            FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance));
+        var failureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed,
+            FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance),
+            attemptsPerformed, maxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, wasForeground), result);
         if (isManualTest)
             NotifyManualTestFailure(result, failureNotification);
         else
@@ -365,6 +577,26 @@ internal static class Program
             if (window != IntPtr.Zero) return window;
         }
         return IntPtr.Zero;
+    }
+
+    private static int RunSelfTest()
+    {
+        try { return SelfTest(LoadConfig()); }
+        catch (Exception ex)
+        {
+            Log("Self test failed: " + ex);
+            return 1;
+        }
+    }
+
+    private static int RunClaimOcrVerification(string[] args)
+    {
+        try { return VerifyClaimOcr(args.Skip(1).FirstOrDefault(), LoadConfig(), args.Skip(2).FirstOrDefault(), args.Skip(3).FirstOrDefault()); }
+        catch (Exception ex)
+        {
+            Log("OCR screenshot verification failed: " + ex);
+            return 1;
+        }
     }
 
     private static bool ShouldTreatWorkBuddyAsToolLaunched(bool hadVisibleWindow, bool hadExistingProcess) =>
@@ -444,6 +676,10 @@ internal static class Program
         outcomeKind = ClaimOutcomeKind.Failed;
         beforeNotificationBalance = null;
         afterNotificationBalance = null;
+        using (var loginProbe = CaptureWindow(window))
+        {
+            if (loginProbe is not null) ThrowIfLoginRequired(ReadOcr(loginProbe));
+        }
         // 以“积分余额”文字为个人中心锚点。这样页面的卡片颜色、尺寸和按钮位置改变时，
         // 仍然只会在确认个人中心已经打开后，点击 OCR 实际读到的领取文字。
         if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence))
@@ -459,7 +695,7 @@ internal static class Program
             result = "已打开个人中心，但无法读取当前界面。";
             return false;
         }
-        var currentOcr = ReadOcr(currentImage);
+        var currentOcr = ReadClaimOcr(currentImage);
         // Final-claim routing is intentionally text-only: any full-window OCR line
         // containing “立即领取” is the target. It has no card, crop, or position gate.
         var immediate = FindImmediateClaimAction(currentImage, currentOcr, config);
@@ -488,7 +724,7 @@ internal static class Program
                 result = "“今日已领”状态未通过稳定核验，且无法重新读取个人中心。";
                 return false;
             }
-            currentOcr = ReadOcr(refreshedImage);
+            currentOcr = ReadClaimOcr(refreshedImage);
             immediate = FindImmediateClaimAction(refreshedImage, currentOcr, config);
             if (immediate is not null)
                 return ClickImmediateClaimAndVerify(window, config, immediate, beforeBalance, out result, out outcomeKind,
@@ -498,7 +734,8 @@ internal static class Program
         // “签到”只被视为进入领取流程的入口，不把它本身当作领取成功。
         // 每个入口最多点一次；只有随后真实出现“立即领取”才会继续。
         var triedCandidateIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var checkIn in FindCheckInActions(currentOcr, config))
+        bool clickedCheckIn = false;
+        foreach (var checkIn in FindCheckInActions(currentImage, currentOcr, config))
         {
             if (!triedCandidateIds.Add(checkIn.CandidateId)) continue;
             if (!TryGetStableBalanceBeforeAction(window, config, beforeBalance, out var stableBeforeEntry))
@@ -507,10 +744,11 @@ internal static class Program
                 continue;
             }
             Log($"OCR 识别签到入口：{checkIn.Keyword}，文本={checkIn.Text}，位置=({checkIn.CenterX},{checkIn.CenterY})。");
-            SaveBuddyDiagnosticCapture(window, "before-checkin");
+            var beforeCheckInSignature = CreateUiFrameSignature(currentImage);
             ClickWindowPoint(window, checkIn.CenterX, checkIn.CenterY);
+            clickedCheckIn = true;
             beforeNotificationBalance = stableBeforeEntry;
-            var followup = TryFindImmediateClaimAfterCheckIn(window, config, out var discoveredImmediate);
+            var followup = TryFindImmediateClaimAfterCheckIn(window, config, beforeCheckInSignature, out var discoveredImmediate);
             if (followup == CheckInFollowup.Immediate && discoveredImmediate is not null)
                 return ClickImmediateClaimAndVerify(window, config, discoveredImmediate, stableBeforeEntry,
                     out result, out outcomeKind, out afterNotificationBalance, balanceAlreadyStabilized: true);
@@ -530,7 +768,7 @@ internal static class Program
                     result = "WorkBuddy 今日已领取";
                     return true;
                 }
-                if (IsBalanceChanged(stableBeforeEntry, afterEvidence.Balance, config))
+                if (IsBalanceIncreased(stableBeforeEntry, afterEvidence.Balance, config))
                 {
                     afterNotificationBalance = afterEvidence.Balance;
                     outcomeKind = ClaimOutcomeKind.Claimed;
@@ -542,9 +780,14 @@ internal static class Program
             }
         }
 
-        result = "未识别到立即领取；已点击签到入口但未出现立即领取按钮";
+        result = BuildClaimActionNotFoundResult(clickedCheckIn);
+        SaveFailureDiagnostic(window, config, "claim-action-not-found", result);
         return false;
     }
+
+    private static string BuildClaimActionNotFoundResult(bool clickedCheckIn) => clickedCheckIn
+        ? "未识别到立即领取；已点击签到入口但未出现立即领取按钮"
+        : "未识别到立即领取；未识别到签到入口，未执行点击";
 
     private static bool ClickImmediateClaimAndVerify(
         IntPtr window, Config config, ClaimAction immediate, BalanceReading beforeBalance,
@@ -560,13 +803,20 @@ internal static class Program
             return false;
         }
         if (!balanceAlreadyStabilized) beforeBalance = stableBeforeBalance;
+        using var beforeClickImage = CaptureWindow(window);
+        if (beforeClickImage is null)
+        {
+            result = "已识别立即领取，但点击前无法捕获界面以验证状态变化。";
+            return false;
+        }
+        var beforeClickSignature = CreateUiFrameSignature(beforeClickImage);
         Log($"OCR 识别最终立即领取：文本={immediate.Text}，位置=({immediate.CenterX},{immediate.CenterY})，点击前积分余额={beforeBalance.RawText}。");
-        SaveBuddyDiagnosticCapture(window, "before-claim");
         ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
-        var verification = WaitForClaimResult(window, config, beforeBalance, TimeSpan.FromSeconds(20),
+        var verification = WaitForClaimResult(window, config, beforeBalance, beforeClickSignature, TimeSpan.FromSeconds(20),
             out afterNotificationBalance);
         bool claimed = verification != ClaimVerification.NotConfirmed;
-        SaveBuddyDiagnosticCapture(window, claimed ? "after-claim-success" : "after-claim-failure");
+        if (!claimed)
+            SaveFailureDiagnostic(window, config, "claim-not-confirmed", "点击立即领取后未确认余额变化或今日已领取");
         result = verification switch
         {
             ClaimVerification.ClaimedText => "WorkBuddy 今日已领取",
@@ -586,27 +836,38 @@ internal static class Program
     private static CheckInFollowup TryFindImmediateClaimAfterCheckIn(
         IntPtr window,
         Config config,
+        UiFrameSignature beforeCheckInSignature,
         out ClaimAction? immediate)
     {
         var until = DateTime.UtcNow.AddSeconds(10);
+        bool observedUiTransition = false;
         do
         {
             using var image = CaptureWindow(window);
             if (image is not null)
             {
-                var ocr = ReadOcr(image);
+                var ocr = ReadClaimOcr(image);
                 var found = FindImmediateClaimAction(image, ocr, config);
+                // “立即领取” was absent before the entry click, so its first appearance
+                // is itself a concrete post-click state change even if the coarse visual
+                // signature has not crossed its luminance threshold yet.
                 if (found is not null)
                 {
                     immediate = found;
-                    SaveBuddyDiagnosticCapture(window, "after-checkin-immediate");
                     return CheckInFollowup.Immediate;
                 }
-                if (HasClaimSuccessText(ocr))
+                if (!observedUiTransition && HasMeaningfulUiChange(beforeCheckInSignature, CreateUiFrameSignature(image)))
                 {
-                    immediate = null;
-                    SaveBuddyDiagnosticCapture(window, "after-checkin-already-claimed");
-                    return CheckInFollowup.AlreadyClaimed;
+                    observedUiTransition = true;
+                    Log("已观察到签到入口点击后的界面变化，开始查找立即领取。");
+                }
+                if (observedUiTransition)
+                {
+                    if (HasClaimSuccessText(ocr))
+                    {
+                        immediate = null;
+                        return CheckInFollowup.AlreadyClaimed;
+                    }
                 }
             }
             Thread.Sleep(500);
@@ -628,7 +889,7 @@ internal static class Program
         {
             if (current is not null)
             {
-                var currentOcr = ReadOcr(current);
+                var currentOcr = ReadClaimOcr(current);
                 evidence = ReadMenuEvidence(current, currentOcr, config);
                 if (evidence.IsPersonalCenter)
                 {
@@ -657,7 +918,7 @@ internal static class Program
                         Thread.Sleep(250);
                         using var afterDismissal = CaptureWindow(window);
                         if (afterDismissal is null) continue;
-                        var afterDismissalOcr = ReadOcr(afterDismissal);
+                        var afterDismissalOcr = ReadClaimOcr(afterDismissal);
                         evidence = ReadMenuEvidence(afterDismissal, afterDismissalOcr, config);
                         if (evidence.IsPersonalCenter)
                         {
@@ -696,6 +957,7 @@ internal static class Program
             {
                 evidence = MenuEvidence.Empty;
                 Log("未确认左下头像入口；拒绝使用被横幅遮挡时可能误点的固定坐标。");
+                SaveFailureDiagnostic(window, config, "profile-entry-not-found", "未确认左下个人中心入口");
                 return false;
             }
             Log("未发现积分余额；打开左下个人中心并等待 OCR 锚点加载。");
@@ -711,7 +973,7 @@ internal static class Program
                 using var image = CaptureWindow(window);
                 if (image is not null)
                 {
-                    var ocr = ReadOcr(image);
+                    var ocr = ReadClaimOcr(image);
                     evidence = ReadMenuEvidence(image, ocr, config);
                     lastCapture?.Dispose();
                     lastCapture = (Bitmap)image.Clone();
@@ -728,7 +990,8 @@ internal static class Program
             while (DateTime.UtcNow < until);
 
             evidence = MenuEvidence.Empty;
-            SavePersonalCenterFailureEvidence(lastCapture, lastOcr);
+            SavePersonalCenterFailureEvidence(window, config, lastCapture, lastOcr,
+                profileEntryLocated, personalCenterAlreadyOpen);
             Log("打开个人中心后仍未通过 OCR 识别到明确数字余额。");
             return false;
         }
@@ -911,8 +1174,46 @@ internal static class Program
         return false;
     }
 
+    private readonly record struct UiFrameSignature(byte[] Cells);
+
+    private static UiFrameSignature CreateUiFrameSignature(Bitmap bitmap)
+    {
+        var cells = new byte[UiFrameSignatureColumns * UiFrameSignatureRows];
+        int index = 0;
+        for (int cellY = 0; cellY < UiFrameSignatureRows; cellY++)
+        for (int cellX = 0; cellX < UiFrameSignatureColumns; cellX++)
+        {
+            int left = cellX * bitmap.Width / UiFrameSignatureColumns;
+            int right = Math.Max(left + 1, (cellX + 1) * bitmap.Width / UiFrameSignatureColumns);
+            int top = cellY * bitmap.Height / UiFrameSignatureRows;
+            int bottom = Math.Max(top + 1, (cellY + 1) * bitmap.Height / UiFrameSignatureRows);
+            long lumaTotal = 0;
+            int pixelCount = 0;
+            for (int y = top; y < bottom; y++)
+            for (int x = left; x < right; x++)
+            {
+                var color = bitmap.GetPixel(x, y);
+                lumaTotal += color.R * 299L + color.G * 587L + color.B * 114L;
+                pixelCount++;
+            }
+            cells[index++] = (byte)Math.Clamp((int)(lumaTotal / Math.Max(1, pixelCount) / 1_000L / UiFrameLumaQuantization), 0, 7);
+        }
+        return new UiFrameSignature(cells);
+    }
+
+    private static bool HasMeaningfulUiChange(UiFrameSignature before, UiFrameSignature after)
+    {
+        if (before.Cells is null || after.Cells is null || before.Cells.Length != after.Cells.Length) return false;
+        int changedCells = 0;
+        for (int index = 0; index < before.Cells.Length; index++)
+        {
+            if (Math.Abs(before.Cells[index] - after.Cells[index]) >= UiTransitionMinimumCellDelta) changedCells++;
+        }
+        return changedCells >= UiTransitionMinimumChangedCells;
+    }
+
     private static ClaimVerification WaitForClaimResult(
-        IntPtr window, Config config, BalanceReading beforeBalance, TimeSpan timeout,
+        IntPtr window, Config config, BalanceReading beforeBalance, UiFrameSignature beforeClickSignature, TimeSpan timeout,
         out BalanceReading? afterBalance)
     {
         afterBalance = null;
@@ -922,6 +1223,7 @@ internal static class Program
         var alreadyClaimedSamples = new List<MenuEvidence>();
         BalanceReading? lastObservedBalance = null;
         var changedBalanceFrames = new List<BalanceReading?>();
+        bool observedUiTransition = false;
         do
         {
             bool hasPersonalCenter = false;
@@ -929,6 +1231,11 @@ internal static class Program
             {
                 if (image is not null)
                 {
+                    if (!observedUiTransition && HasMeaningfulUiChange(beforeClickSignature, CreateUiFrameSignature(image)))
+                    {
+                        observedUiTransition = true;
+                        Log("已观察到立即领取点击后的界面变化，开始接受后续状态核验。");
+                    }
                     var evidence = ReadMenuEvidence(image, config);
                     hasPersonalCenter = evidence.IsPersonalCenter;
                     alreadyClaimedSamples.Add(evidence);
@@ -939,7 +1246,7 @@ internal static class Program
                     if (evidence.Balance is not null)
                     {
                         lastObservedBalance = evidence.Balance;
-                        if (IsBalanceChanged(beforeBalance, evidence.Balance, config))
+                        if (IsBalanceIncreased(beforeBalance, evidence.Balance, config))
                         {
                             if (TryConfirmBalanceAcrossFrames(changedBalanceFrames, evidence.Balance,
                                     out var confirmedChangedBalance))
@@ -955,7 +1262,8 @@ internal static class Program
                         }
                     }
                     else TryConfirmBalanceAcrossFrames(changedBalanceFrames, null, out _);
-                    if (IsConfirmedAlreadyClaimed(alreadyClaimedSamples, beforeBalance, config, out var confirmedBalance))
+                    if (observedUiTransition &&
+                        IsConfirmedAlreadyClaimed(alreadyClaimedSamples, beforeBalance, config, out var confirmedBalance))
                     {
                         afterBalance = confirmedBalance;
                         return ClaimVerification.ClaimedText;
@@ -1075,7 +1383,7 @@ internal static class Program
         return 0;
     }
 
-    private static int VerifyClaimOcr(string? imagePath, Config config, string? expectedBalance = null)
+    private static int VerifyClaimOcr(string? imagePath, Config config, string? expectedBalance = null, string? expectedCheckIn = null)
     {
         if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
             throw new FileNotFoundException("请提供可读取的截图路径。", imagePath);
@@ -1083,18 +1391,26 @@ internal static class Program
         var ocr = ReadOcr(bitmap);
         var evidence = ReadMenuEvidence(bitmap, ocr, config);
         var immediate = FindImmediateClaimAction(bitmap, ocr, config);
+        var checkInActions = FindCheckInActions(bitmap, ocr, config);
         if (!HasConfirmedNumericBalance(evidence.Balance))
             throw new InvalidOperationException("未读取到明确数字的积分余额，OCR 领取验证不通过。\n");
         var numericBalance = FormatNotificationBalance(evidence.Balance);
         if (!string.IsNullOrWhiteSpace(expectedBalance) &&
             !StringComparer.Ordinal.Equals(numericBalance, expectedBalance))
             throw new InvalidOperationException($"积分余额 OCR 校验失败：期望 {expectedBalance}，实际 {numericBalance ?? "未读取到"}。\n");
-        if (evidence.Balance is null && !evidence.HasSuccessText && immediate is null && evidence.Actions.Count == 0)
+        if (!string.IsNullOrWhiteSpace(expectedCheckIn) && !checkInActions.Any(action =>
+                NormalizeOcrText(action.Text).Contains(NormalizeOcrText(expectedCheckIn), StringComparison.Ordinal)))
+            throw new InvalidOperationException($"签到入口 OCR 校验失败：未识别到 {expectedCheckIn}。\n");
+        if (!HasOfflineClaimRouteOrState(evidence, immediate, checkInActions))
             throw new InvalidOperationException("OCR 未识别到成功状态或可领取文字。\n");
-        Console.WriteLine($"余额={numericBalance ?? "无"}; 成功文字={evidence.HasSuccessText}; 立即领取={immediate?.Text ?? "无"}; 签到入口={string.Join(", ", evidence.Actions.Select(action => action.Text))}");
-        Log($"OCR 领取截图验证通过：余额={evidence.Balance?.RawText ?? "无"}，成功文字={evidence.HasSuccessText}，立即领取={immediate?.Text ?? "无"}，签到入口数量={evidence.Actions.Count}。\n");
+        Console.WriteLine($"余额={numericBalance ?? "无"}; 成功文字={evidence.HasSuccessText}; 立即领取={immediate?.Text ?? "无"}; 签到入口={string.Join(", ", checkInActions.Select(action => action.Text))}");
+        Log($"OCR 领取截图验证通过：余额={evidence.Balance?.RawText ?? "无"}，成功文字={evidence.HasSuccessText}，立即领取={immediate?.Text ?? "无"}，签到入口数量={checkInActions.Count}。\n");
         return 0;
     }
+
+    private static bool HasOfflineClaimRouteOrState(
+        MenuEvidence evidence, ClaimAction? immediate, IReadOnlyList<ClaimAction> checkInActions) =>
+        evidence.HasSuccessText || immediate is not null || checkInActions.Count > 0;
 
     // Offline regression seam for the exact post-claim failure frame. It does not
     // touch WorkBuddy: the profile avatar is deliberately hidden, so the verifier
@@ -1162,7 +1478,18 @@ internal static class Program
             using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Windows OCR。\n");
             var outputTask = process.StandardOutput.ReadToEndAsync();
             var errorTask = process.StandardError.ReadToEndAsync();
-            process.WaitForExit();
+            int processId = process.Id;
+            var waitResult = WaitForOcrProcess(process, OcrProcessTimeout);
+            if (waitResult != OcrProcessWaitResult.Completed)
+            {
+                if (waitResult == OcrProcessWaitResult.TerminatedAfterTimeout)
+                {
+                    Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; stopped PID={processId}.");
+                    throw new TimeoutException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒并已安全终止。");
+                }
+                Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; PID={processId} did not exit after termination request.");
+                throw new InvalidOperationException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒且无法确认终止，流程已安全停止。");
+            }
             Task.WaitAll(outputTask, errorTask);
             if (process.ExitCode != 0)
                 throw new InvalidOperationException("Windows OCR 失败: " + errorTask.Result.Trim());
@@ -1176,9 +1503,26 @@ internal static class Program
         finally { try { File.Delete(imagePath); } catch { } }
     }
 
+    private static OcrSnapshot ReadClaimOcr(Bitmap bitmap)
+    {
+        var snapshot = ReadOcr(bitmap);
+        ThrowIfLoginRequired(snapshot);
+        return snapshot;
+    }
+
+    private enum OcrProcessWaitResult { Completed, TerminatedAfterTimeout, StillRunningAfterTimeout }
+
+    private static OcrProcessWaitResult WaitForOcrProcess(Process process, TimeSpan timeout)
+    {
+        if (process.WaitForExit((int)Math.Clamp(timeout.TotalMilliseconds, 1, int.MaxValue))) return OcrProcessWaitResult.Completed;
+        try { process.Kill(entireProcessTree: true); } catch { }
+        process.WaitForExit(2_000);
+        return process.HasExited ? OcrProcessWaitResult.TerminatedAfterTimeout : OcrProcessWaitResult.StillRunningAfterTimeout;
+    }
+
     private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, Config config)
     {
-        return ReadMenuEvidence(bitmap, ReadOcr(bitmap), config);
+        return ReadMenuEvidence(bitmap, ReadClaimOcr(bitmap), config);
     }
 
     private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, OcrSnapshot ocr, Config config)
@@ -1192,18 +1536,79 @@ internal static class Program
         return new MenuEvidence(balance, actions, hasSuccessText, isPersonalCenter);
     }
 
-    private static void SavePersonalCenterFailureEvidence(Bitmap? image, OcrSnapshot? ocr)
+    private static void SavePersonalCenterFailureEvidence(
+        IntPtr window, Config config, Bitmap? image, OcrSnapshot? ocr,
+        bool profileEntryLocated, bool personalCenterAlreadyOpen)
     {
-        if (image is null || ocr is null) return;
-        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
-        Directory.CreateDirectory(folder);
-        var screenshotPath = Path.Combine(folder, "workbuddy-personal-center-ocr-failure.png");
-        var ocrPath = Path.Combine(folder, "workbuddy-personal-center-ocr-failure.txt");
-        image.Save(screenshotPath, ImageFormat.Png);
-        var text = string.Join(Environment.NewLine, ocr.Lines.Select(line =>
-            $"{string.Join(' ', line.Words.Select(word => $"{word.X},{word.Y},{word.Width},{word.Height}"))}: {line.Text}"));
-        File.WriteAllText(ocrPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-        Log($"个人中心 OCR 失败证据已保存: 截图={screenshotPath}，原文={ocrPath}");
+        if (image is not null && ocr is not null)
+        {
+            Directory.CreateDirectory(DataDirectory);
+            var screenshotPath = Path.Combine(DataDirectory, "workbuddy-personal-center-ocr-failure.png");
+            var ocrPath = Path.Combine(DataDirectory, "workbuddy-personal-center-ocr-failure.txt");
+            image.Save(screenshotPath, ImageFormat.Png);
+            var text = string.Join(Environment.NewLine, ocr.Lines.Select(line =>
+                $"{string.Join(' ', line.Words.Select(word => $"{word.X},{word.Y},{word.Width},{word.Height}"))}: {line.Text}"));
+            File.WriteAllText(ocrPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            Log($"个人中心 OCR 失败证据已保存: 截图={screenshotPath}，原文={ocrPath}");
+        }
+        SaveFailureDiagnostic(window, config, "personal-center-unreadable", "未能确认积分余额",
+            image, ocr, $"profileEntryLocated={profileEntryLocated}; personalCenterAlreadyOpen={personalCenterAlreadyOpen}");
+    }
+
+    private static void SaveFailureDiagnostic(
+        IntPtr window, Config config, string phase, string reason,
+        Bitmap? image = null, OcrSnapshot? ocr = null, string? additionalContext = null)
+    {
+        Bitmap? capturedHere = null;
+        try
+        {
+            var capture = image ?? (capturedHere = CaptureWindow(window));
+            if (capture is null) return;
+            var diagnosticsPath = Path.Combine(DataDirectory, "diagnostics");
+            Directory.CreateDirectory(diagnosticsPath);
+            var baseName = $"{DateTime.Now:yyyyMMdd-HHmmssfff}-{phase}";
+            var screenshotPath = Path.Combine(diagnosticsPath, baseName + ".png");
+            var metadataPath = Path.Combine(diagnosticsPath, baseName + ".json");
+            capture.Save(screenshotPath, ImageFormat.Png);
+
+            string? ocrFailure = null;
+            var snapshot = ocr;
+            if (snapshot is null)
+            {
+                try { snapshot = ReadOcr(capture); }
+                catch (Exception ex) { ocrFailure = ex.Message; }
+            }
+            Native.GetWindowRect(window, out var rect);
+            uint dpi = 0;
+            try { dpi = Native.GetDpiForWindow(window); } catch { }
+            string version;
+            try { version = FileVersionInfo.GetVersionInfo(config.WorkBuddyPath).FileVersion ?? "unknown"; }
+            catch { version = "unknown"; }
+            var metadata = new
+            {
+                capturedAt = DateTimeOffset.Now,
+                phase,
+                reason,
+                workBuddyVersion = version,
+                window = new { width = rect.Right - rect.Left, height = rect.Bottom - rect.Top, dpi },
+                additionalContext,
+                ocrFailure,
+                ocrLines = snapshot?.Lines.Select(line => new
+                {
+                    text = line.Text,
+                    words = line.Words.Select(word => new { word.Text, word.X, word.Y, word.Width, word.Height })
+                })
+            };
+            File.WriteAllText(metadataPath, JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true }),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            TrimFailureDiagnostics(diagnosticsPath, DateTime.Now.AddDays(-LogRetentionDays));
+            Log($"Failure diagnostic saved: screenshot={screenshotPath}, metadata={metadataPath}.");
+        }
+        catch (Exception ex)
+        {
+            Log("Failure diagnostic capture failed: " + ex.Message);
+        }
+        finally { capturedHere?.Dispose(); }
     }
 
     private sealed record BalanceLabel(OcrLine Line, OcrBounds Bounds);
@@ -1299,14 +1704,11 @@ internal static class Program
 
         // The left-side icon is sometimes OCR'd as 0, so only accept digits that
         // occur after the “积分余额” text on the same line.
-        var normalizedLabelLine = NormalizeOcrText(label.Line.Text);
         const string labelText = "积分余额";
-        int labelTextIndex = normalizedLabelLine.IndexOf(labelText, StringComparison.Ordinal);
-        var sameLineDigits = labelTextIndex < 0
-            ? string.Empty
-            : new string(normalizedLabelLine[(labelTextIndex + labelText.Length)..].Where(char.IsDigit).ToArray());
-        if (sameLineDigits.Length >= 1)
-            return new BalanceReading(label.Line.Text, sameLineDigits, label.Bounds);
+        var textAfterLabel = TryGetTextAfterNormalizedAnchor(label.Line.Text, labelText);
+        var sameLineValue = textAfterLabel is null ? null : NormalizeBalanceToken(textAfterLabel);
+        if (!string.IsNullOrWhiteSpace(sameLineValue))
+            return new BalanceReading(sameLineValue, new string(sameLineValue.Where(char.IsDigit).ToArray()), label.Bounds);
 
         var candidate = snapshot.Lines
             .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
@@ -1327,6 +1729,18 @@ internal static class Program
         if (value is null) return null;
         var fingerprint = new string(value.Where(char.IsDigit).ToArray());
         return new BalanceReading(value, fingerprint, label.Bounds);
+    }
+
+    private static string? TryGetTextAfterNormalizedAnchor(string text, string anchor)
+    {
+        var normalized = new StringBuilder();
+        for (int index = 0; index < text.Length; index++)
+        {
+            normalized.Append(NormalizeOcrText(text[index].ToString()));
+            if (normalized.ToString().EndsWith(anchor, StringComparison.Ordinal))
+                return text[(index + 1)..];
+        }
+        return null;
     }
 
     private static BalanceLabel? FindBalanceLabel(OcrSnapshot snapshot)
@@ -1371,28 +1785,59 @@ internal static class Program
 
     private static string? NormalizeBalanceToken(string text)
     {
-        var value = new StringBuilder();
+        var token = new StringBuilder();
         bool hasDigit = false;
         foreach (char character in text)
         {
             if (char.IsDigit(character))
             {
-                value.Append(character);
+                token.Append(character);
                 hasDigit = true;
             }
-            else if ((character == '.' || character == ',') && hasDigit && !value.ToString().Contains('.'))
+            else if ((character == '.' || character == ',' || character == '．' || character == '，') && hasDigit)
             {
-                value.Append('.');
+                token.Append(character is ',' or '，' ? ',' : '.');
             }
             // Windows OCR read the final 9 in the verified balance screenshot as g.
             else if ((character == 'g' || character == 'G') && hasDigit)
             {
-                value.Append('9');
+                token.Append('9');
             }
         }
         if (!hasDigit) return null;
-        var normalized = value.ToString();
-        return normalized.EndsWith('.') ? normalized[..^1] : normalized;
+
+        var raw = token.ToString().TrimEnd('.', ',');
+        if (raw.Length == 0) return null;
+        int lastDot = raw.LastIndexOf('.');
+        int lastComma = raw.LastIndexOf(',');
+        int decimalSeparatorIndex = -1;
+        if (lastDot >= 0 && lastComma >= 0)
+        {
+            // When both separators are present, the final one is the decimal mark and
+            // all earlier separators are thousands grouping (1,722.8 / 1.722,8).
+            decimalSeparatorIndex = Math.Max(lastDot, lastComma);
+        }
+        else if (lastDot >= 0)
+        {
+            // WorkBuddy uses a dot for decimal balances. Earlier dots, if any, are
+            // treated as OCR'd grouping separators.
+            decimalSeparatorIndex = lastDot;
+        }
+        else if (lastComma >= 0)
+        {
+            int trailingDigits = raw[(lastComma + 1)..].Count(char.IsDigit);
+            // A lone comma followed by three digits is a thousands separator. One or
+            // two trailing digits are accepted as a locale-style decimal mark.
+            if (trailingDigits is 1 or 2) decimalSeparatorIndex = lastComma;
+        }
+
+        var value = new StringBuilder();
+        for (int index = 0; index < raw.Length; index++)
+        {
+            if (char.IsDigit(raw[index])) value.Append(raw[index]);
+            else if (index == decimalSeparatorIndex) value.Append('.');
+        }
+        return value.ToString();
     }
 
     private static Bitmap CreateBalanceValueCrop(
@@ -1548,6 +1993,35 @@ internal static class Program
             .ToArray();
     }
 
+    private static IReadOnlyList<ClaimAction> FindCheckInActions(Bitmap bitmap, OcrSnapshot directOcr, Config config)
+    {
+        var direct = FindCheckInActions(directOcr, config);
+        if (direct.Count > 0) return direct;
+
+        // As with “立即领取”, retry only after enlarging the entire current window.
+        // No card, crop, or fixed-position condition is introduced here.
+        using var enlarged = CreateScaledCrop(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+            FullWindowImmediateOcrScale);
+        var enlargedActions = FindCheckInActions(ReadOcr(enlarged), config);
+        if (enlargedActions.Count == 0) return direct;
+
+        Log("整图放大 OCR 识别到签到入口。");
+        return enlargedActions.Select(action =>
+        {
+            int x = Math.Clamp((int)Math.Round(action.CenterX / (double)FullWindowImmediateOcrScale),
+                0, Math.Max(0, bitmap.Width - 1));
+            int y = Math.Clamp((int)Math.Round(action.CenterY / (double)FullWindowImmediateOcrScale),
+                0, Math.Max(0, bitmap.Height - 1));
+            var mappedBounds = new OcrBounds(x, y, x, y);
+            return action with
+            {
+                CenterX = x,
+                CenterY = y,
+                CandidateId = GetCandidateId(mappedBounds, config.ClaimCandidatePositionTolerancePixels)
+            };
+        }).ToArray();
+    }
+
     private static string[] GetNormalizedKeywords(IEnumerable<string>? configured, IEnumerable<string> fallback) =>
         (configured ?? fallback)
             .Select(NormalizeOcrText)
@@ -1565,14 +2039,24 @@ internal static class Program
                StringComparer.Ordinal.Equals(expected.Fingerprint, actual.Fingerprint);
     }
 
-    private static bool IsBalanceChanged(BalanceReading before, BalanceReading after, Config config) =>
-        HasConfirmedNumericBalance(before) && HasConfirmedNumericBalance(after) &&
-        !StringComparer.Ordinal.Equals(before.Fingerprint, after.Fingerprint);
+    private static bool IsBalanceIncreased(BalanceReading before, BalanceReading after, Config config) =>
+        TryGetNumericBalance(before, out var beforeValue) &&
+        TryGetNumericBalance(after, out var afterValue) &&
+        afterValue > beforeValue;
+
+    private static bool TryGetNumericBalance(BalanceReading balance, out decimal value)
+    {
+        value = 0;
+        if (!HasConfirmedNumericBalance(balance)) return false;
+        var normalized = NormalizeBalanceToken(balance.RawText);
+        return normalized is not null &&
+               decimal.TryParse(normalized, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value);
+    }
 
     private static ClaimOutcomeKind? ClassifyClaimOutcome(
         BalanceReading before, BalanceReading after, bool hasAlreadyClaimedText, Config config)
     {
-        if (IsBalanceChanged(before, after, config)) return ClaimOutcomeKind.Claimed;
+        if (IsBalanceIncreased(before, after, config)) return ClaimOutcomeKind.Claimed;
         if (hasAlreadyClaimedText && AreSameBalance(before, after, config)) return ClaimOutcomeKind.AlreadyClaimed;
         return null;
     }
@@ -1644,9 +2128,29 @@ internal static class Program
             .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeOcrText(line.Text)))
             .Where(item => item.Line.Words.Count > 0)
             .Any(item => item.Normalized.Contains("今日已领", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("本期已领", StringComparison.Ordinal) ||
-                         item.Normalized.Contains("已领取", StringComparison.Ordinal));
+                          item.Normalized.Contains("已领取", StringComparison.Ordinal));
     }
+
+    private static bool HasLoginRequiredText(OcrSnapshot snapshot)
+    {
+        string[] loginRequiredPhrases = ["登录失效", "请登录", "重新登录"];
+        return snapshot.Lines
+            .Select(line => NormalizeOcrText(line.Text))
+            .Any(text => loginRequiredPhrases.Any(phrase => text.Contains(phrase, StringComparison.Ordinal)));
+    }
+
+    private sealed class LoginRequiredException : Exception
+    {
+        public LoginRequiredException() : base("OCR 检测到 WorkBuddy 登录失效，领取流程已安全停止。") { }
+    }
+
+    private static void ThrowIfLoginRequired(OcrSnapshot snapshot)
+    {
+        if (HasLoginRequiredText(snapshot)) throw new LoginRequiredException();
+    }
+
+    private static bool IsLoginRequiredResult(string result) =>
+        result.StartsWith(LoginRequiredResultPrefix, StringComparison.Ordinal);
 
     private static string GetCandidateId(OcrBounds bounds, int tolerancePixels)
     {
@@ -1666,7 +2170,9 @@ internal static class Program
             // Windows OCR sometimes emits the Traditional glyphs from the same Simplified UI.
             // Normalize the action words before routing; raw OCR is retained in diagnostics.
             .Replace('領', '领')
-            .Replace('簽', '签');
+            .Replace('簽', '签')
+            .Replace('卽', '即')
+            .Replace('娶', '取');
 
     private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
         windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
@@ -1950,23 +2456,26 @@ internal static class Program
         var xmlPath = Path.Combine(Path.GetTempPath(), "workbuddy-auto-claim-task.xml");
         var escapedExe = SecurityElement.Escape(exe) ?? throw new InvalidOperationException("无法转义程序路径。");
         var escapedDir = SecurityElement.Escape(BaseDir) ?? throw new InvalidOperationException("无法转义工作目录。");
-        var xml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
-<Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Principals><Principal id=""Author""><RunLevel>LeastPrivilege</RunLevel><LogonType>InteractiveToken</LogonType></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
-  <Actions Context=""Author""><Exec><Command>{escapedExe}</Command><Arguments>--daemon</Arguments><WorkingDirectory>{escapedDir}</WorkingDirectory></Exec></Actions>
-</Task>";
+        var xml = BuildScheduledTaskXml(escapedExe, escapedDir);
         File.WriteAllText(xmlPath, xml, new System.Text.UnicodeEncoding());
         try { RunProcess("schtasks.exe", $"/Create /TN \"{TaskName}\" /XML \"{xmlPath}\" /F"); }
         finally { try { File.Delete(xmlPath); } catch { } }
         // 安装发生在当天领取时间之后时，从下一天开始，避免安装动作立刻打断正在使用的 WorkBuddy。
-        if (DateTime.TryParse(config.ClaimTime, out var scheduled) && DateTime.Now.TimeOfDay >= scheduled.TimeOfDay)
-            SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
+        // Installation must not manufacture a successful daily claim or overwrite an
+        // observed terminal failure. Only the numeric-balance verification path writes
+        // SuccessDate; the daemon will use the persisted state on its next wake-up.
         Log("已安装开机自启任务。\n");
         Notify("WorkBuddy 自动领取", "已启用：每天 00:00 后自动领取。", ToolTipIcon.Info);
         return 0;
     }
+
+    private static string BuildScheduledTaskXml(string escapedExe, string escapedDir) => $@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id=""Author""><RunLevel>LeastPrivilege</RunLevel><LogonType>InteractiveToken</LogonType></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Actions Context=""Author""><Exec><Command>{escapedExe}</Command><Arguments>--daemon</Arguments><WorkingDirectory>{escapedDir}</WorkingDirectory></Exec></Actions>
+</Task>";
 
     private static int Uninstall()
     {
@@ -2160,7 +2669,7 @@ internal static class Program
             if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var before))
                 throw new InvalidOperationException("探测前未能打开个人中心。");
             using var beforeImage = CaptureWindow(window) ?? throw new InvalidOperationException("探测前无法捕获 WorkBuddy。");
-            var entry = FindCheckInActions(ReadOcr(beforeImage), config).FirstOrDefault()
+            var entry = FindCheckInActions(beforeImage, ReadOcr(beforeImage), config).FirstOrDefault()
                         ?? throw new InvalidOperationException("探测前未识别到签到入口。");
             SaveBuddyDiagnosticCapture(window, "probe-before-checkin");
             Log($"签到入口探测：仅点击一次 {entry.Text}，位置=({entry.CenterX},{entry.CenterY})，不会点击最终领取。");
@@ -2216,6 +2725,116 @@ internal static class Program
 
     private static int SelfTest(Config config)
     {
+        if (OcrProcessTimeout != TimeSpan.FromSeconds(ExpectedOcrProcessTimeoutSeconds))
+            throw new InvalidOperationException("Windows OCR 必须在 8 秒后超时并安全停止。");
+        if (ClassifyFailureStage("Windows OCR exceeded 8 seconds and was safely stopped.") != "OCR 超时")
+            throw new InvalidOperationException("OCR 超时必须在失败通知中归类为 OCR 超时。");
+        using (var timeoutProcess = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -Command Start-Sleep -Seconds 2")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        }) ?? throw new InvalidOperationException("无法启动 OCR 超时回归进程。"))
+        {
+            var timeoutOutput = timeoutProcess.StandardOutput.ReadToEndAsync();
+            var timeoutError = timeoutProcess.StandardError.ReadToEndAsync();
+            if (WaitForOcrProcess(timeoutProcess, TimeSpan.FromMilliseconds(50)) != OcrProcessWaitResult.TerminatedAfterTimeout ||
+                !timeoutProcess.HasExited)
+                throw new InvalidOperationException("OCR 超时回归必须终止卡住的子进程。");
+        }
+        var stateTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-StateSelfTest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stateTestDirectory);
+        var stateTestPath = Path.Combine(stateTestDirectory, "state.json");
+        var stateTestBackupPath = stateTestPath + ".bak";
+        try
+        {
+            SaveState(new State { SuccessDate = new DateOnly(2026, 8, 10) }, stateTestPath, stateTestBackupPath);
+            SaveState(new State { TerminalFailureDate = new DateOnly(2026, 8, 11) }, stateTestPath, stateTestBackupPath);
+            File.WriteAllText(stateTestPath, "{invalid json");
+            var recoveredState = LoadState(stateTestPath, stateTestBackupPath);
+            if (recoveredState.Source != StateLoadSource.Backup ||
+                recoveredState.State?.SuccessDate != new DateOnly(2026, 8, 10))
+                throw new InvalidOperationException("状态主文件损坏时必须从有效备份恢复，而不能重新执行领取。");
+            File.WriteAllText(stateTestBackupPath, "{invalid backup");
+            if (LoadState(stateTestPath, stateTestBackupPath).Source != StateLoadSource.Invalid)
+                throw new InvalidOperationException("主状态与备份都损坏时必须进入安全失败状态。");
+        }
+        finally
+        {
+            if (File.Exists(stateTestPath)) File.Delete(stateTestPath);
+            if (File.Exists(stateTestBackupPath)) File.Delete(stateTestBackupPath);
+            if (Directory.Exists(stateTestDirectory)) Directory.Delete(stateTestDirectory);
+        }
+        if (!HasDailyTerminalState(new State { SuccessDate = new DateOnly(2026, 8, 11) }, new DateOnly(2026, 8, 11)) ||
+            HasDailyTerminalState(new State { SuccessDate = new DateOnly(2026, 8, 10) }, new DateOnly(2026, 8, 11)))
+            throw new InvalidOperationException("从备份恢复时必须能区分已确认的今日终态与未知的今日状态。");
+        var retainedDiagnostics = SelectRetainedFailureDiagnosticBases(
+            Enumerable.Range(1, FailureDiagnosticRetentionCount + 1).Select(index => $"20260811-0000{index:D2}-failure"));
+        if (retainedDiagnostics.Count != FailureDiagnosticRetentionCount ||
+            retainedDiagnostics.Contains("20260811-000001-failure") ||
+            !retainedDiagnostics.Contains($"20260811-0000{FailureDiagnosticRetentionCount + 1:D2}-failure"))
+            throw new InvalidOperationException("失败诊断必须仅保留最新 20 份。");
+        var loginExpiredOcr = new OcrSnapshot
+        {
+            Lines = [new OcrLine { Text = "请重新登录", Words = [new OcrWord { Text = "请重新登录", X = 20, Y = 20, Width = 80, Height = 20 }] }]
+        };
+        var loginRewardOcr = new OcrSnapshot
+        {
+            Lines = [new OcrLine { Text = "登录奖励", Words = [new OcrWord { Text = "登录奖励", X = 20, Y = 20, Width = 80, Height = 20 }] }]
+        };
+        if (!HasLoginRequiredText(loginExpiredOcr) || HasLoginRequiredText(loginRewardOcr))
+            throw new InvalidOperationException("登录失效必须单独识别，不能把普通登录相关文字误判为失效。");
+        try
+        {
+            ThrowIfLoginRequired(loginExpiredOcr);
+            throw new InvalidOperationException("领取流程中途识别到登录失效时必须立即中止。");
+        }
+        catch (LoginRequiredException) { }
+        ThrowIfLoginRequired(loginRewardOcr);
+        var taskXml = BuildScheduledTaskXml("C:\\WorkBuddyAutoClaim.exe", "C:\\WorkBuddy");
+        if (!taskXml.Contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>", StringComparison.Ordinal))
+            throw new InvalidOperationException("任务计划必须在守护进程异常退出后自动重启。");
+        var daemonRestart = CreateScheduledTaskDaemonStartInfo();
+        if (!string.Equals(daemonRestart.FileName, "schtasks.exe", StringComparison.OrdinalIgnoreCase) ||
+            daemonRestart.UseShellExecute ||
+            daemonRestart.ArgumentList.Count != 3 ||
+            daemonRestart.ArgumentList[0] != "/Run" ||
+            daemonRestart.ArgumentList[1] != "/TN" ||
+            daemonRestart.ArgumentList[2] != TaskName)
+            throw new InvalidOperationException("已安装任务时必须通过任务计划恢复守护，不能让测试命令派生 --daemon 子进程。");
+        var daemonReadyProbeName = $"Local\\WorkBuddyAutoClaim.DaemonReadySelfTest.{Guid.NewGuid():N}";
+        using (var daemonReadyProbe = new EventWaitHandle(false, EventResetMode.AutoReset, daemonReadyProbeName))
+        {
+            daemonReadyProbe.Set();
+            DrainReadySignal(daemonReadyProbe);
+            if (daemonReadyProbe.WaitOne(0))
+                throw new InvalidOperationException("守护恢复前必须清除旧的就绪信号。");
+            using var daemonReadyChild = Process.Start(CreateDaemonReadyProbeStartInfo(daemonReadyProbeName))
+                ?? throw new InvalidOperationException("无法启动守护就绪安全测试子进程。");
+            if (!daemonReadyProbe.WaitOne(TimeSpan.FromSeconds(5)) ||
+                !daemonReadyChild.WaitForExit(5_000) || daemonReadyChild.ExitCode != 0)
+                throw new InvalidOperationException("守护恢复必须由新子进程发出的就绪信号确认。");
+        }
+        using (var unchangedFrame = new Bitmap(60, 40))
+        using (var changedFrame = new Bitmap(60, 40))
+        using (var graphics = Graphics.FromImage(changedFrame))
+        {
+            graphics.FillRectangle(Brushes.White, 0, 0, 20, 20);
+            graphics.FillRectangle(Brushes.White, 40, 20, 20, 20);
+            if (HasMeaningfulUiChange(CreateUiFrameSignature(unchangedFrame), CreateUiFrameSignature(unchangedFrame)) ||
+                !HasMeaningfulUiChange(CreateUiFrameSignature(unchangedFrame), CreateUiFrameSignature(changedFrame)))
+                throw new InvalidOperationException("点击后必须观察到实际界面变化，不能接受旧帧 OCR。");
+        }
+        var detailedFailureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed, "100", null, 5, 5,
+            "保留原后台并最小化", "未能在个人中心读取积分余额");
+        if (!detailedFailureNotification.Contains("失败阶段：个人中心/余额", StringComparison.Ordinal) ||
+            !detailedFailureNotification.Contains("尝试：5/5", StringComparison.Ordinal) ||
+            !detailedFailureNotification.Contains("WorkBuddy：保留原后台并最小化", StringComparison.Ordinal))
+            throw new InvalidOperationException("失败通知必须包含阶段、尝试次数和 WorkBuddy 进程处理方式。");
+        if (!BuildClaimActionNotFoundResult(clickedCheckIn: false).Contains("未识别到签到入口", StringComparison.Ordinal) ||
+            !BuildClaimActionNotFoundResult(clickedCheckIn: true).Contains("已点击签到入口", StringComparison.Ordinal))
+            throw new InvalidOperationException("签到入口失败结果必须如实区分未识别与已点击后未出现立即领取。");
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
         if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
@@ -2260,6 +2879,17 @@ internal static class Program
         }
 
         var selfTestConfig = new Config();
+        if (NormalizeOcrText("立 即 领 娶") != "立即领取")
+            throw new InvalidOperationException("立即领取 OCR 规范化必须兼容空格和取字误读。");
+        var unapprovedClaimStateOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "本期已领", Words = [new OcrWord { Text = "本期已领", X = 45, Y = 278, Width = 68, Height = 18 }] }
+            ]
+        };
+        if (HasClaimSuccessText(unapprovedClaimStateOcr))
+            throw new InvalidOperationException("本期已领不是已授权的今日已领取判定文字。");
         var ocr = new OcrSnapshot
         {
             Lines =
@@ -2318,7 +2948,7 @@ internal static class Program
         var visualChanged = new BalanceReading("视觉余额指纹", "V:010101010101", immediateBalance.Bounds, true);
         if (HasConfirmedNumericBalance(visualBefore) ||
             AreSameBalance(visualBefore, visualSame, selfTestConfig) ||
-            IsBalanceChanged(visualBefore, visualChanged, selfTestConfig))
+            IsBalanceIncreased(visualBefore, visualChanged, selfTestConfig))
             throw new InvalidOperationException("视觉余额指纹不得作为领取或今日已领的余额证据。");
         var claimedOcr = new OcrSnapshot
         {
@@ -2381,8 +3011,31 @@ internal static class Program
                                ?? throw new InvalidOperationException("通知余额 OCR 回归样本未读到余额。");
         if (FormatNotificationBalance(correctedBalance) != "398.49")
             throw new InvalidOperationException("通知余额必须忽略加载图标误识别，并将 398.4g 还原为 398.49。");
+        if (NormalizeBalanceToken("1,722.8") != "1722.8" ||
+            NormalizeBalanceToken("1.722,8") != "1722.8")
+            throw new InvalidOperationException("余额解析必须区分千位分隔符与小数点。");
+        var sameLineGroupedBalanceOcr = new OcrSnapshot
+        {
+            Lines = [new OcrLine { Text = "积分余额1,722.8", Words = [
+                new OcrWord { Text = "积分余额", X = 30, Y = 350, Width = 80, Height = 18 },
+                new OcrWord { Text = "1,722.8", X = 130, Y = 350, Width = 70, Height = 18 }
+            ] }]
+        };
+        var sameLineGroupedBalance = TryReadBalance(sameLineGroupedBalanceOcr, selfTestConfig)
+                                     ?? throw new InvalidOperationException("同行千位分隔余额未读取到。");
+        if (FormatNotificationBalance(sameLineGroupedBalance) != "1722.8")
+            throw new InvalidOperationException("同行积分余额必须保留原始千位符与小数点后再解析。");
         var verifiedBalance = new BalanceReading("398.49", "39849", correctedBalance.Bounds);
         var outlierBalance = new BalanceReading("3398.49", "339849", correctedBalance.Bounds);
+        var balanceOnlyEvidence = new MenuEvidence(verifiedBalance, [], HasSuccessText: false, IsPersonalCenter: true);
+        if (HasOfflineClaimRouteOrState(balanceOnlyEvidence, immediate: null, checkInActions: []))
+            throw new InvalidOperationException("离线 OCR 验证不得让只有余额、没有领取状态或入口的截图通过。");
+        var lowerBalance = new BalanceReading("1622.8", "16228", correctedBalance.Bounds);
+        var higherBalance = new BalanceReading("1822.8", "18228", correctedBalance.Bounds);
+        var startingBalance = new BalanceReading("1722.8", "17228", correctedBalance.Bounds);
+        if (IsBalanceIncreased(startingBalance, lowerBalance, selfTestConfig) ||
+            !IsBalanceIncreased(startingBalance, higherBalance, selfTestConfig))
+            throw new InvalidOperationException("领取成功只能由明确数字余额增加确认，余额下降不得判定成功。");
         if (SelectConfirmedNumericBalance([verifiedBalance, verifiedBalance, outlierBalance])?.RawText != "398.49")
             throw new InvalidOperationException("余额多路读取必须接受两个一致值，并忽略一个异常值。");
         if (SelectConfirmedNumericBalance([verifiedBalance, outlierBalance]) is not null)
@@ -2429,16 +3082,122 @@ internal static class Program
         }
         return JsonSerializer.Deserialize<Config>(File.ReadAllText(ConfigPath)) ?? throw new InvalidOperationException("配置文件无效。");
     }
-    private static State LoadState()
+    private enum StateLoadSource { Primary, Backup, Missing, Invalid }
+
+    private readonly record struct StateLoadResult(State? State, StateLoadSource Source)
     {
-        try { return JsonSerializer.Deserialize<State>(File.ReadAllText(StatePath)) ?? new State(); }
-        catch { return new State(); }
+        public bool IsUsable => State is not null && Source != StateLoadSource.Invalid;
     }
-    private static void SaveState(State state)
+
+    private static StateLoadResult LoadState() => LoadState(StatePath, StateBackupPath);
+
+    private static StateLoadResult LoadState(string statePath, string backupPath)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
-        File.WriteAllText(StatePath, JsonSerializer.Serialize(state));
+        if (TryReadStateFile(statePath, out var primary))
+            return new StateLoadResult(primary, StateLoadSource.Primary);
+        if (TryReadStateFile(backupPath, out var backup))
+            return new StateLoadResult(backup, StateLoadSource.Backup);
+
+        if (!File.Exists(statePath) && !File.Exists(backupPath))
+            return new StateLoadResult(new State(), StateLoadSource.Missing);
+        return new StateLoadResult(null, StateLoadSource.Invalid);
     }
+
+    private static bool TryReadStateFile(string path, out State? state)
+    {
+        state = null;
+        try
+        {
+            if (!File.Exists(path)) return false;
+            state = JsonSerializer.Deserialize<State>(File.ReadAllText(path));
+            return state is not null;
+        }
+        catch { return false; }
+    }
+
+    private static void SaveState(State state) => SaveState(state, StatePath, StateBackupPath);
+
+    private static void SaveState(State state, string statePath, string backupPath)
+    {
+        var directory = Path.GetDirectoryName(statePath) ?? throw new InvalidOperationException("State directory is unavailable.");
+        Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(directory, Path.GetFileName(statePath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(state), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            if (TryReadStateFile(statePath, out _)) File.Copy(statePath, backupPath, overwrite: true);
+            File.Move(temporaryPath, statePath, overwrite: true);
+            if (!File.Exists(backupPath)) File.Copy(statePath, backupPath, overwrite: false);
+        }
+        finally
+        {
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
+        }
+    }
+
+    private static void MaintainDiagnosticRetention()
+    {
+        var today = DateOnly.FromDateTime(DateTime.Today);
+        if (_lastRetentionMaintenanceDate == today) return;
+        try
+        {
+            Directory.CreateDirectory(DataDirectory);
+            var cutoff = DateTime.Now.AddDays(-LogRetentionDays);
+            TrimLogToRetentionWindow(Path.Combine(DataDirectory, "workbuddy-auto-claim.log"), cutoff);
+            TrimFailureDiagnostics(Path.Combine(DataDirectory, "diagnostics"), cutoff);
+            _lastRetentionMaintenanceDate = today;
+        }
+        catch (Exception ex)
+        {
+            Log("Diagnostic retention maintenance failed: " + ex.Message);
+        }
+    }
+
+    private static void TrimLogToRetentionWindow(string logPath, DateTime cutoff)
+    {
+        if (!File.Exists(logPath)) return;
+        var kept = File.ReadLines(logPath)
+            .Where(line => !TryGetLogTimestamp(line, out var timestamp) || timestamp >= cutoff)
+            .ToArray();
+        File.WriteAllLines(logPath, kept, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+    }
+
+    private static bool TryGetLogTimestamp(string line, out DateTime timestamp)
+    {
+        timestamp = default;
+        return line.Length >= 21 && line[0] == '[' && line[20] == ']' &&
+               DateTime.TryParseExact(line.Substring(1, 19), "yyyy-MM-dd HH:mm:ss",
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   System.Globalization.DateTimeStyles.None, out timestamp);
+    }
+
+    private static void TrimFailureDiagnostics(string diagnosticsPath, DateTime cutoff)
+    {
+        if (!Directory.Exists(diagnosticsPath)) return;
+        foreach (var file in Directory.EnumerateFiles(diagnosticsPath).Select(path => new FileInfo(path)).ToArray())
+        {
+            if (file.LastWriteTime >= cutoff) continue;
+            try { file.Delete(); } catch { }
+        }
+
+        var retainedBases = SelectRetainedFailureDiagnosticBases(
+            Directory.EnumerateFiles(diagnosticsPath).Select(Path.GetFileNameWithoutExtension));
+        foreach (var file in Directory.EnumerateFiles(diagnosticsPath).ToArray())
+        {
+            if (retainedBases.Contains(Path.GetFileNameWithoutExtension(file))) continue;
+            try { File.Delete(file); } catch { }
+        }
+    }
+
+    private static HashSet<string> SelectRetainedFailureDiagnosticBases(IEnumerable<string?> baseNames) =>
+        baseNames
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderByDescending(name => name, StringComparer.Ordinal)
+            .Take(FailureDiagnosticRetentionCount)
+            .ToHashSet(StringComparer.Ordinal);
+
     private static void Log(string text)
     {
         var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
@@ -2500,6 +3259,32 @@ internal static class Program
             ClaimOutcomeKind.AlreadyClaimed => $"今日已领取 · 当前余额：{afterBalance ?? beforeBalance ?? "未读取到"}",
             _ => $"领取失败 · 最后读取余额：{beforeBalance ?? afterBalance ?? "未读取到"}"
         };
+
+    private static string BuildRunNotificationText(
+        ClaimOutcomeKind outcome, string? beforeBalance, string? afterBalance,
+        int attemptsPerformed, int maxAttempts, string lifecycle, string result)
+    {
+        var baseText = BuildClaimNotificationText(outcome, beforeBalance, afterBalance);
+        var attempts = $"尝试：{Math.Max(0, attemptsPerformed)}/{Math.Max(1, maxAttempts)}";
+        return outcome == ClaimOutcomeKind.Failed
+            ? $"{baseText}\n失败阶段：{ClassifyFailureStage(result)} · {attempts} · WorkBuddy：{lifecycle}"
+            : $"{baseText}\n{attempts} · WorkBuddy：{lifecycle}";
+    }
+
+    private static string ClassifyFailureStage(string result)
+    {
+        if (result.Contains("登录", StringComparison.Ordinal)) return "登录失效";
+        if (result.Contains("OCR", StringComparison.OrdinalIgnoreCase) &&
+            (result.Contains("超时", StringComparison.Ordinal) ||
+             result.Contains("timed out", StringComparison.OrdinalIgnoreCase) ||
+             result.Contains("exceeded", StringComparison.OrdinalIgnoreCase))) return "OCR 超时";
+        if (result.Contains("积分余额", StringComparison.Ordinal) || result.Contains("个人中心", StringComparison.Ordinal)) return "个人中心/余额";
+        if (result.Contains("立即领取", StringComparison.Ordinal) || result.Contains("领取", StringComparison.Ordinal)) return "领取文字/结果核验";
+        return "未确认";
+    }
+
+    private static string DescribeWorkBuddyLifecycle(bool launchedByTool, bool wasForeground) =>
+        launchedByTool ? "工具启动后关闭" : wasForeground ? "保留原前台" : "保留原后台并最小化";
 
     private static string? FormatNotificationBalance(BalanceReading? balance)
     {
@@ -2581,6 +3366,7 @@ internal static class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
     [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] internal static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
