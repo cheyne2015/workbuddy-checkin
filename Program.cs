@@ -2937,18 +2937,30 @@ internal static class Program
         if (!BuildClaimActionNotFoundResult(clickedCheckIn: false).Contains("未识别到签到入口", StringComparison.Ordinal) ||
             !BuildClaimActionNotFoundResult(clickedCheckIn: true).Contains("已点击签到入口", StringComparison.Ordinal))
             throw new InvalidOperationException("签到入口失败结果必须如实区分未识别与已点击后未出现立即领取。");
-        if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
-        if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
-        if (config.ManualMaxAttempts != 1) throw new InvalidOperationException("ManualMaxAttempts 默认必须为 1。");
-        if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
+        ValidateUserConfig(config);
+        var defaultConfig = new Config();
+        if (defaultConfig.MaxAttempts != 5 || defaultConfig.ManualMaxAttempts != 1 ||
+            defaultConfig.RetryIntervalSeconds != 60)
+            throw new InvalidOperationException("新配置的自动/手动尝试次数和重试间隔默认值不正确。");
         if (ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: true))
             throw new InvalidOperationException("已有后台 WorkBuddy 进程时不得被视为工具启动并关闭。");
         if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
             ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: true, hadExistingProcess: true))
             throw new InvalidOperationException("WorkBuddy 启动归属判定回归失败。");
-        if (GetAttemptLimit(config, ClaimRunMode.ManualTest) != config.ManualMaxAttempts ||
-            GetAttemptLimit(config, ClaimRunMode.Automatic) != config.MaxAttempts)
+        var customAttemptConfig = new Config { ManualMaxAttempts = 2, MaxAttempts = 4 };
+        if (GetAttemptLimit(customAttemptConfig, ClaimRunMode.ManualTest) != 2 ||
+            GetAttemptLimit(customAttemptConfig, ClaimRunMode.Automatic) != 4)
             throw new InvalidOperationException("手动测试与自动领取必须分别使用各自配置的次数。");
+        using (var externalRequest = new AutoResetEvent(false))
+        using (var changedRequest = new AutoResetEvent(false))
+        {
+            changedRequest.Set();
+            if (SleepUntilOrManualTestRequest(DateTime.Now.AddMinutes(1), "配置唤醒自测", externalRequest, changedRequest))
+                throw new InvalidOperationException("配置更新必须只重算计划，不能被误判为外部手动测试交接。");
+            externalRequest.Set();
+            if (!SleepUntilOrManualTestRequest(DateTime.Now.AddMinutes(1), "交接唤醒自测", externalRequest, changedRequest))
+                throw new InvalidOperationException("外部手动测试请求必须让守护进程交出执行权。");
+        }
         var configTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-ConfigSelfTest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(configTestDirectory);
         var configTestPath = Path.Combine(configTestDirectory, "config.json");
