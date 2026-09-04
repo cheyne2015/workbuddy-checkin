@@ -587,11 +587,33 @@ internal sealed class DashboardForm : Form
         if (dialog.ShowDialog(this) == DialogResult.OK) _workBuddyPath.Text = dialog.FileName;
     }
 
-    private static void OpenAdvancedConfig()
+    internal static void OpenAdvancedConfig(string? pathOverride = null, Action<ProcessStartInfo>? startProcess = null)
     {
-        var path = Program.ConfigFilePath;
-        if (!File.Exists(path)) Program.LoadConfig();
-        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        var path = pathOverride ?? Program.ConfigFilePath;
+        if (!File.Exists(path))
+        {
+            if (pathOverride is null) Program.LoadConfig();
+            else throw new FileNotFoundException("找不到高级配置文件。", path);
+        }
+
+        startProcess ??= startInfo =>
+        {
+            _ = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动配置文件编辑器。");
+        };
+
+        try
+        {
+            startProcess(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            var fallback = new ProcessStartInfo("notepad.exe")
+            {
+                UseShellExecute = false
+            };
+            fallback.ArgumentList.Add(path);
+            startProcess(fallback);
+        }
     }
 
     private static DateTime CalculateNextRun(Config config, RunStatus? status)

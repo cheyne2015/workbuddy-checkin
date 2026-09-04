@@ -3342,6 +3342,30 @@ internal static class Program
         if (PersistentNotificationRetentionDays != 3 ||
             !CanUseToastNotificationSetting(NotificationSetting.Enabled))
             throw new InvalidOperationException("通知中心只应在 Windows 允许时投递，并保留三天。");
+        var advancedConfigTestPath = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim advanced config test.json");
+        File.WriteAllText(advancedConfigTestPath, "{}");
+        var advancedConfigStarts = new List<ProcessStartInfo>();
+        try
+        {
+            DashboardForm.OpenAdvancedConfig(advancedConfigTestPath, startInfo =>
+            {
+                advancedConfigStarts.Add(startInfo);
+                if (advancedConfigStarts.Count == 1)
+                    throw new System.ComponentModel.Win32Exception(1155, "No application is associated with JSON files.");
+            });
+            if (advancedConfigStarts.Count != 2 ||
+                !advancedConfigStarts[0].UseShellExecute ||
+                !string.Equals(advancedConfigStarts[0].FileName, advancedConfigTestPath, StringComparison.Ordinal) ||
+                advancedConfigStarts[1].UseShellExecute ||
+                !string.Equals(advancedConfigStarts[1].FileName, "notepad.exe", StringComparison.OrdinalIgnoreCase) ||
+                advancedConfigStarts[1].ArgumentList.Count != 1 ||
+                !string.Equals(advancedConfigStarts[1].ArgumentList[0], advancedConfigTestPath, StringComparison.Ordinal))
+                throw new InvalidOperationException("高级配置必须先使用系统默认程序打开；无 JSON 关联时应回退到记事本。");
+        }
+        finally
+        {
+            File.Delete(advancedConfigTestPath);
+        }
         var statusTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-RunStatusSelfTest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(statusTestDirectory);
         var statusTestPath = Path.Combine(statusTestDirectory, "run-status.json");
