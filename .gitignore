@@ -3,3 +3,4 @@ obj/
 release/
 config.json
 *.user
+artifacts/*.png

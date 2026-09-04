@@ -9,6 +9,18 @@
 - 成功、确认“今日已领取”或达到当天失败上限后，守护进程休眠到下一天，不会全天轮询或反复点击。
 - WorkBuddy 未运行时会后台启动；由工具启动的 WorkBuddy 会在流程结束后关闭。原本在前台运行的窗口保持前台，原本最小化的窗口会恢复为最小化。
 - 成功、今日已领取、失败都会发送 Windows 通知中心通知，并保留三天。
+- 守护进程常驻在右下角通知区域：左键图标打开面板，右键可以打开面板、重试领取或退出守护。
+
+## 守护面板
+
+面板会自动适配 Windows 的浅色/深色模式，并分为“概览”和“设置”：
+
+- “概览”显示最近领取状态、当前余额、更新时间、领取详情和下一次自动领取时间。
+- “重试领取”按照“手动尝试次数”执行；运行期间按钮会锁定，避免重复提交。
+- “设置”可修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
+- 点击“保存并立即应用”会唤醒守护并重新计算计划，不需要重启程序。
+- 关闭面板只会隐藏到右下角；要停止常驻守护，请右键托盘图标并选择“退出守护”。
+- “打开高级配置”可编辑 OCR 与界面适配参数，面板保存常用设置时会保留这些高级参数。
 
 ## 领取与核验逻辑
 
@@ -61,7 +73,7 @@
 
 ## 配置
 
-编辑 `release\config.json`，修改后重新启动守护进程才会生效。
+推荐从右下角托盘图标打开“设置”修改；保存后立即生效。也可以直接编辑 `release\config.json`，守护会在下一次唤醒时重新读取。
 
 常用项如下：
 
@@ -71,6 +83,7 @@
 | `ClaimTime` | `00:00` | 每日领取时间，格式 `HH:mm` |
 | `RetryIntervalSeconds` | `60` | 锁屏、睡眠恢复或失败后的重试等待秒数 |
 | `MaxAttempts` | `5` | 每日自动领取的最多尝试次数 |
+| `ManualMaxAttempts` | `1` | 面板或 `--manual-test` 手动领取的最多尝试次数 |
 | `LaunchWaitSeconds` | `20` | 启动 WorkBuddy 后的等待秒数 |
 | `CardReadyTimeoutSeconds` | `30` | 等待个人中心余额区域加载的最长秒数 |
 | `ImmediateClaimKeywords` | `立即领取` | 最终领取按钮的识别文字 |
@@ -88,6 +101,9 @@ cd .\release
 # 运行内置回归检查；不会领取
 .\WorkBuddyAutoClaim.exe --self-test
 
+# 验证托盘图标和 GUI 能创建；不会启动或控制 WorkBuddy
+.\WorkBuddyAutoClaim.exe --ui-smoke-test
+
 # 读取当前余额并发送一条真实 Windows 通知；不会点击签到或领取
 .\WorkBuddyAutoClaim.exe --test-notification
 
@@ -104,7 +120,7 @@ cd .\release
 .\WorkBuddyAutoClaim.exe --manual-test
 ```
 
-手动测试只尝试一次，不会写入当天的自动领取成功状态；失败后会停止并等待处理，后台守护随后恢复。
+手动测试按 `ManualMaxAttempts` 执行（默认一次），不会写入当天的自动领取成功状态；失败后会停止并等待处理，后台守护随后恢复。
 
 ## 日志与排错
 
@@ -118,6 +134,7 @@ cd .\release
 
 - `workbuddy-auto-claim.log`：运行、OCR、通知与失败原因。
 - `state.json`：当天自动领取的成功或终止失败状态。
+- `run-status.json`：守护面板显示的最近领取状态、余额和尝试次数。
 - `workbuddy-*.png`：领取前后、个人中心识别失败等诊断截图。
 - `workbuddy-personal-center-ocr-failure.txt`：识别失败时保存的 OCR 原文。
 
@@ -137,7 +154,7 @@ cd .\release
 - `state.json` 使用原子写入和 `.bak` 备份。两份状态都损坏时，当天安全停止并通知，不会重复领取。
 - 安装的 Windows 任务在登录时启动守护进程；守护异常退出时，任务计划会每分钟最多重启 3 次。
 - 安装、手动测试或安全测试结束时，工具优先请求任务计划恢复守护；只有新守护完成配置加载并主动发出就绪信号后才记录恢复成功，直接启动回退也执行同样确认。
-- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-recovery-hardening.zip`；包内不包含本机 `config.json`、PDB 或诊断数据。
+- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.1.0.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
 - `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-auto-claim.log` 只保留最近 30 天；`diagnostics\` 仅保留最新 20 份失败诊断。诊断包包含截图、OCR 原文、WorkBuddy 版本、窗口尺寸和 DPI；成功领取不会保留领取截图。
 
 失败通知除余额外，还会包含失败阶段、已执行尝试次数，以及 WorkBuddy 是保留原前台、保留后台最小化，还是由工具启动后关闭。

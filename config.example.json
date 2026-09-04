@@ -3,6 +3,7 @@
   "ClaimTime": "00:00",
   "RetryIntervalSeconds": 60,
   "MaxAttempts": 5,
+  "ManualMaxAttempts": 1,
   "LaunchWaitSeconds": 20,
   "CardReadyTimeoutSeconds": 30,
   "ImmediateClaimKeywords": ["立即领取"],

@@ -38,8 +38,11 @@ internal static class Program
     private static readonly string ConfigPath = Path.Combine(BaseDir, "config.json");
     private static readonly string StatePath = Path.Combine(DataDirectory, "state.json");
     private static readonly string StateBackupPath = StatePath + ".bak";
+    private static readonly string RunStatusPath = Path.Combine(DataDirectory, "run-status.json");
     private static Mutex? _mutex;
+    private static readonly SemaphoreSlim ClaimExecutionGate = new(1, 1);
     private static DateOnly? _lastRetentionMaintenanceDate;
+    internal static string ConfigFilePath => ConfigPath;
 
     [STAThread]
     private static int Main(string[] args)
@@ -47,6 +50,7 @@ internal static class Program
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
         if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
         if (command == "--self-test") return RunSelfTest();
+        if (command == "--ui-smoke-test") return TrayApplication.RunSmokeTest(args.Skip(1).FirstOrDefault());
         if (command == "--verify-claim-ocr") return RunClaimOcrVerification(args);
         if (command is "--run-now" or "--manual-test") return RunManualTest();
         if (IsInteractiveNonClaimTest(command)) return RunInteractiveNonClaimTest(command);
@@ -79,7 +83,7 @@ internal static class Program
                 "--test-personal-center" => TestPersonalCenter(config),
                 "--test-notification" => TestNotification(config),
                 "--probe-checkin-entry" => ProbeCheckInEntry(config),
-                "--daemon" => RunDaemon(config),
+                "--daemon" => TrayApplication.RunDaemon(config),
                 _ => 2
             };
         }
@@ -148,28 +152,30 @@ internal static class Program
         }
     }
 
-    private static int RunDaemon(Config config)
+    internal static int RunDaemon(Config config, WaitHandle? configChanged = null)
     {
-        if (!TimeSpan.TryParse(config.ClaimTime, out var claimTime))
-            throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
+        ValidateUserConfig(config);
         using var daemonReady = new EventWaitHandle(false, EventResetMode.AutoReset, DaemonReadyEventName);
         daemonReady.Set();
         Log("后台守护已启动并发出就绪信号，领取时间: " + config.ClaimTime);
 
-        var retryDelay = TimeSpan.FromSeconds(Math.Max(10, config.RetryIntervalSeconds));
         using var manualTestRequest = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
         while (true)
         {
+            var retryDelay = TimeSpan.FromSeconds(Math.Clamp(config.RetryIntervalSeconds, 10, 3600));
             try
             {
                 if (WaitForManualTestRequest(manualTestRequest, TimeSpan.Zero)) return 0;
+                config = LoadConfig();
+                var claimTime = TimeSpan.ParseExact(config.ClaimTime, @"hh\:mm", CultureInfo.InvariantCulture);
+                retryDelay = TimeSpan.FromSeconds(config.RetryIntervalSeconds);
                 var now = DateTime.Now;
                 var stateLoad = LoadState();
                 if (!stateLoad.IsUsable)
                 {
                     Log("State file and backup are invalid; claim is stopped safely for today.");
                     Notify("WorkBuddy 自动领取", "状态文件与备份均无法读取；今日未执行领取，请查看诊断日志。", ToolTipIcon.Error);
-                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态文件损坏，等待明天", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态文件损坏，等待明天", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
                 var state = stateLoad.State!;
@@ -181,25 +187,25 @@ internal static class Program
                     {
                         Log("Recovered state cannot prove today's claim status; stopped safely for today.");
                         Notify("WorkBuddy 自动领取", "状态文件已从备份恢复，但无法确认今日状态；今日未执行领取。", ToolTipIcon.Error);
-                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态恢复待确认，等待明天", manualTestRequest)) return 0;
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "状态恢复待确认，等待明天", manualTestRequest, configChanged)) return 0;
                         continue;
                     }
                 }
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已完成 5 次领取尝试，等待明天", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), $"今天已完成 {config.MaxAttempts} 次领取尝试，等待明天", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
 
                 if (now < scheduledToday)
                 {
-                    if (SleepUntilOrManualTestRequest(scheduledToday, "尚未到领取时间", manualTestRequest)) return 0;
+                    if (SleepUntilOrManualTestRequest(scheduledToday, "尚未到领取时间", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
 
@@ -212,7 +218,7 @@ internal static class Program
                     int exitCode = RunOnce(config, ClaimRunMode.Automatic);
                     if (exitCode == 0)
                     {
-                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest)) return 0;
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
                         continue;
                     }
                     if (exitCode == 3)
@@ -221,18 +227,18 @@ internal static class Program
                     }
                     else
                     {
-                        // RunOnce has already completed the configured five consecutive
+                        // RunOnce has already completed the configured consecutive
                         // attempts and sent the one terminal-failure notification. Do not
-                        // start another five-attempt batch every minute for the rest of today.
+                        // start another attempt batch every minute for the rest of today.
                         state.TerminalFailureDate = DateOnly.FromDateTime(now);
                         SaveState(state);
-                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest)) return 0;
+                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest, configChanged)) return 0;
                         continue;
                     }
                 }
             }
             catch (Exception ex) { Log("守护错误: " + ex.Message); }
-            if (WaitForManualTestRequest(manualTestRequest, retryDelay)) return 0;
+            if (SleepUntilOrManualTestRequest(DateTime.Now.Add(retryDelay), "等待下次重试", manualTestRequest, configChanged)) return 0;
         }
     }
 
@@ -245,7 +251,8 @@ internal static class Program
     private static bool HasDailyTerminalState(State state, DateOnly date) =>
         state.SuccessDate == date || state.TerminalFailureDate == date;
 
-    private static bool SleepUntilOrManualTestRequest(DateTime wakeAt, string reason, WaitHandle? interrupt = null)
+    private static bool SleepUntilOrManualTestRequest(
+        DateTime wakeAt, string reason, WaitHandle? interrupt = null, WaitHandle? configChanged = null)
     {
         while (true)
         {
@@ -259,11 +266,28 @@ internal static class Program
                 Thread.Sleep((int)Math.Ceiling(milliseconds));
                 continue;
             }
-            if (interrupt.WaitOne((int)Math.Ceiling(milliseconds)))
+            var waitMilliseconds = (int)Math.Ceiling(milliseconds);
+            if (configChanged is not null)
+            {
+                var result = WaitHandle.WaitAny([interrupt, configChanged], waitMilliseconds);
+                if (result == 0)
+                {
+                    LogManualTestYield();
+                    return true;
+                }
+                if (result == 1)
+                {
+                    Log("检测到配置已更新，重新计算守护计划。");
+                    return false;
+                }
+                return false;
+            }
+            if (interrupt.WaitOne(waitMilliseconds))
             {
                 LogManualTestYield();
                 return true;
             }
+            return false;
         }
     }
 
@@ -297,7 +321,7 @@ internal static class Program
                 restartDaemon = true;
             }
 
-            Log("开始手动测试：仅执行一次，不修改自动领取状态。");
+            Log($"开始手动测试：按配置最多执行 {config.ManualMaxAttempts} 次，不修改自动领取状态。");
             return RunOnce(config, ClaimRunMode.ManualTest);
         }
         catch (Exception ex)
@@ -428,11 +452,49 @@ internal static class Program
     private enum ClaimRunMode { Automatic, ManualTest }
 
     private static int GetAttemptLimit(Config config, ClaimRunMode mode) =>
-        mode == ClaimRunMode.ManualTest ? 1 : config.MaxAttempts;
+        mode == ClaimRunMode.ManualTest ? config.ManualMaxAttempts : config.MaxAttempts;
 
     private static bool ShouldPersistDailyState(ClaimRunMode mode) => mode == ClaimRunMode.Automatic;
 
     private static int RunOnce(Config config, ClaimRunMode mode)
+    {
+        ClaimExecutionGate.Wait();
+        try { return RunOnceCore(config, mode); }
+        finally { ClaimExecutionGate.Release(); }
+    }
+
+    internal static int RunManualRetryFromTray()
+    {
+        try
+        {
+            var config = LoadConfig();
+            RecordRunStatus(new RunStatus
+            {
+                UpdatedAt = DateTimeOffset.Now,
+                Mode = "Manual",
+                Outcome = "Queued",
+                Message = "已从守护面板提交重试请求。",
+                AttemptsPerformed = 0,
+                MaxAttempts = config.ManualMaxAttempts
+            });
+            return RunOnce(config, ClaimRunMode.ManualTest);
+        }
+        catch (Exception ex)
+        {
+            RecordRunStatus(new RunStatus
+            {
+                UpdatedAt = DateTimeOffset.Now,
+                Mode = "Manual",
+                Outcome = "Failed",
+                Message = "手动重试未能启动：" + ex.Message
+            });
+            Log("守护面板手动重试错误: " + ex);
+            Notify("WorkBuddy 手动重试失败", "重试未能启动：" + ex.Message, ToolTipIcon.Error);
+            return 1;
+        }
+    }
+
+    private static int RunOnceCore(Config config, ClaimRunMode mode)
     {
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         int maxAttempts = GetAttemptLimit(config, mode);
@@ -440,6 +502,15 @@ internal static class Program
         if (!IsInteractiveDesktop())
         {
             Log("桌面已锁定，跳过本次尝试。");
+            RecordRunStatus(new RunStatus
+            {
+                UpdatedAt = DateTimeOffset.Now,
+                Mode = isManualTest ? "Manual" : "Automatic",
+                Outcome = "Failed",
+                Message = "桌面已锁定，未执行领取。",
+                AttemptsPerformed = 0,
+                MaxAttempts = maxAttempts
+            });
             if (isManualTest)
                 NotifyManualTestFailure("桌面已锁定，测试未执行",
                     BuildClaimNotificationText(ClaimOutcomeKind.Failed, null, null));
@@ -457,6 +528,15 @@ internal static class Program
         ClaimOutcomeKind outcomeKind = ClaimOutcomeKind.Failed;
         BalanceReading? notificationBeforeBalance = null;
         BalanceReading? notificationAfterBalance = null;
+        RecordRunStatus(new RunStatus
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Mode = isManualTest ? "Manual" : "Automatic",
+            Outcome = "Running",
+            Message = "正在打开个人中心并读取积分余额。",
+            AttemptsPerformed = 0,
+            MaxAttempts = maxAttempts
+        });
         try
         {
             window = EnsureWorkBuddyWindow(config, out launchedByTool);
@@ -531,6 +611,17 @@ internal static class Program
         {
             if (ShouldPersistDailyState(mode)) SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
             Log("完成: " + result);
+            RecordRunStatus(new RunStatus
+            {
+                UpdatedAt = DateTimeOffset.Now,
+                Mode = isManualTest ? "Manual" : "Automatic",
+                Outcome = outcomeKind.ToString(),
+                Message = result,
+                BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
+                AfterBalance = FormatNotificationBalance(notificationAfterBalance),
+                AttemptsPerformed = attemptsPerformed,
+                MaxAttempts = maxAttempts
+            });
             Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
                 BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
                     FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, maxAttempts,
@@ -539,6 +630,17 @@ internal static class Program
         }
 
         Log("领取失败: " + result);
+        RecordRunStatus(new RunStatus
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Mode = isManualTest ? "Manual" : "Automatic",
+            Outcome = "Failed",
+            Message = result,
+            BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
+            AfterBalance = FormatNotificationBalance(notificationAfterBalance),
+            AttemptsPerformed = attemptsPerformed,
+            MaxAttempts = maxAttempts
+        });
         var failureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed,
             FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance),
             attemptsPerformed, maxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, wasForeground), result);
@@ -2837,15 +2939,41 @@ internal static class Program
             throw new InvalidOperationException("签到入口失败结果必须如实区分未识别与已点击后未出现立即领取。");
         if (!DateTime.TryParse(config.ClaimTime, out _)) throw new InvalidOperationException("ClaimTime 必须是 HH:mm。");
         if (config.MaxAttempts != 5) throw new InvalidOperationException("MaxAttempts 必须保持为 5。");
+        if (config.ManualMaxAttempts != 1) throw new InvalidOperationException("ManualMaxAttempts 默认必须为 1。");
         if (config.RetryIntervalSeconds < 10) throw new InvalidOperationException("RetryIntervalSeconds 不能小于 10。");
         if (ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: true))
             throw new InvalidOperationException("已有后台 WorkBuddy 进程时不得被视为工具启动并关闭。");
         if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
             ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: true, hadExistingProcess: true))
             throw new InvalidOperationException("WorkBuddy 启动归属判定回归失败。");
-        if (GetAttemptLimit(config, ClaimRunMode.ManualTest) != 1 ||
+        if (GetAttemptLimit(config, ClaimRunMode.ManualTest) != config.ManualMaxAttempts ||
             GetAttemptLimit(config, ClaimRunMode.Automatic) != config.MaxAttempts)
-            throw new InvalidOperationException("手动测试必须只尝试一次，自动领取必须使用配置次数。");
+            throw new InvalidOperationException("手动测试与自动领取必须分别使用各自配置的次数。");
+        var configTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-ConfigSelfTest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(configTestDirectory);
+        var configTestPath = Path.Combine(configTestDirectory, "config.json");
+        try
+        {
+            var editableConfig = new Config
+            {
+                WorkBuddyPath = @"D:\Program Files\WorkBuddy\WorkBuddy.exe",
+                ClaimTime = "01:25",
+                RetryIntervalSeconds = 75,
+                MaxAttempts = 4,
+                ManualMaxAttempts = 2,
+                BalanceValueCropScale = 7
+            };
+            ValidateUserConfig(editableConfig);
+            SaveConfig(editableConfig, configTestPath);
+            var reloadedConfig = LoadConfig(configTestPath, createFromExample: false);
+            if (reloadedConfig.ClaimTime != "01:25" || reloadedConfig.MaxAttempts != 4 ||
+                reloadedConfig.ManualMaxAttempts != 2 || reloadedConfig.BalanceValueCropScale != 7)
+                throw new InvalidOperationException("GUI 保存配置时必须保留高级 OCR 参数并立即可重新读取。");
+        }
+        finally
+        {
+            if (Directory.Exists(configTestDirectory)) Directory.Delete(configTestDirectory, recursive: true);
+        }
         if (ShouldPersistDailyState(ClaimRunMode.ManualTest) || !ShouldPersistDailyState(ClaimRunMode.Automatic))
             throw new InvalidOperationException("手动测试不得写入每日状态，自动领取必须写入每日状态。");
         var nextAfterTerminalFailure = NextClaimTime(new DateTime(2026, 7, 26, 12, 0, 0), TimeSpan.Zero);
@@ -3069,18 +3197,160 @@ internal static class Program
         if (PersistentNotificationRetentionDays != 3 ||
             !CanUseToastNotificationSetting(NotificationSetting.Enabled))
             throw new InvalidOperationException("通知中心只应在 Windows 允许时投递，并保留三天。");
+        var statusTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-RunStatusSelfTest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(statusTestDirectory);
+        var statusTestPath = Path.Combine(statusTestDirectory, "run-status.json");
+        try
+        {
+            var completedStatus = new RunStatus
+            {
+                UpdatedAt = new DateTimeOffset(2026, 9, 4, 0, 0, 8, TimeSpan.FromHours(8)),
+                Mode = "Automatic",
+                Outcome = "Claimed",
+                Message = "余额已增加",
+                BeforeBalance = "1722.8",
+                AfterBalance = "1822.8",
+                AttemptsPerformed = 1,
+                MaxAttempts = 5
+            };
+            SaveRunStatus(completedStatus, statusTestPath);
+            var reloadedStatus = LoadRunStatus(statusTestPath);
+            var completedView = DashboardStatusView.From(reloadedStatus);
+            if (completedView.Title != "领取成功" || completedView.Balance != "1822.8" ||
+                !completedView.Detail.Contains("1722.8 → 1822.8", StringComparison.Ordinal))
+                throw new InvalidOperationException("GUI 必须把余额变化显示为领取成功，并展示领取前后余额。");
+
+            var alreadyView = DashboardStatusView.From(completedStatus with
+            {
+                Outcome = "AlreadyClaimed",
+                BeforeBalance = "1822.8",
+                AfterBalance = "1822.8"
+            });
+            if (alreadyView.Title != "今日已领取" || alreadyView.Balance != "1822.8")
+                throw new InvalidOperationException("GUI 必须把余额不变且已领状态显示为今日已领取。");
+        }
+        finally
+        {
+            if (Directory.Exists(statusTestDirectory)) Directory.Delete(statusTestDirectory, recursive: true);
+        }
         Log("Self test OK.");
         return 0;
     }
 
-    private static Config LoadConfig()
+    internal static Config LoadConfig() => LoadConfig(ConfigPath, createFromExample: true);
+
+    internal static Config LoadConfig(string path, bool createFromExample)
     {
-        if (!File.Exists(ConfigPath))
+        if (!File.Exists(path))
         {
+            if (!createFromExample) throw new FileNotFoundException("找不到配置文件。", path);
             var example = Path.Combine(BaseDir, "config.example.json");
-            File.Copy(example, ConfigPath);
+            File.Copy(example, path);
         }
-        return JsonSerializer.Deserialize<Config>(File.ReadAllText(ConfigPath)) ?? throw new InvalidOperationException("配置文件无效。");
+        var config = JsonSerializer.Deserialize<Config>(File.ReadAllText(path))
+            ?? throw new InvalidOperationException("配置文件无效。");
+        ValidateUserConfig(config);
+        return config;
+    }
+
+    internal static void ValidateUserConfig(Config config)
+    {
+        if (string.IsNullOrWhiteSpace(config.WorkBuddyPath))
+            throw new InvalidOperationException("WorkBuddy 路径不能为空。");
+        if (!TimeSpan.TryParseExact(config.ClaimTime, @"hh\:mm", CultureInfo.InvariantCulture, out _))
+            throw new InvalidOperationException("领取时间必须是 HH:mm，例如 00:00。");
+        if (config.MaxAttempts is < 1 or > 10)
+            throw new InvalidOperationException("每日自动重试次数必须在 1 到 10 之间。");
+        if (config.ManualMaxAttempts is < 1 or > 10)
+            throw new InvalidOperationException("手动重试次数必须在 1 到 10 之间。");
+        if (config.RetryIntervalSeconds is < 10 or > 3600)
+            throw new InvalidOperationException("失败重试间隔必须在 10 到 3600 秒之间。");
+        if (config.LaunchWaitSeconds is < 5 or > 120 || config.CardReadyTimeoutSeconds is < 5 or > 120)
+            throw new InvalidOperationException("启动等待和界面等待必须在 5 到 120 秒之间。");
+    }
+
+    internal static void SaveConfig(Config config) => SaveConfig(config, ConfigPath);
+
+    internal static void SaveConfig(Config config, string path)
+    {
+        ValidateUserConfig(config);
+        var directory = Path.GetDirectoryName(path) ?? throw new InvalidOperationException("配置目录不可用。");
+        Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(directory, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(temporaryPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            File.Move(temporaryPath, path, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
+        }
+    }
+
+    internal static RunStatus? LoadRunStatus()
+    {
+        var status = LoadRunStatus(RunStatusPath);
+        if (status is not null) return status;
+        var stateLoad = LoadState();
+        if (!stateLoad.IsUsable) return null;
+        var state = stateLoad.State!;
+        var latestDate = new[] { state.SuccessDate, state.TerminalFailureDate }
+            .Where(date => date.HasValue)
+            .Select(date => date!.Value)
+            .DefaultIfEmpty()
+            .Max();
+        if (latestDate == default) return null;
+        var failed = state.TerminalFailureDate == latestDate;
+        var localTime = latestDate.ToDateTime(TimeOnly.MinValue);
+        return new RunStatus
+        {
+            UpdatedAt = new DateTimeOffset(localTime, TimeZoneInfo.Local.GetUtcOffset(localTime)),
+            Mode = "Automatic",
+            Outcome = failed ? "Failed" : "AlreadyClaimed",
+            Message = failed ? "由原有每日状态恢复：当天领取失败。" : "由原有每日状态恢复：当天已完成领取。",
+            MaxAttempts = 0
+        };
+    }
+
+    internal static RunStatus? LoadRunStatus(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return null;
+            return JsonSerializer.Deserialize<RunStatus>(File.ReadAllText(path));
+        }
+        catch (Exception ex)
+        {
+            Log("读取最近领取状态失败: " + ex.Message);
+            return null;
+        }
+    }
+
+    internal static void SaveRunStatus(RunStatus status) => SaveRunStatus(status, RunStatusPath);
+
+    private static void RecordRunStatus(RunStatus status)
+    {
+        try { SaveRunStatus(status); }
+        catch (Exception ex) { Log("保存最近领取状态失败: " + ex.Message); }
+    }
+
+    internal static void SaveRunStatus(RunStatus status, string path)
+    {
+        var directory = Path.GetDirectoryName(path) ?? throw new InvalidOperationException("状态目录不可用。");
+        Directory.CreateDirectory(directory);
+        var temporaryPath = Path.Combine(directory, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            var json = JsonSerializer.Serialize(status, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(temporaryPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            File.Move(temporaryPath, path, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
+        }
     }
     private enum StateLoadSource { Primary, Backup, Missing, Invalid }
 
@@ -3308,6 +3578,7 @@ internal sealed class Config
     public string ClaimTime { get; set; } = "00:00";
     public int RetryIntervalSeconds { get; set; } = 60;
     public int MaxAttempts { get; set; } = 5;
+    public int ManualMaxAttempts { get; set; } = 1;
     public int LaunchWaitSeconds { get; set; } = 20;
     public int CardReadyTimeoutSeconds { get; set; } = 30;
     public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
