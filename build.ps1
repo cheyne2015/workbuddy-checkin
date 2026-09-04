@@ -6,11 +6,11 @@ Copy-Item (Join-Path $here 'config.example.json') (Join-Path $here 'release\conf
 
 $releaseDirectory = Join-Path $here 'release'
 $artifactDirectory = Join-Path $here 'artifacts'
-$packageName = 'WorkBuddyAutoClaim-v1.1.0'
+$packageName = 'WorkBuddyAutoClaim-v1.1.1'
 $packagePath = Join-Path $artifactDirectory ($packageName + '.zip')
 $temporaryPackagePath = Join-Path $artifactDirectory ($packageName + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
 $backupPackagePath = Join-Path $artifactDirectory ($packageName + '.' + [Guid]::NewGuid().ToString('N') + '.previous.tmp')
-$rootFiles = @('install.cmd', 'uninstall.cmd', 'README.md')
+$rootFiles = @('install.cmd', 'uninstall.cmd', 'README.md', 'QUICKSTART-ZH.txt')
 $releaseFiles = @(
     'CommunityToolkit.WinUI.Notifications.dll',
     'config.example.json',

@@ -29,6 +29,7 @@ internal sealed class TrayDaemonContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _icon;
     private readonly DashboardForm _dashboard;
+    private readonly ToolStripMenuItem _startupItem;
     private readonly AutoResetEvent _configChanged = new(false);
     private readonly System.Windows.Forms.Timer _lifecycleTimer = new() { Interval = 500 };
     private readonly Task<int>? _schedulerTask;
@@ -43,7 +44,12 @@ internal sealed class TrayDaemonContext : ApplicationContext
         menu.Items.Add("打开守护面板", null, (_, _) => ShowDashboard());
         menu.Items.Add("重试领取", null, (_, _) => StartRetry());
         menu.Items.Add(new ToolStripSeparator());
+        _startupItem = new ToolStripMenuItem("开机启动") { CheckOnClick = false };
+        _startupItem.Click += (_, _) => ToggleStartup();
+        menu.Items.Add(_startupItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出守护", null, (_, _) => ExitDaemon());
+        menu.Opening += (_, _) => RefreshStartupMenuState();
 
         _notifyIcon = new NotifyIcon
         {
@@ -71,6 +77,11 @@ internal sealed class TrayDaemonContext : ApplicationContext
                     ShowDashboard();
                     if (!_notifyIcon.Visible || !_dashboard.IsHandleCreated || _dashboard.Width < 500 || _dashboard.Height < 500)
                         throw new InvalidOperationException("托盘图标或守护面板未正确创建。");
+                    var menuLabels = _notifyIcon.ContextMenuStrip!.Items.OfType<ToolStripMenuItem>()
+                        .Select(item => item.Text ?? string.Empty).ToArray();
+                    if (!menuLabels.Contains("打开守护面板") || !menuLabels.Contains("重试领取") ||
+                        !menuLabels.Any(label => label.StartsWith("开机启动", StringComparison.Ordinal)) || !menuLabels.Contains("退出守护"))
+                        throw new InvalidOperationException("托盘右键菜单缺少打开、重试、开机启动或退出命令。");
                     _dashboard.ValidateSmoke();
                     if (!string.IsNullOrWhiteSpace(screenshotPath))
                     {
@@ -160,6 +171,32 @@ internal sealed class TrayDaemonContext : ApplicationContext
         _dashboard.AllowClose();
         _dashboard.Close();
         ExitThread();
+    }
+
+    private void RefreshStartupMenuState()
+    {
+        var state = Program.GetStartupTaskState();
+        _startupItem.Checked = state == Program.StartupTaskState.Enabled;
+        _startupItem.Enabled = state != Program.StartupTaskState.Unavailable;
+        _startupItem.Text = state == Program.StartupTaskState.Unavailable ? "开机启动（状态不可用）" : "开机启动";
+    }
+
+    private void ToggleStartup()
+    {
+        try
+        {
+            _startupItem.Enabled = false;
+            var enable = Program.GetStartupTaskState() != Program.StartupTaskState.Enabled;
+            Program.SetStartupEnabled(enable);
+            RefreshStartupMenuState();
+            _notifyIcon.ShowBalloonTip(5000, "WorkBuddy 自动领取守护",
+                enable ? "已开启开机启动。" : "已关闭开机启动，当前守护仍会继续运行。", ToolTipIcon.Info);
+        }
+        catch (Exception ex)
+        {
+            _startupItem.Enabled = true;
+            _notifyIcon.ShowBalloonTip(7000, "开机启动设置失败", ex.Message, ToolTipIcon.Error);
+        }
     }
 
     protected override void ExitThreadCore()

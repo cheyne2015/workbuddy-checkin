@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using Windows.UI.Notifications;
 
 namespace WorkBuddyAutoClaim;
@@ -51,6 +52,8 @@ internal static class Program
         if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
         if (command == "--self-test") return RunSelfTest();
         if (command == "--ui-smoke-test") return TrayApplication.RunSmokeTest(args.Skip(1).FirstOrDefault());
+        if (command == "--startup-status") return RunStartupStatusProbe();
+        if (command == "--set-startup") return RunSetStartup(args.Skip(1).FirstOrDefault());
         if (command == "--verify-claim-ocr") return RunClaimOcrVerification(args);
         if (command is "--run-now" or "--manual-test") return RunManualTest();
         if (IsInteractiveNonClaimTest(command)) return RunInteractiveNonClaimTest(command);
@@ -2552,7 +2555,145 @@ internal static class Program
         finally { Native.CloseDesktop(desktop); }
     }
 
+    internal enum StartupTaskState { Missing, Disabled, Enabled, Unavailable }
+
+    internal static StartupTaskState GetStartupTaskState()
+    {
+        try
+        {
+            using var process = Process.Start(CreateStartupTaskQueryStartInfo())
+                ?? throw new InvalidOperationException("无法启动任务计划查询。");
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(10_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                Log("查询开机启动状态超时。");
+                return StartupTaskState.Unavailable;
+            }
+            var output = outputTask.GetAwaiter().GetResult();
+            _ = errorTask.GetAwaiter().GetResult();
+            return process.ExitCode == 0 ? ParseStartupTaskState(output) : StartupTaskState.Missing;
+        }
+        catch (Exception ex)
+        {
+            Log("查询开机启动状态失败: " + ex.Message);
+            return StartupTaskState.Unavailable;
+        }
+    }
+
+    internal static StartupTaskState ParseStartupTaskState(string xml)
+    {
+        var document = XDocument.Parse(xml);
+        var settings = document.Descendants().FirstOrDefault(element => element.Name.LocalName == "Settings");
+        var enabledText = settings?.Elements().FirstOrDefault(element => element.Name.LocalName == "Enabled")?.Value;
+        return string.Equals(enabledText, "false", StringComparison.OrdinalIgnoreCase)
+            ? StartupTaskState.Disabled
+            : StartupTaskState.Enabled;
+    }
+
+    private static ProcessStartInfo CreateStartupTaskQueryStartInfo()
+    {
+        var start = new ProcessStartInfo("schtasks.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        start.ArgumentList.Add("/Query");
+        start.ArgumentList.Add("/TN");
+        start.ArgumentList.Add(TaskName);
+        start.ArgumentList.Add("/XML");
+        start.ArgumentList.Add("ONE");
+        return start;
+    }
+
+    internal static ProcessStartInfo CreateStartupTaskChangeStartInfo(bool enabled)
+    {
+        var start = new ProcessStartInfo("schtasks.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        start.ArgumentList.Add("/Change");
+        start.ArgumentList.Add("/TN");
+        start.ArgumentList.Add(TaskName);
+        start.ArgumentList.Add(enabled ? "/ENABLE" : "/DISABLE");
+        return start;
+    }
+
+    internal static void SetStartupEnabled(bool enabled)
+    {
+        var current = GetStartupTaskState();
+        if (enabled && current == StartupTaskState.Missing)
+        {
+            CreateOrUpdateStartupTask();
+        }
+        else if (current != StartupTaskState.Missing || enabled)
+        {
+            using var process = Process.Start(CreateStartupTaskChangeStartInfo(enabled))
+                ?? throw new InvalidOperationException("无法启动任务计划设置。");
+            if (!process.WaitForExit(10_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                throw new TimeoutException("修改开机启动状态超时。");
+            }
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException($"修改开机启动状态失败，退出码 {process.ExitCode}。");
+        }
+
+        var expected = enabled ? StartupTaskState.Enabled : StartupTaskState.Disabled;
+        var actual = GetStartupTaskState();
+        if (!enabled && actual == StartupTaskState.Missing) return;
+        if (actual != expected)
+            throw new InvalidOperationException($"开机启动状态核验失败，当前状态为 {actual}。");
+        Log(enabled ? "已从托盘启用开机启动。" : "已从托盘禁用开机启动；当前守护继续运行。");
+    }
+
+    private static int RunStartupStatusProbe() => GetStartupTaskState() switch
+    {
+        StartupTaskState.Enabled => 0,
+        StartupTaskState.Disabled or StartupTaskState.Missing => 1,
+        _ => 2
+    };
+
+    private static int RunSetStartup(string? value)
+    {
+        try
+        {
+            if (string.Equals(value, "enabled", StringComparison.OrdinalIgnoreCase))
+            {
+                SetStartupEnabled(true);
+                return 0;
+            }
+            if (string.Equals(value, "disabled", StringComparison.OrdinalIgnoreCase))
+            {
+                SetStartupEnabled(false);
+                return 0;
+            }
+            return 2;
+        }
+        catch (Exception ex)
+        {
+            Log("命令行修改开机启动失败: " + ex);
+            return 1;
+        }
+    }
+
     private static int Install(Config config)
+    {
+        CreateOrUpdateStartupTask();
+        // 安装发生在当天领取时间之后时，从下一天开始，避免安装动作立刻打断正在使用的 WorkBuddy。
+        // Installation must not manufacture a successful daily claim or overwrite an
+        // observed terminal failure. Only the numeric-balance verification path writes
+        // SuccessDate; the daemon will use the persisted state on its next wake-up.
+        Log("已安装开机自启任务。\n");
+        Notify("WorkBuddy 自动领取", "已启用：每天 00:00 后自动领取。", ToolTipIcon.Info);
+        return 0;
+    }
+
+    private static void CreateOrUpdateStartupTask()
     {
         var exe = Environment.ProcessPath ?? throw new InvalidOperationException("无法解析程序路径。");
         var xmlPath = Path.Combine(Path.GetTempPath(), "workbuddy-auto-claim-task.xml");
@@ -2562,13 +2703,6 @@ internal static class Program
         File.WriteAllText(xmlPath, xml, new System.Text.UnicodeEncoding());
         try { RunProcess("schtasks.exe", $"/Create /TN \"{TaskName}\" /XML \"{xmlPath}\" /F"); }
         finally { try { File.Delete(xmlPath); } catch { } }
-        // 安装发生在当天领取时间之后时，从下一天开始，避免安装动作立刻打断正在使用的 WorkBuddy。
-        // Installation must not manufacture a successful daily claim or overwrite an
-        // observed terminal failure. Only the numeric-balance verification path writes
-        // SuccessDate; the daemon will use the persisted state on its next wake-up.
-        Log("已安装开机自启任务。\n");
-        Notify("WorkBuddy 自动领取", "已启用：每天 00:00 后自动领取。", ToolTipIcon.Info);
-        return 0;
     }
 
     private static string BuildScheduledTaskXml(string escapedExe, string escapedDir) => $@"<?xml version=""1.0"" encoding=""UTF-16""?>
@@ -2961,6 +3095,18 @@ internal static class Program
             if (!SleepUntilOrManualTestRequest(DateTime.Now.AddMinutes(1), "交接唤醒自测", externalRequest, changedRequest))
                 throw new InvalidOperationException("外部手动测试请求必须让守护进程交出执行权。");
         }
+        const string enabledTaskXml = "<Task><Settings><Enabled>true</Enabled></Settings></Task>";
+        const string disabledTaskXml = "<Task><Settings><Enabled>false</Enabled></Settings></Task>";
+        const string defaultEnabledTaskXml = "<Task><Settings /></Task>";
+        if (ParseStartupTaskState(enabledTaskXml) != StartupTaskState.Enabled ||
+            ParseStartupTaskState(disabledTaskXml) != StartupTaskState.Disabled ||
+            ParseStartupTaskState(defaultEnabledTaskXml) != StartupTaskState.Enabled)
+            throw new InvalidOperationException("托盘菜单必须准确区分开机启动的启用和禁用状态。");
+        var disableStartup = CreateStartupTaskChangeStartInfo(enabled: false);
+        var enableStartup = CreateStartupTaskChangeStartInfo(enabled: true);
+        if (disableStartup.ArgumentList[^1] != "/DISABLE" || enableStartup.ArgumentList[^1] != "/ENABLE" ||
+            disableStartup.UseShellExecute || !disableStartup.CreateNoWindow)
+            throw new InvalidOperationException("开机启动切换必须使用无窗口的任务计划启用/禁用命令。");
         var configTestDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyAutoClaim-ConfigSelfTest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(configTestDirectory);
         var configTestPath = Path.Combine(configTestDirectory, "config.json");
