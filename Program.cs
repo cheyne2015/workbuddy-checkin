@@ -9,7 +9,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
-using System.Xml.Linq;
 using Windows.UI.Notifications;
 
 namespace WorkBuddyAutoClaim;
@@ -2559,54 +2558,47 @@ internal static class Program
 
     internal static StartupTaskState GetStartupTaskState()
     {
+        object? schedulerObject = null;
+        object? folderObject = null;
+        object? taskObject = null;
         try
         {
-            using var process = Process.Start(CreateStartupTaskQueryStartInfo())
-                ?? throw new InvalidOperationException("无法启动任务计划查询。");
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(10_000))
-            {
-                try { process.Kill(entireProcessTree: true); } catch { }
-                Log("查询开机启动状态超时。");
-                return StartupTaskState.Unavailable;
-            }
-            var output = outputTask.GetAwaiter().GetResult();
-            _ = errorTask.GetAwaiter().GetResult();
-            return process.ExitCode == 0 ? ParseStartupTaskState(output) : StartupTaskState.Missing;
+            var schedulerType = Type.GetTypeFromProgID("Schedule.Service")
+                ?? throw new InvalidOperationException("当前系统没有 Task Scheduler COM 服务。");
+            schedulerObject = Activator.CreateInstance(schedulerType)
+                ?? throw new InvalidOperationException("无法创建 Task Scheduler COM 服务。");
+            dynamic scheduler = schedulerObject;
+            scheduler.Connect();
+            folderObject = scheduler.GetFolder("\\");
+            dynamic folder = folderObject;
+            taskObject = folder.GetTask(TaskName);
+            dynamic task = taskObject;
+            return task.Enabled ? StartupTaskState.Enabled : StartupTaskState.Disabled;
+        }
+        catch (COMException ex) when (IsTaskNotFoundHResult(ex.HResult))
+        {
+            return StartupTaskState.Missing;
         }
         catch (Exception ex)
         {
             Log("查询开机启动状态失败: " + ex.Message);
             return StartupTaskState.Unavailable;
         }
-    }
-
-    internal static StartupTaskState ParseStartupTaskState(string xml)
-    {
-        var document = XDocument.Parse(xml);
-        var settings = document.Descendants().FirstOrDefault(element => element.Name.LocalName == "Settings");
-        var enabledText = settings?.Elements().FirstOrDefault(element => element.Name.LocalName == "Enabled")?.Value;
-        return string.Equals(enabledText, "false", StringComparison.OrdinalIgnoreCase)
-            ? StartupTaskState.Disabled
-            : StartupTaskState.Enabled;
-    }
-
-    private static ProcessStartInfo CreateStartupTaskQueryStartInfo()
-    {
-        var start = new ProcessStartInfo("schtasks.exe")
+        finally
         {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        start.ArgumentList.Add("/Query");
-        start.ArgumentList.Add("/TN");
-        start.ArgumentList.Add(TaskName);
-        start.ArgumentList.Add("/XML");
-        start.ArgumentList.Add("ONE");
-        return start;
+            ReleaseComObject(taskObject);
+            ReleaseComObject(folderObject);
+            ReleaseComObject(schedulerObject);
+        }
+    }
+
+    internal static bool IsTaskNotFoundHResult(int hResult) =>
+        hResult == unchecked((int)0x80070002);
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is null || !Marshal.IsComObject(value)) return;
+        try { Marshal.FinalReleaseComObject(value); } catch { }
     }
 
     internal static ProcessStartInfo CreateStartupTaskChangeStartInfo(bool enabled)
@@ -3095,13 +3087,8 @@ internal static class Program
             if (!SleepUntilOrManualTestRequest(DateTime.Now.AddMinutes(1), "交接唤醒自测", externalRequest, changedRequest))
                 throw new InvalidOperationException("外部手动测试请求必须让守护进程交出执行权。");
         }
-        const string enabledTaskXml = "<Task><Settings><Enabled>true</Enabled></Settings></Task>";
-        const string disabledTaskXml = "<Task><Settings><Enabled>false</Enabled></Settings></Task>";
-        const string defaultEnabledTaskXml = "<Task><Settings /></Task>";
-        if (ParseStartupTaskState(enabledTaskXml) != StartupTaskState.Enabled ||
-            ParseStartupTaskState(disabledTaskXml) != StartupTaskState.Disabled ||
-            ParseStartupTaskState(defaultEnabledTaskXml) != StartupTaskState.Enabled)
-            throw new InvalidOperationException("托盘菜单必须准确区分开机启动的启用和禁用状态。");
+        if (!IsTaskNotFoundHResult(unchecked((int)0x80070002)) || IsTaskNotFoundHResult(unchecked((int)0x80070005)))
+            throw new InvalidOperationException("只有任务不存在可以显示为未启用，权限错误不得误判为任务不存在。");
         var disableStartup = CreateStartupTaskChangeStartInfo(enabled: false);
         var enableStartup = CreateStartupTaskChangeStartInfo(enabled: true);
         if (disableStartup.ArgumentList[^1] != "/DISABLE" || enableStartup.ArgumentList[^1] != "/ENABLE" ||

@@ -34,6 +34,8 @@ internal sealed class TrayDaemonContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _lifecycleTimer = new() { Interval = 500 };
     private readonly Task<int>? _schedulerTask;
     private int _retryInProgress;
+    private int _startupOperationInProgress;
+    private Program.StartupTaskState _startupState = Program.StartupTaskState.Unavailable;
 
     internal int ExitCode { get; private set; }
 
@@ -49,7 +51,7 @@ internal sealed class TrayDaemonContext : ApplicationContext
         menu.Items.Add(_startupItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出守护", null, (_, _) => ExitDaemon());
-        menu.Opening += (_, _) => RefreshStartupMenuState();
+        menu.Opening += (_, _) => BeginStartupStateRefresh();
 
         _notifyIcon = new NotifyIcon
         {
@@ -65,6 +67,8 @@ internal sealed class TrayDaemonContext : ApplicationContext
 
         _dashboard = new DashboardForm(StartRetry, () => Volatile.Read(ref _retryInProgress) != 0,
             () => _configChanged.Set());
+        _ = _dashboard.Handle;
+        BeginStartupStateRefresh();
 
         if (smokeTest)
         {
@@ -173,9 +177,30 @@ internal sealed class TrayDaemonContext : ApplicationContext
         ExitThread();
     }
 
-    private void RefreshStartupMenuState()
+    private void BeginStartupStateRefresh()
     {
-        var state = Program.GetStartupTaskState();
+        if (Interlocked.CompareExchange(ref _startupOperationInProgress, 1, 0) != 0) return;
+        _startupItem.Enabled = false;
+        _startupItem.Text = "开机启动（检查中…）";
+        _ = Task.Run(Program.GetStartupTaskState).ContinueWith(task =>
+        {
+            try
+            {
+                _dashboard.BeginInvoke(() =>
+                {
+                    Interlocked.Exchange(ref _startupOperationInProgress, 0);
+                    ApplyStartupMenuState(task.Status == TaskStatus.RanToCompletion
+                        ? task.Result
+                        : Program.StartupTaskState.Unavailable);
+                });
+            }
+            catch { Interlocked.Exchange(ref _startupOperationInProgress, 0); }
+        }, TaskScheduler.Default);
+    }
+
+    private void ApplyStartupMenuState(Program.StartupTaskState state)
+    {
+        _startupState = state;
         _startupItem.Checked = state == Program.StartupTaskState.Enabled;
         _startupItem.Enabled = state != Program.StartupTaskState.Unavailable;
         _startupItem.Text = state == Program.StartupTaskState.Unavailable ? "开机启动（状态不可用）" : "开机启动";
@@ -183,20 +208,31 @@ internal sealed class TrayDaemonContext : ApplicationContext
 
     private void ToggleStartup()
     {
-        try
+        if (Interlocked.CompareExchange(ref _startupOperationInProgress, 1, 0) != 0) return;
+        var enable = _startupState != Program.StartupTaskState.Enabled;
+        _startupItem.Enabled = false;
+        _startupItem.Text = enable ? "开机启动（正在启用…）" : "开机启动（正在禁用…）";
+        _ = Task.Run(() => Program.SetStartupEnabled(enable)).ContinueWith(task =>
         {
-            _startupItem.Enabled = false;
-            var enable = Program.GetStartupTaskState() != Program.StartupTaskState.Enabled;
-            Program.SetStartupEnabled(enable);
-            RefreshStartupMenuState();
-            _notifyIcon.ShowBalloonTip(5000, "WorkBuddy 自动领取守护",
-                enable ? "已开启开机启动。" : "已关闭开机启动，当前守护仍会继续运行。", ToolTipIcon.Info);
-        }
-        catch (Exception ex)
-        {
-            _startupItem.Enabled = true;
-            _notifyIcon.ShowBalloonTip(7000, "开机启动设置失败", ex.Message, ToolTipIcon.Error);
-        }
+            try
+            {
+                _dashboard.BeginInvoke(() =>
+                {
+                    Interlocked.Exchange(ref _startupOperationInProgress, 0);
+                    if (task.IsFaulted)
+                    {
+                        ApplyStartupMenuState(Program.StartupTaskState.Unavailable);
+                        _notifyIcon.ShowBalloonTip(7000, "开机启动设置失败",
+                            task.Exception?.GetBaseException().Message ?? "未知错误", ToolTipIcon.Error);
+                        return;
+                    }
+                    ApplyStartupMenuState(enable ? Program.StartupTaskState.Enabled : Program.StartupTaskState.Disabled);
+                    _notifyIcon.ShowBalloonTip(5000, "WorkBuddy 自动领取守护",
+                        enable ? "已开启开机启动。" : "已关闭开机启动，当前守护仍会继续运行。", ToolTipIcon.Info);
+                });
+            }
+            catch { Interlocked.Exchange(ref _startupOperationInProgress, 0); }
+        }, TaskScheduler.Default);
     }
 
     protected override void ExitThreadCore()
