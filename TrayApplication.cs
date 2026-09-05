@@ -409,7 +409,7 @@ internal sealed class DashboardForm : Form
         var browse = new Button { Text = "浏览…", Dock = DockStyle.Fill };
         browse.Click += (_, _) => BrowseForWorkBuddy();
         ConfigureTimePicker();
-        ConfigureNumeric(_automaticAttempts, 1, 10, 5);
+        ConfigureNumeric(_automaticAttempts, 1, 5, 5);
         ConfigureNumeric(_manualAttempts, 1, 10, 1);
         ConfigureNumeric(_retryInterval, 10, 3600, 60);
         ConfigureNumeric(_launchWait, 5, 120, 20);
