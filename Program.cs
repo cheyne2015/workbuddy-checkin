@@ -526,7 +526,8 @@ internal static class Program
 
         var originalWindow = FindWorkBuddyWindow();
         bool wasRunning = originalWindow != IntPtr.Zero;
-        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool preserveVisibleWindow = ShouldPreserveVisibleWorkBuddy(
+            wasRunning, wasRunning && Native.IsIconic(originalWindow));
         bool launchedByTool = false;
         IntPtr window = IntPtr.Zero;
         bool succeeded = false;
@@ -555,7 +556,7 @@ internal static class Program
                 Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
                 Log("WorkBuddy 由工具启动，已无焦点恢复以读取领取卡片。");
             }
-            else if (wasForeground)
+            else if (preserveVisibleWindow)
             {
                 Log("WorkBuddy 原本在前台，保留前台状态领取。");
             }
@@ -626,7 +627,7 @@ internal static class Program
                     CloseWorkBuddy();
                     Log("WorkBuddy 由工具启动，领取流程结束后已关闭。");
                 }
-                else if (!wasForeground)
+                else if (!preserveVisibleWindow)
                 {
                     Native.ShowWindow(window, Native.SW_MINIMIZE);
                     Log("WorkBuddy 原本在后台，领取流程结束后已最小化。");
@@ -652,7 +653,7 @@ internal static class Program
             Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
                 BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
                     FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, maxAttempts,
-                    DescribeWorkBuddyLifecycle(launchedByTool, wasForeground), result), ToolTipIcon.Info);
+                    DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result), ToolTipIcon.Info);
             return 0;
         }
 
@@ -670,7 +671,7 @@ internal static class Program
         });
         var failureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed,
             FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance),
-            attemptsPerformed, maxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, wasForeground), result);
+            attemptsPerformed, maxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result);
         if (isManualTest)
             NotifyManualTestFailure(result, failureNotification);
         else
@@ -783,12 +784,14 @@ internal static class Program
                 throw new InvalidOperationException("未同时识别到个人中心组合锚点和明确数字余额。");
             if (!TryFindBalanceRefreshPoint(ocr, config, out var refreshPoint))
                 throw new InvalidOperationException("未识别到积分余额行中的刷新图标。");
+            var buddyFuel = FindBuddyFuelStationAction(ocr, config)
+                            ?? throw new InvalidOperationException("未识别到个人中心中的 Buddy加油站入口。");
             var balance = FormatNotificationBalance(evidence.Balance);
             if (!string.IsNullOrWhiteSpace(expectedBalance) &&
                 !StringComparer.Ordinal.Equals(balance, expectedBalance))
                 throw new InvalidOperationException($"积分余额 OCR 校验失败：期望 {expectedBalance}，实际 {balance}。");
-            Console.WriteLine($"个人中心=true; 余额={balance}; 刷新X={refreshPoint.X}; 刷新Y={refreshPoint.Y}");
-            Log($"个人中心 OCR 验证通过：余额={balance}，刷新点=({refreshPoint.X},{refreshPoint.Y})。");
+            Console.WriteLine($"个人中心=true; 余额={balance}; 刷新X={refreshPoint.X}; 刷新Y={refreshPoint.Y}; BuddyX={buddyFuel.CenterX}; BuddyY={buddyFuel.CenterY}");
+            Log($"个人中心 OCR 验证通过：余额={balance}，刷新点=({refreshPoint.X},{refreshPoint.Y})，Buddy加油站=({buddyFuel.CenterX},{buddyFuel.CenterY})。");
             return 0;
         }
         catch (Exception ex)
@@ -800,6 +803,9 @@ internal static class Program
 
     private static bool ShouldTreatWorkBuddyAsToolLaunched(bool hadVisibleWindow, bool hadExistingProcess) =>
         !hadVisibleWindow && !hadExistingProcess;
+
+    private static bool ShouldPreserveVisibleWorkBuddy(bool wasRunning, bool wasMinimized) =>
+        wasRunning && !wasMinimized;
 
     private static bool HasExistingWorkBuddyProcess()
     {
@@ -1994,6 +2000,18 @@ internal static class Program
             return true;
         }
 
+        // In current WorkBuddy builds OCR may split the refresh glyph into symbols
+        // such as “《0” or “（冫”. The whole compact row is still a reliable dynamic
+        // anchor: it is on the balance-label baseline and contains both glyph and value.
+        var detectedRow = FindBalanceValueRow(snapshot, label, config);
+        if (detectedRow is not null &&
+            detectedRow.Bounds.Left - label.Bounds.Right >= 100 &&
+            detectedRow.Bounds.Right - detectedRow.Bounds.Left >= 65)
+        {
+            point = new Point(detectedRow.Bounds.Left + 8, detectedRow.Bounds.CenterY);
+            return true;
+        }
+
         point = default;
         return false;
     }
@@ -2074,6 +2092,7 @@ internal static class Program
     }
 
     private sealed record BalanceLabel(OcrLine Line, OcrBounds Bounds);
+    private sealed record BalanceValueRow(OcrLine Line, OcrBounds Bounds);
 
     private static BalanceReading? TryReadBalance(Bitmap bitmap, OcrSnapshot snapshot, Config config)
     {
@@ -2083,6 +2102,21 @@ internal static class Program
 
         var readings = new List<BalanceReading>();
         if (direct is not null) readings.Add(direct);
+
+        // WorkBuddy 5.5.3 renders the refresh glyph and the small gray balance close
+        // together. Full-window OCR can lose both separators (2,132.34 -> 13234).
+        // Re-crop immediately after the detected refresh glyph and require two
+        // independent image treatments to agree before accepting the value.
+        var detectedRowReadings = new[]
+        {
+            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.Raw),
+            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.LightContrast),
+            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.DarkContrast)
+        }.Where(reading => reading is not null).Select(reading => reading!).ToArray();
+        var detectedRowConfirmed = SelectConfirmedNumericBalance(detectedRowReadings);
+        if (detectedRowConfirmed is not null)
+            return detectedRowConfirmed with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
+
         var broadValue = TryReadBalanceFromCrop(bitmap, label, config, leftOffset: -4,
             width: config.BalanceValueCropWidthPixels, scale: config.BalanceValueCropScale,
             above: config.BalanceValueCropAbovePixels, below: config.BalanceValueCropBelowPixels,
@@ -2255,6 +2289,42 @@ internal static class Program
             return text.Any(character => character is >= '\u3400' and <= '\u9fff');
         }
         return false;
+    }
+
+    private static BalanceValueRow? FindBalanceValueRow(
+        OcrSnapshot snapshot, BalanceLabel label, Config config)
+    {
+        return snapshot.Lines
+            .Where(line => !ReferenceEquals(line, label.Line) && line.Words.Count > 0 &&
+                           line.Text.Any(char.IsDigit))
+            .Select(line => new BalanceValueRow(line, GetOcrBounds(line)))
+            .Where(row => row.Bounds.Left >= label.Bounds.Right + 80 &&
+                          row.Bounds.Left <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
+                          row.Bounds.Right <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
+                          Math.Abs(row.Bounds.CenterY - label.Bounds.CenterY) <= config.BalanceValueSameRowTolerance)
+            .OrderBy(row => Math.Abs(row.Bounds.CenterY - label.Bounds.CenterY))
+            .ThenBy(row => row.Bounds.Left)
+            .FirstOrDefault();
+    }
+
+    private static BalanceReading? TryReadBalanceFromDetectedRowCrop(
+        Bitmap bitmap, OcrSnapshot snapshot, BalanceLabel label, Config config, BalanceCropTreatment treatment)
+    {
+        var row = FindBalanceValueRow(snapshot, label, config);
+        if (row is null || row.Bounds.Right - row.Bounds.Left < 35) return null;
+
+        int sourceLeft = Math.Min(row.Bounds.Right - 1, row.Bounds.Left + 14);
+        int sourceTop = Math.Max(0, Math.Min(label.Bounds.Top, row.Bounds.Top) - 8);
+        int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + 2);
+        int sourceBottom = Math.Min(bitmap.Height, Math.Max(label.Bounds.Bottom, row.Bounds.Bottom) + 8);
+        using var crop = CreateScaledCrop(bitmap,
+            new Rectangle(sourceLeft, sourceTop, Math.Max(1, sourceRight - sourceLeft),
+                Math.Max(1, sourceBottom - sourceTop)), 8);
+        if (treatment == BalanceCropTreatment.LightContrast) IncreaseOcrContrast(crop);
+        else if (treatment == BalanceCropTreatment.DarkContrast) NormalizeDarkThemeOcr(crop);
+        var ocr = ReadOcr(crop, "en-US");
+        var parsed = TryParseBalanceWords(ocr.Lines.SelectMany(line => line.Words));
+        return parsed is null ? null : CreateNumericBalanceReading(parsed, label.Bounds);
     }
 
     private enum BalanceCropTreatment { Raw, LightContrast, DarkContrast }
@@ -2528,13 +2598,21 @@ internal static class Program
     {
         const string expected = "Buddy加油站";
         return snapshot.Lines
-            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeExactActionText(line.Text)))
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeBuddyFuelText(line.Text)))
             .Where(item => item.Line.Words.Count > 0 &&
                            StringComparer.Ordinal.Equals(item.Normalized, expected))
             .Select(item => new ClaimAction(expected, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY,
                 GetCandidateId(item.Bounds, config.ClaimCandidatePositionTolerancePixels),
                 ClaimActionKind.BuddyFuelStation))
             .FirstOrDefault();
+    }
+
+    private static string NormalizeBuddyFuelText(string text)
+    {
+        var normalized = NormalizeExactActionText(text);
+        return normalized.StartsWith("8uddy加油站", StringComparison.Ordinal)
+            ? "B" + normalized[1..]
+            : normalized;
     }
 
     private static IReadOnlyList<ClaimAction> FindCheckInActions(OcrSnapshot snapshot, Config config)
@@ -3240,7 +3318,8 @@ internal static class Program
     {
         var originalWindow = FindWorkBuddyWindow();
         bool wasRunning = originalWindow != IntPtr.Zero;
-        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool wasForeground = originalWindow != IntPtr.Zero &&
+                             ShouldPreserveVisibleWorkBuddy(wasRunning: true, Native.IsIconic(originalWindow));
         bool launchedByTool = false;
         IntPtr window = IntPtr.Zero;
         try
@@ -3296,8 +3375,8 @@ internal static class Program
     private static int TestPersonalCenter(Config config)
     {
         var originalWindow = FindWorkBuddyWindow();
-        bool wasRunning = originalWindow != IntPtr.Zero || HasExistingWorkBuddyProcess();
-        bool wasForeground = wasRunning && Native.GetForegroundWindow() == originalWindow;
+        bool wasForeground = originalWindow != IntPtr.Zero &&
+                             ShouldPreserveVisibleWorkBuddy(wasRunning: true, Native.IsIconic(originalWindow));
         bool launchedByTool = false;
         IntPtr window = IntPtr.Zero;
         try
@@ -3332,7 +3411,7 @@ internal static class Program
         bool launchedByTool = false;
         var window = EnsureWorkBuddyWindow(config, out launchedByTool);
         if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
-        bool wasForeground = Native.GetForegroundWindow() == window;
+        bool wasForeground = ShouldPreserveVisibleWorkBuddy(wasRunning: true, Native.IsIconic(window));
         try
         {
             Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
@@ -3358,7 +3437,7 @@ internal static class Program
         bool launchedByTool = false;
         var window = EnsureWorkBuddyWindow(config, out launchedByTool);
         if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
-        bool wasForeground = Native.GetForegroundWindow() == window;
+        bool wasForeground = ShouldPreserveVisibleWorkBuddy(wasRunning: true, Native.IsIconic(window));
         try
         {
             Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
@@ -3541,6 +3620,10 @@ internal static class Program
         if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
             ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: true, hadExistingProcess: true))
             throw new InvalidOperationException("WorkBuddy 启动归属判定回归失败。");
+        if (!ShouldPreserveVisibleWorkBuddy(wasRunning: true, wasMinimized: false) ||
+            ShouldPreserveVisibleWorkBuddy(wasRunning: true, wasMinimized: true) ||
+            ShouldPreserveVisibleWorkBuddy(wasRunning: false, wasMinimized: false))
+            throw new InvalidOperationException("可见未最小化的 WorkBuddy 必须保持原状态，只有原本最小化时才恢复后台。");
         var customAttemptConfig = new Config { ManualMaxAttempts = 2, MaxAttempts = 4 };
         if (GetAttemptLimit(customAttemptConfig, ClaimRunMode.ManualTest) != 2 ||
             GetAttemptLimit(customAttemptConfig, ClaimRunMode.Automatic) != 4)
@@ -3716,6 +3799,15 @@ internal static class Program
         if (buddyFuelAction is null || buddyFuelAction.Keyword != "Buddy加油站" ||
             buddyFuelAction.Kind != ClaimActionKind.BuddyFuelStation)
             throw new InvalidOperationException("已确认个人中心后必须能精确定位 Buddy加油站入口。");
+        var observedBuddyFuelOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "@8uddy加油站", Words = [new OcrWord { Text = "@8uddy加油站", X = 52, Y = 185, Width = 98, Height = 18 }] }
+            ]
+        };
+        if (FindBuddyFuelStationAction(observedBuddyFuelOcr, selfTestConfig) is null)
+            throw new InvalidOperationException("必须兼容真实诊断中 Buddy 首字母被读成 8 的稳定 OCR 结果。");
         var ambiguousBuddyOcr = new OcrSnapshot
         {
             Lines =
@@ -4318,8 +4410,8 @@ internal static class Program
         return "未确认";
     }
 
-    private static string DescribeWorkBuddyLifecycle(bool launchedByTool, bool wasForeground) =>
-        launchedByTool ? "工具启动后关闭" : wasForeground ? "保留原前台" : "保留原后台并最小化";
+    private static string DescribeWorkBuddyLifecycle(bool launchedByTool, bool preserveVisibleWindow) =>
+        launchedByTool ? "工具启动后关闭" : preserveVisibleWindow ? "保留原前台" : "保留原后台并最小化";
 
     private static string? FormatNotificationBalance(BalanceReading? balance)
     {
@@ -4397,6 +4489,7 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
