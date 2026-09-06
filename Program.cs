@@ -921,13 +921,32 @@ internal static class Program
         if (thirdRoute == ClaimRouteExecution.Succeeded) return true;
         if (thirdRoute == ClaimRouteExecution.Failed) return false;
 
-        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var buddyMenuEvidence) ||
-            buddyMenuEvidence.Balance is null)
+        // A check-in click can navigate away or close the menu. Re-establish the
+        // personal center only when needed; every successful balance read is followed
+        // by another full-window scan before the Buddy fallback may be clicked.
+        bool personalCenterReadyForBuddy = thirdCandidates.Count == 0;
+        for (int recoveryScan = 1; !personalCenterReadyForBuddy && recoveryScan <= 3; recoveryScan++)
         {
-            result = "进入 Buddy加油站前未能重新确认个人中心和明确数字余额。";
+            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var buddyMenuEvidence) ||
+                buddyMenuEvidence.Balance is null)
+            {
+                result = "进入 Buddy加油站前未能重新确认个人中心和明确数字余额。";
+                return false;
+            }
+            Log($"进入 Buddy加油站前第 {recoveryScan}/3 次重新确认积分余额 {buddyMenuEvidence.Balance.RawText}；立即执行整窗扫描。");
+            int candidatesBeforeScan = thirdCandidates.Count;
+            var recoveryRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, thirdCandidates,
+                out result, out outcomeKind, out afterNotificationBalance);
+            if (recoveryRoute == ClaimRouteExecution.Succeeded) return true;
+            if (recoveryRoute == ClaimRouteExecution.Failed) return false;
+            personalCenterReadyForBuddy = thirdCandidates.Count == candidatesBeforeScan;
+        }
+        if (!personalCenterReadyForBuddy)
+        {
+            result = "进入 Buddy加油站前连续出现新的签到入口，未能在个人中心稳定完成扫描。";
             return false;
         }
-        Log($"进入 Buddy加油站前重新确认积分余额 {buddyMenuEvidence.Balance.RawText}。");
+
         if (!TryClickBuddyFuelStation(window, config, out var buddyFailure))
         {
             result = buddyFailure;
@@ -1059,17 +1078,10 @@ internal static class Program
         }
 
         var ocr = ReadClaimOcr(image);
-        var evidence = ReadMenuEvidence(image, ocr, config);
-        if (!evidence.IsPersonalCenter)
-        {
-            failure = "点击 Buddy加油站前个人中心组合锚点已消失，拒绝猜测点击。";
-            return false;
-        }
-
         var buddy = FindBuddyFuelStationAction(ocr, config);
-        if (buddy is null)
+        if (FindBalanceLabel(ocr) is null || buddy is null)
         {
-            failure = "个人中心已确认打开，但未精确识别到 Buddy加油站入口。";
+            failure = "点击 Buddy加油站前积分余额标签或精确 Buddy加油站入口已消失，拒绝猜测点击。";
             return false;
         }
 
@@ -2216,6 +2228,9 @@ internal static class Program
                 var candidate = normalized.ToString();
                 if (StringComparer.Ordinal.Equals(candidate, expected))
                 {
+                    if (HasAdjacentCjkOcrWord(line.Words, start - 1, step: -1) ||
+                        HasAdjacentCjkOcrWord(line.Words, index + 1, step: 1))
+                        break;
                     bounds = new OcrBounds(
                         matchedWords.Min(word => word.X),
                         matchedWords.Min(word => word.Y),
@@ -2228,6 +2243,17 @@ internal static class Program
         }
 
         bounds = default;
+        return false;
+    }
+
+    private static bool HasAdjacentCjkOcrWord(IReadOnlyList<OcrWord> words, int index, int step)
+    {
+        for (; index >= 0 && index < words.Count; index += step)
+        {
+            var text = NormalizeExactActionText(words[index].Text);
+            if (text.Length == 0) continue;
+            return text.Any(character => character is >= '\u3400' and <= '\u9fff');
+        }
         return false;
     }
 
@@ -3673,6 +3699,19 @@ internal static class Program
         };
         if (FindBalanceLabel(misleadingBalanceLabelOcr) is not null)
             throw new InvalidOperationException("积分余额标签必须是精确词组，不得接受积分余额说明等包含文字。");
+        var splitMisleadingBalanceLabelOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额 说明", Words =
+                [
+                    new OcrWord { Text = "积分余额", X = 30, Y = 350, Width = 80, Height = 18 },
+                    new OcrWord { Text = "说明", X = 112, Y = 350, Width = 36, Height = 18 }
+                ] }
+            ]
+        };
+        if (FindBalanceLabel(splitMisleadingBalanceLabelOcr) is not null)
+            throw new InvalidOperationException("拆词后的积分余额说明也不得被当成精确余额标签。");
         var buddyFuelAction = FindBuddyFuelStationAction(ocr, selfTestConfig);
         if (buddyFuelAction is null || buddyFuelAction.Keyword != "Buddy加油站" ||
             buddyFuelAction.Kind != ClaimActionKind.BuddyFuelStation)
