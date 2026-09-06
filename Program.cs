@@ -2005,10 +2005,9 @@ internal static class Program
         // anchor: it is on the balance-label baseline and contains both glyph and value.
         var detectedRow = FindBalanceValueRow(snapshot, label, config);
         if (detectedRow is not null &&
-            detectedRow.Bounds.Left - label.Bounds.Right >= 100 &&
-            detectedRow.Bounds.Right - detectedRow.Bounds.Left >= 65)
+            TryFindObservedBalanceRefreshFragment(detectedRow, out var refreshBounds, out _))
         {
-            point = new Point(detectedRow.Bounds.Left + 8, detectedRow.Bounds.CenterY);
+            point = new Point(refreshBounds.CenterX, refreshBounds.CenterY);
             return true;
         }
 
@@ -2311,9 +2310,10 @@ internal static class Program
         Bitmap bitmap, OcrSnapshot snapshot, BalanceLabel label, Config config, BalanceCropTreatment treatment)
     {
         var row = FindBalanceValueRow(snapshot, label, config);
-        if (row is null || row.Bounds.Right - row.Bounds.Left < 35) return null;
+        if (row is null ||
+            !TryFindObservedBalanceRefreshFragment(row, out _, out int valueStartX)) return null;
 
-        int sourceLeft = Math.Min(row.Bounds.Right - 1, row.Bounds.Left + 14);
+        int sourceLeft = Math.Min(row.Bounds.Right - 1, valueStartX);
         int sourceTop = Math.Max(0, Math.Min(label.Bounds.Top, row.Bounds.Top) - 8);
         int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + 2);
         int sourceBottom = Math.Min(bitmap.Height, Math.Max(label.Bounds.Bottom, row.Bounds.Bottom) + 8);
@@ -2325,6 +2325,37 @@ internal static class Program
         var ocr = ReadOcr(crop, "en-US");
         var parsed = TryParseBalanceWords(ocr.Lines.SelectMany(line => line.Words));
         return parsed is null ? null : CreateNumericBalanceReading(parsed, label.Bounds);
+    }
+
+    private static bool TryFindObservedBalanceRefreshFragment(
+        BalanceValueRow row, out OcrBounds bounds, out int valueStartX)
+    {
+        var words = row.Line.Words.OrderBy(word => word.X).ToArray();
+        if (words.Length < 3)
+        {
+            bounds = default;
+            valueStartX = 0;
+            return false;
+        }
+
+        var prefix = Regex.Replace(words[0].Text + words[1].Text, @"\s", string.Empty);
+        if (prefix is not ("《0" or "（冫"))
+        {
+            bounds = default;
+            valueStartX = 0;
+            return false;
+        }
+
+        bounds = new OcrBounds(
+            Math.Min(words[0].X, words[1].X),
+            Math.Min(words[0].Y, words[1].Y),
+            Math.Max(words[0].X + words[0].Width, words[1].X + words[1].Width),
+            Math.Max(words[0].Y + words[0].Height, words[1].Y + words[1].Height));
+        // Start exactly at the detected refresh fragment's right edge. This keeps
+        // the full first balance glyph even when full-window OCR places that glyph
+        // several pixels to the right, without using a DPI-dependent offset.
+        valueStartX = bounds.Right;
+        return words[2].X > bounds.Right;
     }
 
     private enum BalanceCropTreatment { Raw, LightContrast, DarkContrast }
@@ -3842,6 +3873,16 @@ internal static class Program
         };
         if (TryFindBalanceRefreshPoint(noRefreshOcr, selfTestConfig, out _))
             throw new InvalidOperationException("没有明确刷新图标时不得猜测点击坐标。");
+        var wideBalanceWithoutRefreshOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额", Words = [new OcrWord { Text = "积分余额", X = 30, Y = 350, Width = 80, Height = 18 }] },
+                new OcrLine { Text = "123456789012", Words = [new OcrWord { Text = "123456789012", X = 230, Y = 350, Width = 90, Height = 18 }] }
+            ]
+        };
+        if (TryFindBalanceRefreshPoint(wideBalanceWithoutRefreshOcr, selfTestConfig, out _))
+            throw new InvalidOperationException("只有较宽余额数字、没有刷新图标残片时不得按同行固定偏移猜点。");
         var actions = FindCheckInActions(ocr, selfTestConfig);
         if (actions.Count != 1 || actions[0].Keyword != "签到领积分" || actions[0].Kind != ClaimActionKind.CheckIn)
             throw new InvalidOperationException("动态领取文字 OCR 路由校验失败。");
