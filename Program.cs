@@ -906,7 +906,33 @@ internal static class Program
         if (secondRoute == ClaimRouteExecution.Succeeded) return true;
         if (secondRoute == ClaimRouteExecution.Failed) return false;
 
-        result = BuildClaimActionNotFoundResult(clickedCheckIn: false);
+        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var reopenedEvidence) ||
+            reopenedEvidence.Balance is null)
+        {
+            result = "第二次扫描无领取动作，重新打开个人中心后未能刷新并确认积分余额。";
+            return false;
+        }
+
+        Log($"重新打开个人中心并读取积分余额 {reopenedEvidence.Balance.RawText}；立即执行第三次整窗扫描。");
+        var thirdRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
+            out result, out outcomeKind, out afterNotificationBalance);
+        if (thirdRoute == ClaimRouteExecution.Succeeded) return true;
+        if (thirdRoute == ClaimRouteExecution.Failed) return false;
+
+        if (!TryClickBuddyFuelStation(window, config, out var buddyFailure))
+        {
+            result = buddyFailure;
+            SaveFailureDiagnostic(window, config, "buddy-fuel-station-not-found", result);
+            return false;
+        }
+
+        Log("Buddy加油站已点击；等待页面加载并再次按优先级扫描整个窗口。");
+        var buddyRoute = ExecuteClaimRouteUntilAction(window, config, beforeBalance, triedCandidateIds,
+            TimeSpan.FromSeconds(10), out result, out outcomeKind, out afterNotificationBalance);
+        if (buddyRoute == ClaimRouteExecution.Succeeded) return true;
+        if (buddyRoute == ClaimRouteExecution.Failed) return false;
+
+        result = BuildClaimActionNotFoundResult(clickedCheckIn: triedCandidateIds.Count > 0);
         SaveFailureDiagnostic(window, config, "claim-action-not-found", result);
         return false;
     }
@@ -984,11 +1010,62 @@ internal static class Program
                     return ClaimRouteExecution.Failed;
                 }
                 result = BuildClaimActionNotFoundResult(clickedCheckIn: true);
-                SaveFailureDiagnostic(window, config, "after-checkin-no-immediate", result);
-                return ClaimRouteExecution.Failed;
+                return ClaimRouteExecution.NoAction;
             default:
                 return ClaimRouteExecution.NoAction;
         }
+    }
+
+    private static ClaimRouteExecution ExecuteClaimRouteUntilAction(
+        IntPtr window, Config config, BalanceReading beforeBalance, HashSet<string> triedCandidateIds,
+        TimeSpan timeout, out string result, out ClaimOutcomeKind outcomeKind,
+        out BalanceReading? afterNotificationBalance)
+    {
+        var until = DateTime.UtcNow.Add(timeout);
+        do
+        {
+            var route = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
+                out result, out outcomeKind, out afterNotificationBalance);
+            if (route != ClaimRouteExecution.NoAction) return route;
+            Thread.Sleep(650);
+        }
+        while (DateTime.UtcNow < until);
+
+        result = "进入 Buddy加油站后仍未识别到立即领取、稳定已领取状态或签到入口。";
+        outcomeKind = ClaimOutcomeKind.Failed;
+        afterNotificationBalance = null;
+        return ClaimRouteExecution.NoAction;
+    }
+
+    private static bool TryClickBuddyFuelStation(IntPtr window, Config config, out string failure)
+    {
+        using var image = CaptureWindow(window);
+        if (image is null)
+        {
+            failure = "重新打开个人中心后无法捕获界面，未点击 Buddy加油站。";
+            return false;
+        }
+
+        var ocr = ReadClaimOcr(image);
+        var evidence = ReadMenuEvidence(image, ocr, config);
+        if (!evidence.IsPersonalCenter)
+        {
+            failure = "点击 Buddy加油站前个人中心组合锚点已消失，拒绝猜测点击。";
+            return false;
+        }
+
+        var buddy = FindBuddyFuelStationAction(ocr, config);
+        if (buddy is null)
+        {
+            failure = "个人中心已确认打开，但未精确识别到 Buddy加油站入口。";
+            return false;
+        }
+
+        Log($"OCR 精确识别 Buddy加油站入口：文本={buddy.Text}，位置=({buddy.CenterX},{buddy.CenterY})。");
+        ClickWindowPoint(window, buddy.CenterX, buddy.CenterY);
+        Thread.Sleep(1_000);
+        failure = string.Empty;
+        return true;
     }
 
     private static bool TryConfirmStableClaimSuccessText(IntPtr window)
@@ -1602,7 +1679,7 @@ internal static class Program
         decimal.TryParse(balance.Fingerprint, NumberStyles.AllowDecimalPoint,
             CultureInfo.InvariantCulture, out _);
 
-    private enum ClaimActionKind { CheckIn, Immediate }
+    private enum ClaimActionKind { CheckIn, Immediate, BuddyFuelStation }
     private enum ClaimVerification { NotConfirmed, BalanceChanged, ClaimedText }
     private enum ClaimOutcomeKind { Claimed, AlreadyClaimed, Failed }
     private enum CheckInFollowup { NotFound, Immediate, AlreadyClaimed }
@@ -2349,19 +2426,30 @@ internal static class Program
             .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeExactActionText(line.Text)))
             .Where(item => item.Line.Words.Count > 0)
             .Select(item => (item.Line, item.Bounds, item.Normalized,
-                Keyword: FindApproximateImmediateKeyword(item.Normalized)))
+                Keyword: FindExactImmediateKeyword(item.Normalized)))
             .Where(item => !string.IsNullOrWhiteSpace(item.Keyword))
             .Select(item => new ClaimAction(item.Keyword!, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY,
                 GetCandidateId(item.Bounds, config.ClaimCandidatePositionTolerancePixels), ClaimActionKind.Immediate))
             .FirstOrDefault();
     }
 
-    private static string? FindApproximateImmediateKeyword(string text)
+    private static string? FindExactImmediateKeyword(string text)
     {
         const string expected = "立即领取";
-        if (text.Length != expected.Length) return null;
-        int correctPositions = text.Zip(expected, (actual, target) => actual == target).Count(matches => matches);
-        return correctPositions >= 2 ? expected : null;
+        return StringComparer.Ordinal.Equals(text, expected) ? expected : null;
+    }
+
+    private static ClaimAction? FindBuddyFuelStationAction(OcrSnapshot snapshot, Config config)
+    {
+        const string expected = "Buddy加油站";
+        return snapshot.Lines
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeExactActionText(line.Text)))
+            .Where(item => item.Line.Words.Count > 0 &&
+                           StringComparer.Ordinal.Equals(item.Normalized, expected))
+            .Select(item => new ClaimAction(expected, item.Line.Text, item.Bounds.CenterX, item.Bounds.CenterY,
+                GetCandidateId(item.Bounds, config.ClaimCandidatePositionTolerancePixels),
+                ClaimActionKind.BuddyFuelStation))
+            .FirstOrDefault();
     }
 
     private static IReadOnlyList<ClaimAction> FindCheckInActions(OcrSnapshot snapshot, Config config)
@@ -3452,14 +3540,20 @@ internal static class Program
         if (NormalizeExactActionText("立 即，领 取！") != "立即领取" ||
             NormalizeExactActionText("立 卽 领 取") == "立即领取")
             throw new InvalidOperationException("动作文字规范化只能移除空格和标点。");
+        var exactImmediateOcr = new OcrSnapshot
+        {
+            Lines = [new OcrLine { Text = "立 即，领 取！", Words = [new OcrWord { Text = "立 即，领 取！", X = 60, Y = 290, Width = 74, Height = 22 }] }]
+        };
+        if (FindImmediateClaimAction(exactImmediateOcr, selfTestConfig) is null)
+            throw new InvalidOperationException("完整四字“立即领取”必须在清理空格和标点后精确命中。");
         foreach (var approximateImmediateText in new[] { "立即領取", "立卽领取", "立即领职", "立即领娶", "立刻领取", "立刻领娶" })
         {
             var approximateOcr = new OcrSnapshot
             {
                 Lines = [new OcrLine { Text = approximateImmediateText, Words = [new OcrWord { Text = approximateImmediateText, X = 60, Y = 290, Width = 74, Height = 22 }] }]
             };
-            if (FindImmediateClaimAction(approximateOcr, selfTestConfig) is null)
-                throw new InvalidOperationException($"立即领取近似 OCR 必须接受至少两个字匹配：{approximateImmediateText}。");
+            if (FindImmediateClaimAction(approximateOcr, selfTestConfig) is not null)
+                throw new InvalidOperationException($"非完整精确四字不得被当成立即领取：{approximateImmediateText}。");
         }
         foreach (var unrelatedText in new[]
                  {
@@ -3493,6 +3587,7 @@ internal static class Program
                 new OcrLine { Text = "签到领积分", Words = [new OcrWord { Text = "签到领积分", X = 52, Y = 292, Width = 98, Height = 22 }] },
                 new OcrLine { Text = "体验版", Words = [new OcrWord { Text = "体验版", X = 52, Y = 145, Width = 42, Height = 18 }] },
                 new OcrLine { Text = "领取说明", Words = [new OcrWord { Text = "领取说明", X = 52, Y = 100, Width = 90, Height = 18 }] },
+                new OcrLine { Text = "Buddy加油站", Words = [new OcrWord { Text = "Buddy加油站", X = 52, Y = 185, Width = 98, Height = 18 }] },
                 new OcrLine { Text = "设置", Words = [new OcrWord { Text = "设置", X = 52, Y = 420, Width = 42, Height = 18 }] }
             ]
         };
@@ -3510,6 +3605,19 @@ internal static class Program
         };
         if (IsConfirmedPersonalCenterMenu(incompletePersonalCenterOcr, balance, selfTestConfig))
             throw new InvalidOperationException("只有积分余额和数字时不得确认个人中心菜单。");
+        var buddyFuelAction = FindBuddyFuelStationAction(ocr, selfTestConfig);
+        if (buddyFuelAction is null || buddyFuelAction.Keyword != "Buddy加油站" ||
+            buddyFuelAction.Kind != ClaimActionKind.BuddyFuelStation)
+            throw new InvalidOperationException("已确认个人中心后必须能精确定位 Buddy加油站入口。");
+        var ambiguousBuddyOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "Buddy加油站活动", Words = [new OcrWord { Text = "Buddy加油站活动", X = 52, Y = 185, Width = 118, Height = 18 }] }
+            ]
+        };
+        if (FindBuddyFuelStationAction(ambiguousBuddyOcr, selfTestConfig) is not null)
+            throw new InvalidOperationException("Buddy加油站入口必须是完整精确文字，不得点击附加文案。");
         var refreshOcr = new OcrSnapshot
         {
             Lines =
