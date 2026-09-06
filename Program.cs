@@ -888,20 +888,21 @@ internal static class Program
         }
         var beforeBalance = evidence.Balance ?? throw new InvalidOperationException("领取前丢失了积分余额 OCR 锚点。");
         beforeNotificationBalance = beforeBalance;
-        var triedCandidateIds = new HashSet<string>(StringComparer.Ordinal);
-        var firstRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
+        var firstCandidates = new HashSet<string>(StringComparer.Ordinal);
+        var firstRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, firstCandidates,
             out result, out outcomeKind, out afterNotificationBalance);
         if (firstRoute == ClaimRouteExecution.Succeeded) return true;
         if (firstRoute == ClaimRouteExecution.Failed) return false;
 
-        if (!TryClosePersonalCenterForSecondScan(window, config))
+        if (!EnsurePersonalCenterClosedForSecondScan(window, config))
         {
             result = "首次扫描无领取动作，且未能确认个人中心已经关闭。";
             return false;
         }
 
         Log("个人中心已关闭；开始第二次整窗领取文字扫描。");
-        var secondRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
+        var secondCandidates = new HashSet<string>(StringComparer.Ordinal);
+        var secondRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, secondCandidates,
             out result, out outcomeKind, out afterNotificationBalance);
         if (secondRoute == ClaimRouteExecution.Succeeded) return true;
         if (secondRoute == ClaimRouteExecution.Failed) return false;
@@ -914,11 +915,19 @@ internal static class Program
         }
 
         Log($"重新打开个人中心并读取积分余额 {reopenedEvidence.Balance.RawText}；立即执行第三次整窗扫描。");
-        var thirdRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
+        var thirdCandidates = new HashSet<string>(StringComparer.Ordinal);
+        var thirdRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, thirdCandidates,
             out result, out outcomeKind, out afterNotificationBalance);
         if (thirdRoute == ClaimRouteExecution.Succeeded) return true;
         if (thirdRoute == ClaimRouteExecution.Failed) return false;
 
+        if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var buddyMenuEvidence) ||
+            buddyMenuEvidence.Balance is null)
+        {
+            result = "进入 Buddy加油站前未能重新确认个人中心和明确数字余额。";
+            return false;
+        }
+        Log($"进入 Buddy加油站前重新确认积分余额 {buddyMenuEvidence.Balance.RawText}。");
         if (!TryClickBuddyFuelStation(window, config, out var buddyFailure))
         {
             result = buddyFailure;
@@ -927,12 +936,15 @@ internal static class Program
         }
 
         Log("Buddy加油站已点击；等待页面加载并再次按优先级扫描整个窗口。");
-        var buddyRoute = ExecuteClaimRouteUntilAction(window, config, beforeBalance, triedCandidateIds,
+        var buddyCandidates = new HashSet<string>(StringComparer.Ordinal);
+        var buddyRoute = ExecuteClaimRouteUntilAction(window, config, beforeBalance, buddyCandidates,
             TimeSpan.FromSeconds(10), out result, out outcomeKind, out afterNotificationBalance);
         if (buddyRoute == ClaimRouteExecution.Succeeded) return true;
         if (buddyRoute == ClaimRouteExecution.Failed) return false;
 
-        result = BuildClaimActionNotFoundResult(clickedCheckIn: triedCandidateIds.Count > 0);
+        bool clickedCheckIn = firstCandidates.Count > 0 || secondCandidates.Count > 0 ||
+                              thirdCandidates.Count > 0 || buddyCandidates.Count > 0;
+        result = BuildClaimActionNotFoundResult(clickedCheckIn);
         SaveFailureDiagnostic(window, config, "claim-action-not-found", result);
         return false;
     }
@@ -1075,7 +1087,7 @@ internal static class Program
         return secondImage is not null && HasClaimSuccessText(ReadClaimOcr(secondImage));
     }
 
-    private static bool TryClosePersonalCenterForSecondScan(IntPtr window, Config config)
+    private static bool EnsurePersonalCenterClosedForSecondScan(IntPtr window, Config config)
     {
         int height = GetWindowHeight(window);
         if (height <= config.ProfileBottomOffset) return false;
@@ -1083,10 +1095,24 @@ internal static class Program
         int profileY = height - config.ProfileBottomOffset;
         using (var before = CaptureWindow(window))
         {
-            if (before is not null && TryFindProfileEntryPoint(before, out var profilePoint))
+            if (before is not null)
             {
-                profileX = profilePoint.X;
-                profileY = profilePoint.Y;
+                var beforeOcr = ReadClaimOcr(before);
+                if (FindBalanceLabel(beforeOcr) is null)
+                {
+                    Thread.Sleep(500);
+                    using var confirmation = CaptureWindow(window);
+                    if (confirmation is not null && FindBalanceLabel(ReadClaimOcr(confirmation)) is null)
+                    {
+                        Log("签到入口点击后个人中心已关闭；无需再次点击头像，直接开始下一次整窗扫描。");
+                        return true;
+                    }
+                }
+                if (TryFindProfileEntryPoint(before, out var profilePoint))
+                {
+                    profileX = profilePoint.X;
+                    profileY = profilePoint.Y;
+                }
             }
         }
         Log($"首次整窗扫描无领取动作；再次点击个人中心一次以关闭面板：({profileX},{profileY})。");
@@ -2166,10 +2192,43 @@ internal static class Program
 
     private static BalanceLabel? FindBalanceLabel(OcrSnapshot snapshot)
     {
-        var label = snapshot.Lines
-            .Select(line => new BalanceLabel(line, GetOcrBounds(line)))
-            .FirstOrDefault(item => NormalizeOcrText(item.Line.Text).Contains("积分余额", StringComparison.Ordinal));
-        return label?.Line is null ? null : label;
+        const string expected = "积分余额";
+        foreach (var line in snapshot.Lines)
+        {
+            if (TryFindExactOcrPhraseBounds(line, expected, out var bounds))
+                return new BalanceLabel(line, bounds);
+        }
+        return null;
+    }
+
+    private static bool TryFindExactOcrPhraseBounds(OcrLine line, string expected, out OcrBounds bounds)
+    {
+        for (int start = 0; start < line.Words.Count; start++)
+        {
+            var normalized = new StringBuilder();
+            var matchedWords = new List<OcrWord>();
+            for (int index = start; index < line.Words.Count; index++)
+            {
+                var wordText = NormalizeExactActionText(line.Words[index].Text);
+                if (wordText.Length == 0) continue;
+                normalized.Append(wordText);
+                matchedWords.Add(line.Words[index]);
+                var candidate = normalized.ToString();
+                if (StringComparer.Ordinal.Equals(candidate, expected))
+                {
+                    bounds = new OcrBounds(
+                        matchedWords.Min(word => word.X),
+                        matchedWords.Min(word => word.Y),
+                        matchedWords.Max(word => word.X + word.Width),
+                        matchedWords.Max(word => word.Y + word.Height));
+                    return true;
+                }
+                if (!expected.StartsWith(candidate, StringComparison.Ordinal)) break;
+            }
+        }
+
+        bounds = default;
+        return false;
     }
 
     private enum BalanceCropTreatment { Raw, LightContrast, DarkContrast }
@@ -3605,6 +3664,15 @@ internal static class Program
         };
         if (IsConfirmedPersonalCenterMenu(incompletePersonalCenterOcr, balance, selfTestConfig))
             throw new InvalidOperationException("只有积分余额和数字时不得确认个人中心菜单。");
+        var misleadingBalanceLabelOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额说明", Words = [new OcrWord { Text = "积分余额说明", X = 30, Y = 350, Width = 110, Height = 18 }] }
+            ]
+        };
+        if (FindBalanceLabel(misleadingBalanceLabelOcr) is not null)
+            throw new InvalidOperationException("积分余额标签必须是精确词组，不得接受积分余额说明等包含文字。");
         var buddyFuelAction = FindBuddyFuelStationAction(ocr, selfTestConfig);
         if (buddyFuelAction is null || buddyFuelAction.Keyword != "Buddy加油站" ||
             buddyFuelAction.Kind != ClaimActionKind.BuddyFuelStation)
