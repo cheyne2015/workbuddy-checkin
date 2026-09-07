@@ -1,7 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$ImagePath,
-    [string]$Language = 'profile'
+    [string]$Language = 'profile',
+    [string]$ManifestPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,50 +27,66 @@ function Await-WinRt([object]$Operation, [Type]$ResultType) {
     return $task.Result
 }
 
-$file = Await-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ImagePath)) ([Windows.Storage.StorageFile])
-$stream = Await-WinRt ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-$decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$bitmap = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-
-try {
-    $actualLanguage = $Language
-    $engine = if ($Language -eq 'profile') {
-        [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-    } else {
-        [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($Language))
-    }
-    # The cropped numeric retry prefers en-US, but that OCR language pack is optional.
-    # Fall back to the logged-in user's installed OCR languages before giving up.
-    if ($null -eq $engine -and $Language -ne 'profile') {
-        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-        $actualLanguage = 'profile-fallback'
-    }
-    if ($null -eq $engine) { throw 'Windows OCR is unavailable for the current user profile.' }
-    $result = Await-WinRt ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $lines = @($result.Lines | ForEach-Object {
-        $words = @($_.Words | ForEach-Object {
+function Invoke-ImageOcr([string]$Path, [string]$RequestedLanguage) {
+    $file = Await-WinRt ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+    $stream = Await-WinRt ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $bitmap = $null
+    try {
+        $decoder = Await-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $bitmap = Await-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $actualLanguage = $RequestedLanguage
+        $engine = if ($RequestedLanguage -eq 'profile') {
+            [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+        } else {
+            [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($RequestedLanguage))
+        }
+        # The cropped numeric retry prefers en-US, but that OCR language pack is optional.
+        # Fall back to the logged-in user's installed OCR languages before giving up.
+        if ($null -eq $engine -and $RequestedLanguage -ne 'profile') {
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+            $actualLanguage = 'profile-fallback'
+        }
+        if ($null -eq $engine) { throw 'Windows OCR is unavailable for the current user profile.' }
+        $result = Await-WinRt ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+        $lines = @($result.Lines | ForEach-Object {
+            $words = @($_.Words | ForEach-Object {
+                [pscustomobject]@{
+                    Text = $_.Text
+                    X = [int]$_.BoundingRect.X
+                    Y = [int]$_.BoundingRect.Y
+                    Width = [int]$_.BoundingRect.Width
+                    Height = [int]$_.BoundingRect.Height
+                }
+            })
             [pscustomobject]@{
-                Text = $_.Text
-                X = [int]$_.BoundingRect.X
-                Y = [int]$_.BoundingRect.Y
-                Width = [int]$_.BoundingRect.Width
-                Height = [int]$_.BoundingRect.Height
+                Text = ($words.Text -join '')
+                Words = $words
             }
         })
-        [pscustomobject]@{
-            Text = ($words.Text -join '')
-            Words = $words
+        return [pscustomobject]@{
+            Language = $actualLanguage
+            Lines = $lines
         }
-    })
-    $payload = [pscustomobject]@{
-        Language = $actualLanguage
-        Lines = $lines
-    } | ConvertTo-Json -Depth 5 -Compress
-    # The parent process receives only ASCII. This avoids Windows PowerShell 5
-    # code-page conversion corrupting Chinese OCR text in a redirected pipe.
-    [Console]::WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)))
+    }
+    finally {
+        if ($null -ne $bitmap) { $bitmap.Dispose() }
+        $stream.Dispose()
+    }
 }
-finally {
-    $bitmap.Dispose()
-    $stream.Dispose()
+
+if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
+    $requests = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $payloadObject = @()
+    foreach ($request in $requests) {
+        try { $payloadObject += Invoke-ImageOcr $request.ImagePath $request.Language }
+        catch { throw "OCR batch item failed ($($request.ImagePath)): $($_.Exception.GetBaseException().Message)" }
+    }
+} else {
+    if ([string]::IsNullOrWhiteSpace($ImagePath)) { throw 'ImagePath or ManifestPath is required.' }
+    $payloadObject = Invoke-ImageOcr $ImagePath $Language
 }
+
+$payload = ConvertTo-Json -InputObject $payloadObject -Depth 5 -Compress
+# The parent process receives only ASCII. This avoids Windows PowerShell 5
+# code-page conversion corrupting Chinese OCR text in a redirected pipe.
+[Console]::WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)))

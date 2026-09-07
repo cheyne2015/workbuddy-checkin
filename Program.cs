@@ -991,11 +991,12 @@ internal static class Program
         }
 
         var currentOcr = ReadClaimOcr(currentImage);
-        var immediate = FindImmediateClaimAction(currentImage, currentOcr, config);
+        var actionScan = ScanWindowActions(currentImage, currentOcr, config);
+        var immediate = actionScan.Immediate;
         bool stableClaimedText = immediate is null && HasClaimSuccessText(currentOcr) &&
                                  TryConfirmStableClaimSuccessText(window);
         var checkInActions = immediate is null && !stableClaimedText
-            ? FindCheckInActions(currentImage, currentOcr, config)
+            ? actionScan.CheckInActions
             : [];
         switch (SelectClaimRoute(immediate is not null, stableClaimedText, checkInActions))
         {
@@ -1769,8 +1770,9 @@ internal static class Program
         using var bitmap = new Bitmap(imagePath);
         var ocr = ReadOcr(bitmap);
         var evidence = ReadMenuEvidence(bitmap, ocr, config);
-        var immediate = FindImmediateClaimAction(bitmap, ocr, config);
-        var checkInActions = FindCheckInActions(bitmap, ocr, config);
+        var actionScan = ScanWindowActions(bitmap, ocr, config);
+        var immediate = actionScan.Immediate;
+        var checkInActions = actionScan.CheckInActions;
         if (!HasConfirmedNumericBalance(evidence.Balance))
             throw new InvalidOperationException("未读取到明确数字的积分余额，OCR 领取验证不通过。\n");
         var numericBalance = FormatNotificationBalance(evidence.Balance);
@@ -1826,60 +1828,100 @@ internal static class Program
 
     private static OcrSnapshot ReadOcr(Bitmap bitmap, string language = "profile")
     {
-        var script = Path.Combine(BaseDir, "workbuddy-ocr.ps1");
-        if (!File.Exists(script)) throw new FileNotFoundException("找不到 Windows OCR 脚本。", script);
-        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyAutoClaim");
-        Directory.CreateDirectory(folder);
-        var imagePath = Path.Combine(folder, $"ocr-{Environment.ProcessId}-{Guid.NewGuid():N}.png");
+        Directory.CreateDirectory(DataDirectory);
+        var imagePath = Path.Combine(DataDirectory, $"ocr-{Environment.ProcessId}-{Guid.NewGuid():N}.png");
         bitmap.Save(imagePath, ImageFormat.Png);
         try
         {
-            var start = new ProcessStartInfo("powershell.exe")
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                // workbuddy-ocr.ps1 deliberately emits UTF-8 JSON. Do not let the
-                // current Windows ANSI code page corrupt OCR text before JSON parsing.
-                StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-                StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
-            };
-            start.ArgumentList.Add("-NoProfile");
-            start.ArgumentList.Add("-ExecutionPolicy");
-            start.ArgumentList.Add("Bypass");
-            start.ArgumentList.Add("-File");
-            start.ArgumentList.Add(script);
-            start.ArgumentList.Add("-ImagePath");
-            start.ArgumentList.Add(imagePath);
-            start.ArgumentList.Add("-Language");
-            start.ArgumentList.Add(language);
-            using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Windows OCR。\n");
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-            int processId = process.Id;
-            var waitResult = WaitForOcrProcess(process, OcrProcessTimeout);
-            if (waitResult != OcrProcessWaitResult.Completed)
-            {
-                if (waitResult == OcrProcessWaitResult.TerminatedAfterTimeout)
-                {
-                    Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; stopped PID={processId}.");
-                    throw new TimeoutException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒并已安全终止。");
-                }
-                Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; PID={processId} did not exit after termination request.");
-                throw new InvalidOperationException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒且无法确认终止，流程已安全停止。");
-            }
-            Task.WaitAll(outputTask, errorTask);
-            if (process.ExitCode != 0)
-                throw new InvalidOperationException("Windows OCR 失败: " + errorTask.Result.Trim());
-            byte[] jsonBytes;
-            try { jsonBytes = Convert.FromBase64String(outputTask.Result.Trim()); }
-            catch (FormatException ex) { throw new InvalidOperationException("Windows OCR 返回的数据格式无效。", ex); }
-            return JsonSerializer.Deserialize<OcrSnapshot>(Encoding.UTF8.GetString(jsonBytes),
+            return JsonSerializer.Deserialize<OcrSnapshot>(RunOcrScript("-ImagePath", imagePath, "-Language", language),
                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                    ?? throw new InvalidOperationException("Windows OCR 未返回可读取的结果。");
         }
         finally { try { File.Delete(imagePath); } catch { } }
+    }
+
+    private static IReadOnlyList<OcrSnapshot> ReadOcrBatch(
+        IReadOnlyList<(Bitmap Bitmap, string Language)> inputs)
+    {
+        if (inputs.Count == 0) return [];
+        Directory.CreateDirectory(DataDirectory);
+        var token = $"{Environment.ProcessId}-{Guid.NewGuid():N}";
+        var imagePaths = new List<string>(inputs.Count);
+        var manifestPath = Path.Combine(DataDirectory, $"ocr-batch-{token}.json");
+        try
+        {
+            for (int index = 0; index < inputs.Count; index++)
+            {
+                var imagePath = Path.Combine(DataDirectory, $"ocr-batch-{token}-{index}.png");
+                inputs[index].Bitmap.Save(imagePath, ImageFormat.Png);
+                imagePaths.Add(imagePath);
+            }
+            var manifest = inputs.Select((input, index) => new
+            {
+                ImagePath = imagePaths[index],
+                input.Language
+            });
+            File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var snapshots = JsonSerializer.Deserialize<List<OcrSnapshot>>(
+                                RunOcrScript("-ManifestPath", manifestPath),
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? throw new InvalidOperationException("Windows OCR 批处理未返回可读取的结果。");
+            if (snapshots.Count != inputs.Count)
+                throw new InvalidOperationException($"Windows OCR 批处理结果数量错误：期望 {inputs.Count}，实际 {snapshots.Count}。");
+            return snapshots;
+        }
+        finally
+        {
+            foreach (var imagePath in imagePaths)
+                try { File.Delete(imagePath); } catch { }
+            try { File.Delete(manifestPath); } catch { }
+        }
+    }
+
+    private static string RunOcrScript(params string[] arguments)
+    {
+        var script = Path.Combine(BaseDir, "workbuddy-ocr.ps1");
+        if (!File.Exists(script)) throw new FileNotFoundException("找不到 Windows OCR 脚本。", script);
+        var start = new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            // workbuddy-ocr.ps1 deliberately emits UTF-8 JSON. Do not let the
+            // current Windows ANSI code page corrupt OCR text before JSON parsing.
+            StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+        };
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-ExecutionPolicy");
+        start.ArgumentList.Add("Bypass");
+        start.ArgumentList.Add("-File");
+        start.ArgumentList.Add(script);
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Windows OCR。\n");
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        int processId = process.Id;
+        var waitResult = WaitForOcrProcess(process, OcrProcessTimeout);
+        if (waitResult != OcrProcessWaitResult.Completed)
+        {
+            if (waitResult == OcrProcessWaitResult.TerminatedAfterTimeout)
+            {
+                Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; stopped PID={processId}.");
+                throw new TimeoutException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒并已安全终止。");
+            }
+            Log($"Windows OCR timed out after {OcrProcessTimeout.TotalSeconds:0} seconds; PID={processId} did not exit after termination request.");
+            throw new InvalidOperationException($"Windows OCR 超过 {OcrProcessTimeout.TotalSeconds:0} 秒且无法确认终止，流程已安全停止。");
+        }
+        Task.WaitAll(outputTask, errorTask);
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException("Windows OCR 失败: " + errorTask.Result.Trim());
+        byte[] jsonBytes;
+        try { jsonBytes = Convert.FromBase64String(outputTask.Result.Trim()); }
+        catch (FormatException ex) { throw new InvalidOperationException("Windows OCR 返回的数据格式无效。", ex); }
+        return Encoding.UTF8.GetString(jsonBytes);
     }
 
     private static OcrSnapshot ReadClaimOcr(Bitmap bitmap)
@@ -2099,31 +2141,19 @@ internal static class Program
         var label = FindBalanceLabel(snapshot);
         if (label is null) return null;
 
-        var readings = new List<BalanceReading>();
-        if (direct is not null) readings.Add(direct);
-
         // WorkBuddy 5.5.3 renders the refresh glyph and the small gray balance close
         // together. Full-window OCR can lose both separators (2,132.34 -> 13234).
-        // Re-crop immediately after the detected refresh glyph and require two
-        // independent image treatments to agree before accepting the value.
-        var detectedRowReadings = new[]
-        {
-            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.Raw),
-            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.LightContrast),
-            TryReadBalanceFromDetectedRowCrop(bitmap, snapshot, label, config, BalanceCropTreatment.DarkContrast)
-        }.Where(reading => reading is not null).Select(reading => reading!).ToArray();
-        var detectedRowConfirmed = SelectConfirmedNumericBalance(detectedRowReadings);
-        if (detectedRowConfirmed is not null)
-            return detectedRowConfirmed with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
-
-        var broadValue = TryReadBalanceFromCrop(bitmap, label, config, leftOffset: -4,
-            width: config.BalanceValueCropWidthPixels, scale: config.BalanceValueCropScale,
-            above: config.BalanceValueCropAbovePixels, below: config.BalanceValueCropBelowPixels,
-            treatment: BalanceCropTreatment.Raw);
-        if (broadValue is not null) readings.Add(broadValue);
+        // Read the dynamically detected value row once per frame. Safety comes from
+        // requiring the same explicit numeric value in two consecutive frames below,
+        // rather than launching three to seven OCR processes for every frame.
+        var detectedRow = TryReadBalanceFromDetectedRowCrop(
+            bitmap, snapshot, label, config, BalanceCropTreatment.Raw);
+        if (detectedRow is not null)
+            return detectedRow with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
 
         // The value can be a single small digit at the far right of the row. A focused,
-        // higher-resolution retry prevents a visible 0 balance from being treated as missing.
+        // dynamically label-anchored retry prevents a visible 0 balance from being lost
+        // when the refresh glyph itself was not transcribed.
         var focusedRawValue = TryReadBalanceFromCrop(bitmap, label, config,
             config.BalanceValueFocusedCropLeftOffsetPixels,
             config.BalanceValueFocusedCropWidthPixels,
@@ -2131,31 +2161,11 @@ internal static class Program
             config.BalanceValueFocusedCropAbovePixels,
             config.BalanceValueFocusedCropBelowPixels,
             treatment: BalanceCropTreatment.Raw);
-        if (focusedRawValue is not null) readings.Add(focusedRawValue);
+        var candidate = focusedRawValue ?? direct;
+        if (candidate is not null)
+            return candidate with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
 
-        var focusedValue = TryReadBalanceFromCrop(bitmap, label, config,
-            config.BalanceValueFocusedCropLeftOffsetPixels,
-            config.BalanceValueFocusedCropWidthPixels,
-            config.BalanceValueFocusedCropScale,
-            config.BalanceValueFocusedCropAbovePixels,
-            config.BalanceValueFocusedCropBelowPixels,
-            treatment: BalanceCropTreatment.LightContrast);
-        if (focusedValue is not null) readings.Add(focusedValue);
-
-        var darkThemeFocusedValue = TryReadBalanceFromCrop(bitmap, label, config,
-            config.BalanceValueFocusedCropLeftOffsetPixels,
-            config.BalanceValueFocusedCropWidthPixels,
-            config.BalanceValueFocusedCropScale,
-            config.BalanceValueFocusedCropAbovePixels,
-            config.BalanceValueFocusedCropBelowPixels,
-            treatment: BalanceCropTreatment.DarkContrast);
-        if (darkThemeFocusedValue is not null) readings.Add(darkThemeFocusedValue);
-
-        var confirmed = SelectConfirmedNumericBalance(readings);
-        if (confirmed is not null)
-            return confirmed with { VisualSignature = CreateVisualBalanceFingerprint(bitmap, label.Bounds, config) };
-
-        Log("积分余额多路 OCR 未形成一致数字；本轮不将视觉指纹视为可用余额。");
+        Log("积分余额动态行 OCR 未读取到明确数字；等待下一帧，不使用视觉指纹冒充余额。");
         return null;
     }
 
@@ -2169,8 +2179,8 @@ internal static class Program
             .Select(group => group.First())
             .FirstOrDefault();
 
-    // A single frame must already contain a multi-route OCR confirmation. This
-    // second layer requires the same explicit numeric value in two consecutive frames.
+    // A balance becomes actionable only after the same explicit numeric value is
+    // independently read from two consecutive captured frames.
     private static BalanceReading? SelectConfirmedBalanceAcrossFrames(IEnumerable<BalanceReading?> readings) =>
         readings
             .TakeLast(2)
@@ -2561,39 +2571,101 @@ internal static class Program
         return "V:" + Convert.ToHexString(bytes);
     }
 
-    private const int FullWindowActionOcrScale = 3;
+    private const int FullWindowActionOcrScale = 2;
+    private const int FullWindowActionOcrColumns = 3;
+    private const int FullWindowActionOcrRows = 2;
+    private const int FullWindowActionOcrOverlapPixels = 40;
 
     private static ClaimAction? FindImmediateClaimAction(Bitmap bitmap, OcrSnapshot directOcr, Config config)
+        => ScanWindowActions(bitmap, directOcr, config).Immediate;
+
+    private sealed record WindowActionScan(
+        ClaimAction? Immediate, IReadOnlyList<ClaimAction> CheckInActions);
+
+    private static WindowActionScan ScanWindowActions(Bitmap bitmap, OcrSnapshot directOcr, Config config)
     {
         var direct = FindImmediateClaimAction(directOcr, config);
-        if (direct is not null) return direct;
+        if (direct is not null) return new WindowActionScan(direct, []);
 
-        foreach (var treatment in new[]
-                 {
-                     FullWindowOcrTreatment.Raw,
-                     FullWindowOcrTreatment.Grayscale,
-                     FullWindowOcrTreatment.Inverted
-                 })
+        var raw = ReadWindowActionTiles(bitmap, FullWindowOcrTreatment.Raw);
+        var rawAction = FindImmediateClaimAction(raw, bitmap, config);
+        if (rawAction is not null) return new WindowActionScan(rawAction, []);
+
+        var checkInActions = MergeCheckInActions(
+            FindCheckInActions(directOcr, config),
+            FindCheckInActions(raw, bitmap, config));
+
+        if (!HasPotentialImmediateClaimText(directOcr) &&
+            !raw.Any(tile => HasPotentialImmediateClaimText(tile.Snapshot)))
+            return new WindowActionScan(null, checkInActions);
+
+        var enhanced = ReadWindowActionTiles(bitmap,
+            FullWindowOcrTreatment.Grayscale, FullWindowOcrTreatment.Inverted);
+        var enhancedAction = FindImmediateClaimAction(enhanced, bitmap, config);
+        return enhancedAction is not null
+            ? new WindowActionScan(enhancedAction, [])
+            : new WindowActionScan(null, MergeCheckInActions(checkInActions,
+                FindCheckInActions(enhanced, bitmap, config)));
+    }
+
+    private static IReadOnlyList<WindowOcrTile> ReadWindowActionTiles(
+        Bitmap bitmap, params FullWindowOcrTreatment[] treatments)
+    {
+        var images = new List<Bitmap>();
+        var mappings = new List<(Rectangle Source, FullWindowOcrTreatment Treatment)>();
+        try
         {
-            using var enlarged = CreateScaledCrop(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height),
-                FullWindowActionOcrScale);
-            if (treatment == FullWindowOcrTreatment.Grayscale) ConvertToGrayscale(enlarged);
-            else if (treatment == FullWindowOcrTreatment.Inverted) NormalizeDarkThemeOcr(enlarged);
+            foreach (var treatment in treatments)
+            for (int row = 0; row < FullWindowActionOcrRows; row++)
+            for (int column = 0; column < FullWindowActionOcrColumns; column++)
+            {
+                int baseLeft = column * bitmap.Width / FullWindowActionOcrColumns;
+                int baseRight = (column + 1) * bitmap.Width / FullWindowActionOcrColumns;
+                int baseTop = row * bitmap.Height / FullWindowActionOcrRows;
+                int baseBottom = (row + 1) * bitmap.Height / FullWindowActionOcrRows;
+                var source = Rectangle.FromLTRB(
+                    Math.Max(0, baseLeft - FullWindowActionOcrOverlapPixels),
+                    Math.Max(0, baseTop - FullWindowActionOcrOverlapPixels),
+                    Math.Min(bitmap.Width, baseRight + FullWindowActionOcrOverlapPixels),
+                    Math.Min(bitmap.Height, baseBottom + FullWindowActionOcrOverlapPixels));
+                var image = CreateScaledCrop(bitmap, source, FullWindowActionOcrScale);
+                if (treatment == FullWindowOcrTreatment.Grayscale) ConvertToGrayscale(image);
+                else if (treatment == FullWindowOcrTreatment.Inverted) NormalizeDarkThemeOcr(image);
+                images.Add(image);
+                mappings.Add((source, treatment));
+            }
 
-            var passOcr = ReadOcr(enlarged, "zh-Hans");
-            var enlargedAction = FindImmediateClaimAction(passOcr, config);
-            if (enlargedAction is null) continue;
-            var mappedAction = MapScaledActionToWindow(enlargedAction, bitmap, config, FullWindowActionOcrScale);
-            int x = mappedAction.CenterX;
-            int y = mappedAction.CenterY;
-            Log($"整图 {treatment} OCR 识别立即领取：文本={enlargedAction.Text}，位置=({x},{y})。");
-            return mappedAction;
+            var snapshots = ReadOcrBatch(images.Select(image => (image, "zh-Hans")).ToArray());
+            return snapshots.Select((snapshot, index) =>
+                    new WindowOcrTile(snapshot, mappings[index].Source,
+                        FullWindowActionOcrScale, mappings[index].Treatment))
+                .ToArray();
         }
-
-        return null;
+        finally
+        {
+            foreach (var image in images) image.Dispose();
+        }
     }
 
     private enum FullWindowOcrTreatment { Raw, Grayscale, Inverted }
+
+    private sealed record WindowOcrTile(
+        OcrSnapshot Snapshot, Rectangle Source, int Scale, FullWindowOcrTreatment Treatment);
+
+    private static ClaimAction? FindImmediateClaimAction(
+        IReadOnlyList<WindowOcrTile> tiles, Bitmap originalWindow, Config config)
+    {
+        foreach (var tile in tiles)
+        {
+            var action = FindImmediateClaimAction(tile.Snapshot, config);
+            if (action is null) continue;
+            var mapped = MapScaledActionToWindow(action, originalWindow, config,
+                tile.Scale, tile.Source.Left, tile.Source.Top);
+            Log($"整窗分块 {tile.Treatment} OCR 识别立即领取：文本={action.Text}，位置=({mapped.CenterX},{mapped.CenterY})。");
+            return mapped;
+        }
+        return null;
+    }
 
     private static void ConvertToGrayscale(Bitmap bitmap)
     {
@@ -2623,6 +2695,17 @@ internal static class Program
     {
         const string expected = "立即领取";
         return StringComparer.Ordinal.Equals(text, expected) ? expected : null;
+    }
+
+    private static bool HasPotentialImmediateClaimText(OcrSnapshot snapshot)
+    {
+        const string expected = "立即领取";
+        return snapshot.Lines.Any(line =>
+        {
+            var text = NormalizeExactActionText(line.Text);
+            return text.Length == expected.Length &&
+                   text.Where((character, index) => character == expected[index]).Count() >= 2;
+        });
     }
 
     private static ClaimAction? FindBuddyFuelStationAction(OcrSnapshot snapshot, Config config)
@@ -2667,29 +2750,36 @@ internal static class Program
     }
 
     private static IReadOnlyList<ClaimAction> FindCheckInActions(Bitmap bitmap, OcrSnapshot directOcr, Config config)
+        => ScanWindowActions(bitmap, directOcr, config).CheckInActions;
+
+    private static IReadOnlyList<ClaimAction> FindCheckInActions(
+        IReadOnlyList<WindowOcrTile> tiles, Bitmap originalWindow, Config config)
     {
-        var direct = FindCheckInActions(directOcr, config);
-        if (direct.Count > 0) return direct;
+        return tiles
+            .SelectMany(tile => FindCheckInActions(tile.Snapshot, config)
+                .Select(action => MapScaledActionToWindow(action, originalWindow, config,
+                    tile.Scale, tile.Source.Left, tile.Source.Top)))
+            .GroupBy(action => action.CandidateId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+    }
 
-        // As with “立即领取”, retry only after enlarging the entire current window.
-        // No card, crop, or fixed-position condition is introduced here.
-        using var enlarged = CreateScaledCrop(bitmap, new Rectangle(0, 0, bitmap.Width, bitmap.Height),
-            FullWindowActionOcrScale);
-        var enlargedActions = FindCheckInActions(ReadOcr(enlarged), config);
-        if (enlargedActions.Count == 0) return direct;
-
-        Log("整图放大 OCR 识别到签到入口。");
-        return enlargedActions
-            .Select(action => MapScaledActionToWindow(action, bitmap, config, FullWindowActionOcrScale))
+    private static IReadOnlyList<ClaimAction> MergeCheckInActions(
+        IEnumerable<ClaimAction> first, IEnumerable<ClaimAction> second)
+    {
+        return first.Concat(second)
+            .GroupBy(action => action.CandidateId, StringComparer.Ordinal)
+            .Select(group => group.First())
             .ToArray();
     }
 
     private static ClaimAction MapScaledActionToWindow(
-        ClaimAction action, Bitmap originalWindow, Config config, int scale)
+        ClaimAction action, Bitmap originalWindow, Config config, int scale,
+        int sourceLeft = 0, int sourceTop = 0)
     {
-        int x = Math.Clamp((int)Math.Round(action.CenterX / (double)scale),
+        int x = Math.Clamp(sourceLeft + (int)Math.Round(action.CenterX / (double)scale),
             0, Math.Max(0, originalWindow.Width - 1));
-        int y = Math.Clamp((int)Math.Round(action.CenterY / (double)scale),
+        int y = Math.Clamp(sourceTop + (int)Math.Round(action.CenterY / (double)scale),
             0, Math.Max(0, originalWindow.Height - 1));
         var mappedBounds = new OcrBounds(x, y, x, y);
         return action with
