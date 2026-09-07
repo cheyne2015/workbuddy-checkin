@@ -24,6 +24,7 @@ internal static class Program
     private const int LogRetentionDays = 30;
     private const int FailureDiagnosticRetentionCount = 20;
     private const int ExpectedOcrProcessTimeoutSeconds = 8;
+    private const int OcrPollingIntervalMilliseconds = 100;
     private const int UiFrameSignatureColumns = 12;
     private const int UiFrameSignatureRows = 8;
     private const int UiFrameLumaQuantization = 32;
@@ -102,7 +103,7 @@ internal static class Program
     }
 
     private static bool IsInteractiveNonClaimTest(string command) =>
-        command is "--test-buddy-card" or "--test-menu" or "--test-personal-center" or
+        command is "--test-buddy-card" or "--test-menu" or "--test-personal-center" or "--test-fast-route" or
             "--test-notification" or "--probe-checkin-entry";
 
     private static int RunInteractiveNonClaimTest(string command)
@@ -129,6 +130,7 @@ internal static class Program
                 "--test-buddy-card" => TestBuddyCard(config),
                 "--test-menu" => TestMenuClick(config),
                 "--test-personal-center" => TestPersonalCenter(config),
+                "--test-fast-route" => TestFastClaimRoute(config),
                 "--test-notification" => TestNotification(config),
                 "--probe-checkin-entry" => ProbeCheckInEntry(config),
                 _ => 2
@@ -900,6 +902,25 @@ internal static class Program
         if (firstRoute == ClaimRouteExecution.Succeeded) return true;
         if (firstRoute == ClaimRouteExecution.Failed) return false;
 
+        var directBuddyCandidates = new HashSet<string>(StringComparer.Ordinal);
+        if (ShouldUseDirectBuddyRouteAfterFirstScan(firstRoute, firstCandidates.Count))
+        {
+            if (TryClickBuddyFuelStation(window, config, out var directBuddyFailure))
+            {
+                Log("首次扫描无领取动作；直接进入已精确识别的 Buddy加油站快速路径。");
+                var directBuddyRoute = ExecuteClaimRouteUntilAction(window, config, beforeBalance,
+                    directBuddyCandidates, TimeSpan.FromSeconds(10), out result, out outcomeKind,
+                    out afterNotificationBalance);
+                if (directBuddyRoute == ClaimRouteExecution.Succeeded) return true;
+                if (directBuddyRoute == ClaimRouteExecution.Failed) return false;
+                Log("Buddy加油站快速路径未出现可确认动作；继续执行兼容后备路径。");
+            }
+            else
+            {
+                Log("Buddy加油站快速路径不可用，继续执行兼容后备路径：" + directBuddyFailure);
+            }
+        }
+
         if (!EnsurePersonalCenterClosedForSecondScan(window, config))
         {
             result = "首次扫描无领取动作，且未能确认个人中心已经关闭。";
@@ -968,13 +989,19 @@ internal static class Program
         if (buddyRoute == ClaimRouteExecution.Failed) return false;
 
         bool clickedCheckIn = firstCandidates.Count > 0 || secondCandidates.Count > 0 ||
-                              thirdCandidates.Count > 0 || buddyCandidates.Count > 0;
+                              thirdCandidates.Count > 0 || buddyCandidates.Count > 0 ||
+                              directBuddyCandidates.Count > 0;
         result = BuildClaimActionNotFoundResult(clickedCheckIn);
         SaveFailureDiagnostic(window, config, "claim-action-not-found", result);
         return false;
     }
 
     private enum ClaimRouteExecution { Succeeded, Failed, NoAction }
+
+    private static bool ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution route, int triedCandidateCount) =>
+        route == ClaimRouteExecution.NoAction && triedCandidateCount == 0;
+
+    private static int GetOcrPollingIntervalMilliseconds() => OcrPollingIntervalMilliseconds;
 
     private static ClaimRouteExecution ExecuteClaimRouteInCurrentWindow(
         IntPtr window, Config config, BalanceReading beforeBalance, HashSet<string> triedCandidateIds,
@@ -1065,7 +1092,7 @@ internal static class Program
             var route = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, triedCandidateIds,
                 out result, out outcomeKind, out afterNotificationBalance);
             if (route != ClaimRouteExecution.NoAction) return route;
-            Thread.Sleep(650);
+            Thread.Sleep(OcrPollingIntervalMilliseconds);
         }
         while (DateTime.UtcNow < until);
 
@@ -1101,7 +1128,7 @@ internal static class Program
 
     private static bool TryConfirmStableClaimSuccessText(IntPtr window)
     {
-        Thread.Sleep(650);
+        Thread.Sleep(OcrPollingIntervalMilliseconds);
         using var secondImage = CaptureWindow(window);
         return secondImage is not null && HasClaimSuccessText(ReadClaimOcr(secondImage));
     }
@@ -1350,12 +1377,12 @@ internal static class Program
         var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
         do
         {
-            Thread.Sleep(650);
+            Thread.Sleep(OcrPollingIntervalMilliseconds);
             using var image = CaptureWindow(window);
             if (image is null) continue;
             var ocr = ReadClaimOcr(image);
             evidence = ReadMenuEvidence(image, ocr, config);
-            if (!evidence.IsPersonalCenter && reopenAttemptsAfterRefresh < 3)
+            if (ShouldReopenPersonalCenterAfterRefresh(evidence, ocr) && reopenAttemptsAfterRefresh < 3)
             {
                 int height = GetWindowHeight(window);
                 if (height > config.ProfileBottomOffset)
@@ -1387,6 +1414,9 @@ internal static class Program
         SaveFailureDiagnostic(window, config, "balance-refresh-unconfirmed", "刷新后余额未连续两帧一致");
         return false;
     }
+
+    private static bool ShouldReopenPersonalCenterAfterRefresh(MenuEvidence evidence, OcrSnapshot snapshot) =>
+        !evidence.IsPersonalCenter && !LooksLikePersonalCenterShell(snapshot);
 
     private static bool TryFindProfileEntryPoint(Bitmap bitmap, out Point point)
     {
@@ -1633,7 +1663,7 @@ internal static class Program
                     break;
                 }
             }
-            Thread.Sleep(650);
+            Thread.Sleep(OcrPollingIntervalMilliseconds);
         }
         while (DateTime.UtcNow < statusUntil);
 
@@ -2864,7 +2894,7 @@ internal static class Program
         var samples = new List<MenuEvidence> { firstEvidence };
         for (int sampleIndex = 1; sampleIndex < 2; sampleIndex++)
         {
-            Thread.Sleep(650);
+            Thread.Sleep(OcrPollingIntervalMilliseconds);
             using var image = CaptureWindow(window);
             if (image is null) continue;
             samples.Add(ReadMenuEvidence(image, config));
@@ -3529,6 +3559,79 @@ internal static class Program
         }
     }
 
+    // 真实窗口快速路径验收：允许打开个人中心、刷新余额和进入 Buddy 加油站，
+    // 但绝不点击“立即领取”或任何签到入口。
+    private static int TestFastClaimRoute(Config config)
+    {
+        var originalWindow = FindWorkBuddyWindow();
+        bool wasForeground = originalWindow != IntPtr.Zero &&
+                             ShouldPreserveVisibleWorkBuddy(wasRunning: true, Native.IsIconic(originalWindow));
+        bool launchedByTool = false;
+        IntPtr window = IntPtr.Zero;
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            window = EnsureWorkBuddyWindow(config, out launchedByTool);
+            if (window == IntPtr.Zero) throw new InvalidOperationException("未找到 WorkBuddy 主窗口。");
+            Native.ShowWindow(window, Native.SW_SHOWNOACTIVATE);
+            if (!TryOpenPersonalCenterAndReadEvidence(window, config, out var evidence) || evidence.Balance is null)
+                throw new InvalidOperationException("快速路径测试未能刷新并读取个人中心余额。");
+
+            using (var initialImage = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。"))
+            {
+                var initialOcr = ReadClaimOcr(initialImage);
+                var initialScan = ScanWindowActions(initialImage, initialOcr, config);
+                if (initialScan.Immediate is not null || HasClaimSuccessText(initialOcr) || initialScan.CheckInActions.Count > 0)
+                {
+                    stopwatch.Stop();
+                    Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，当前窗口已有领取动作或状态，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
+                    return 0;
+                }
+            }
+
+            if (!TryClickBuddyFuelStation(window, config, out var buddyFailure))
+                throw new InvalidOperationException("快速路径无法进入 Buddy 加油站：" + buddyFailure);
+
+            int claimedFrames = 0;
+            var until = DateTime.UtcNow.AddSeconds(8);
+            do
+            {
+                using var image = CaptureWindow(window);
+                if (image is not null)
+                {
+                    var ocr = ReadClaimOcr(image);
+                    var scan = ScanWindowActions(image, ocr, config);
+                    if (scan.Immediate is not null || scan.CheckInActions.Count > 0)
+                    {
+                        stopwatch.Stop();
+                        Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，Buddy加油站已出现领取入口，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
+                        return 0;
+                    }
+                    claimedFrames = HasClaimSuccessText(ocr) ? claimedFrames + 1 : 0;
+                    if (claimedFrames >= 2)
+                    {
+                        stopwatch.Stop();
+                        Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，Buddy加油站连续两帧识别今日已领，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
+                        return 0;
+                    }
+                }
+                Thread.Sleep(OcrPollingIntervalMilliseconds);
+            }
+            while (DateTime.UtcNow < until);
+
+            throw new InvalidOperationException("快速路径进入 Buddy 加油站后，未识别到领取入口或稳定已领取状态。");
+        }
+        finally
+        {
+            stopwatch.Stop();
+            if (window != IntPtr.Zero)
+            {
+                if (launchedByTool) CloseWorkBuddy();
+                else if (!wasForeground) Native.ShowWindow(window, Native.SW_MINIMIZE);
+            }
+        }
+    }
+
     // Sends one real Windows notification with the currently OCR-read balance. It never
     // clicks a claim or check-in control; it falls back to a tray balloon only when Toast is blocked.
     private static int TestNotification(Config config)
@@ -3828,6 +3931,24 @@ internal static class Program
                 profileEntryPoint.X < 24 || profileEntryPoint.X > 60)
                 throw new InvalidOperationException("动态个人中心入口必须落在绿色头像本体内。");
         }
+
+        var refreshingPersonalCenterOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "Buddy加油站", Words = [new OcrWord { Text = "Buddy加油站", X = 24, Y = 120, Width = 96, Height = 20 }] },
+                new OcrLine { Text = "设置", Words = [new OcrWord { Text = "设置", X = 24, Y = 220, Width = 42, Height = 20 }] }
+            ]
+        };
+        if (ShouldReopenPersonalCenterAfterRefresh(MenuEvidence.Empty, refreshingPersonalCenterOcr) ||
+            !ShouldReopenPersonalCenterAfterRefresh(MenuEvidence.Empty, new OcrSnapshot()))
+            throw new InvalidOperationException("余额刷新期间仍有个人中心菜单外壳时不得点击头像切换面板。");
+        if (!ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.NoAction, 0) ||
+            ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.NoAction, 1) ||
+            ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.Failed, 0))
+            throw new InvalidOperationException("首次扫描无动作且未点击签到入口时，应直接进入 Buddy 加油站快速路径。");
+        if (GetOcrPollingIntervalMilliseconds() is < 50 or > 200)
+            throw new InvalidOperationException("OCR 轮询间隔必须足够快，同时保留界面重绘余量。");
 
         var selfTestConfig = new Config();
         if (NormalizeExactActionText("立 即，领 取！") != "立即领取" ||
