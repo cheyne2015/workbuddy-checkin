@@ -2325,7 +2325,11 @@ internal static class Program
 
         int sourceLeft = Math.Min(row.Bounds.Right - 1, valueStartX);
         int sourceTop = Math.Max(0, Math.Min(label.Bounds.Top, row.Bounds.Top) - 8);
-        int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + 2);
+        // Full-window OCR can omit a trailing decimal fragment entirely. Extend by
+        // three observed row heights so the crop includes unseen suffix glyphs such
+        // as ".69" without depending on a fixed window coordinate.
+        int rowHeight = Math.Max(1, row.Bounds.Bottom - row.Bounds.Top);
+        int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + rowHeight * 3);
         int sourceBottom = Math.Min(bitmap.Height, Math.Max(label.Bounds.Bottom, row.Bounds.Bottom) + 8);
         using var crop = CreateScaledCrop(bitmap,
             new Rectangle(sourceLeft, sourceTop, Math.Max(1, sourceRight - sourceLeft),
