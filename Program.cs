@@ -2083,8 +2083,43 @@ internal static class Program
             return true;
         }
 
+        if (detectedRow is not null && LooksLikePersonalCenterShell(snapshot) &&
+            TryInferBalanceRefreshPointFromNumericRow(detectedRow, label, out point))
+        {
+            Log($"OCR 未单独转录刷新符号；根据积分余额同行数字动态定位刷新图标：({point.X},{point.Y})。");
+            return true;
+        }
+
         point = default;
         return false;
+    }
+
+    private static bool TryInferBalanceRefreshPointFromNumericRow(
+        BalanceValueRow row, BalanceLabel label, out Point point)
+    {
+        var numericWord = row.Line.Words
+            .Where(word => word.Text.Count(char.IsDigit) >= 2)
+            .OrderByDescending(word => word.Text.Count(char.IsDigit))
+            .ThenBy(word => word.X)
+            .FirstOrDefault();
+        if (numericWord is null)
+        {
+            point = default;
+            return false;
+        }
+
+        int textHeight = Math.Max(8, Math.Max(label.Bounds.Bottom - label.Bounds.Top,
+            row.Bounds.Bottom - row.Bounds.Top));
+        int inferredX = numericWord.X - textHeight;
+        int inferredY = row.Bounds.CenterY;
+        if (inferredX <= label.Bounds.Right + textHeight || inferredX >= numericWord.X)
+        {
+            point = default;
+            return false;
+        }
+
+        point = new Point(inferredX, inferredY);
+        return true;
     }
 
     private static void SavePersonalCenterFailureEvidence(
@@ -3943,6 +3978,19 @@ internal static class Program
         if (ShouldReopenPersonalCenterAfterRefresh(MenuEvidence.Empty, refreshingPersonalCenterOcr) ||
             !ShouldReopenPersonalCenterAfterRefresh(MenuEvidence.Empty, new OcrSnapshot()))
             throw new InvalidOperationException("余额刷新期间仍有个人中心菜单外壳时不得点击头像切换面板。");
+        var refreshGlyphMissingOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额", Words = [new OcrWord { Text = "积分余额", X = 53, Y = 541, Width = 56, Height = 14 }] },
+                new OcrLine { Text = "135131", Words = [new OcrWord { Text = "135131", X = 258, Y = 542, Width = 41, Height = 12 }] },
+                new OcrLine { Text = "Buddy加油站", Words = [new OcrWord { Text = "Buddy加油站", X = 53, Y = 453, Width = 81, Height = 14 }] },
+                new OcrLine { Text = "设置", Words = [new OcrWord { Text = "设置", X = 53, Y = 642, Width = 29, Height = 14 }] }
+            ]
+        };
+        if (!TryFindBalanceRefreshPoint(refreshGlyphMissingOcr, new Config(), out var inferredRefreshPoint) ||
+            inferredRefreshPoint.X is < 240 or > 250 || inferredRefreshPoint.Y is < 540 or > 556)
+            throw new InvalidOperationException("OCR 漏掉刷新符号时，必须从积分余额标签与同行数字动态定位刷新图标。");
         if (!ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.NoAction, 0) ||
             ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.NoAction, 1) ||
             ShouldUseDirectBuddyRouteAfterFirstScan(ClaimRouteExecution.Failed, 0))
