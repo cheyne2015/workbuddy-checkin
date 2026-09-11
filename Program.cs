@@ -1363,13 +1363,21 @@ internal static class Program
     private static bool TryRefreshAndConfirmPersonalCenterBalance(
         IntPtr window, Config config, OcrSnapshot openingOcr, out MenuEvidence evidence)
     {
-        if (!TryFindBalanceRefreshPoint(openingOcr, config, out var refreshPoint))
+        if (!TryFindBalanceRefreshPointWithRetry(openingOcr, config, () =>
+            {
+                Thread.Sleep(500);
+                using var retryImage = CaptureWindow(window);
+                return retryImage is null ? null : ReadClaimRegionOcr(retryImage);
+            }, out var refreshPoint, out var refreshReadsUsed))
         {
             evidence = MenuEvidence.Empty;
-            Log("个人中心已打开，但未识别到积分余额与数字之间的刷新图标；拒绝猜测点击。");
+            Log($"个人中心已打开，但连续 {refreshReadsUsed} 帧未识别到积分余额刷新图标；拒绝猜测点击。");
             SaveFailureDiagnostic(window, config, "balance-refresh-not-found", "未识别到积分余额刷新图标");
             return false;
         }
+
+        if (refreshReadsUsed > 1)
+            Log($"首次漏读积分余额刷新图标；在同一次领取尝试内第 {refreshReadsUsed} 帧重新识别成功。");
 
         Log($"识别并点击积分余额刷新图标：({refreshPoint.X},{refreshPoint.Y})。");
         ClickWindowPoint(window, refreshPoint.X, refreshPoint.Y);
@@ -2118,6 +2126,27 @@ internal static class Program
         return false;
     }
 
+    private const int BalanceRefreshDetectionFrameLimit = 3;
+
+    private static bool TryFindBalanceRefreshPointWithRetry(
+        OcrSnapshot openingSnapshot, Config config, Func<OcrSnapshot?> readNextSnapshot,
+        out Point point, out int readsUsed)
+    {
+        OcrSnapshot? snapshot = openingSnapshot;
+        for (int read = 1; read <= BalanceRefreshDetectionFrameLimit; read++)
+        {
+            readsUsed = read;
+            if (snapshot is not null && TryFindBalanceRefreshPoint(snapshot, config, out point))
+                return true;
+            if (read < BalanceRefreshDetectionFrameLimit)
+                snapshot = readNextSnapshot();
+        }
+
+        readsUsed = BalanceRefreshDetectionFrameLimit;
+        point = default;
+        return false;
+    }
+
     private static bool TryInferBalanceRefreshPointFromNumericRow(
         BalanceValueRow row, BalanceLabel label, out Point point)
     {
@@ -2418,8 +2447,13 @@ internal static class Program
         // three observed row heights so the crop includes unseen suffix glyphs such
         // as ".69" without depending on a fixed window coordinate.
         int rowHeight = Math.Max(1, row.Bounds.Bottom - row.Bounds.Top);
-        int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + rowHeight * 3);
-        int sourceBottom = Math.Min(bitmap.Height, Math.Max(label.Bounds.Bottom, row.Bounds.Bottom) + 8);
+        // Windows OCR can change the leading digit when the resized crop ends exactly
+        // on the final glyph/baseline (for example, visible 517.95 became 317.95).
+        // Preserve a small, row-height-derived context margin on the right and bottom.
+        int contextPadding = Math.Max(4, rowHeight / 3);
+        int sourceRight = Math.Min(bitmap.Width, row.Bounds.Right + rowHeight * 3 + contextPadding);
+        int sourceBottom = Math.Min(bitmap.Height,
+            Math.Max(label.Bounds.Bottom, row.Bounds.Bottom) + 8 + contextPadding);
         using var crop = CreateScaledCrop(bitmap,
             new Rectangle(sourceLeft, sourceTop, Math.Max(1, sourceRight - sourceLeft),
                 Math.Max(1, sourceBottom - sourceTop)), 8);
@@ -4180,6 +4214,13 @@ internal static class Program
         };
         if (TryFindBalanceRefreshPoint(noRefreshOcr, selfTestConfig, out _))
             throw new InvalidOperationException("没有明确刷新图标时不得猜测点击坐标。");
+        int refreshRereads = 0;
+        if (!TryFindBalanceRefreshPointWithRetry(noRefreshOcr, selfTestConfig,
+                () => { refreshRereads++; return refreshOcr; },
+                out var retriedRefreshPoint, out var refreshReadsUsed) ||
+            refreshRereads != 1 || refreshReadsUsed != 2 ||
+            retriedRefreshPoint.X != 175 || retriedRefreshPoint.Y != 358)
+            throw new InvalidOperationException("首次漏读刷新图标时必须在同一次领取尝试内重读，不得直接消耗领取次数。");
         var wideBalanceWithoutRefreshOcr = new OcrSnapshot
         {
             Lines =
