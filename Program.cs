@@ -758,16 +758,16 @@ internal static class Program
             if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
                 throw new FileNotFoundException("请提供可读取的 WorkBuddy 截图路径。", imagePath);
             using var bitmap = new Bitmap(imagePath);
-            var directOcr = ReadClaimOcr(bitmap);
+            var directOcr = ReadClaimRegionOcr(bitmap);
             var action = FindImmediateClaimAction(bitmap, directOcr, LoadConfig())
-                         ?? throw new InvalidOperationException("整窗多路 OCR 未识别到完整的“立即领取”。");
+                         ?? throw new InvalidOperationException("左下固定区域多路 OCR 未识别到“立即领取”。");
             Console.WriteLine($"立即领取={action.Text}; X={action.CenterX}; Y={action.CenterY}");
-            Log($"立即领取整窗 OCR 验证通过：文本={action.Text}，位置=({action.CenterX},{action.CenterY})。");
+            Log($"立即领取左下固定区域 OCR 验证通过：文本={action.Text}，位置=({action.CenterX},{action.CenterY})。");
             return 0;
         }
         catch (Exception ex)
         {
-            Log("立即领取整窗 OCR 验证失败: " + ex);
+            Log("立即领取左下固定区域 OCR 验证失败: " + ex);
             return 1;
         }
     }
@@ -780,7 +780,7 @@ internal static class Program
                 throw new FileNotFoundException("请提供可读取的个人中心截图路径。", imagePath);
             using var bitmap = new Bitmap(imagePath);
             var config = LoadConfig();
-            var ocr = ReadClaimOcr(bitmap);
+            var ocr = ReadClaimRegionOcr(bitmap);
             var evidence = ReadMenuEvidence(bitmap, ocr, config);
             if (!evidence.IsPersonalCenter || !HasConfirmedNumericBalance(evidence.Balance))
                 throw new InvalidOperationException("未同时识别到个人中心组合锚点和明确数字余额。");
@@ -927,7 +927,7 @@ internal static class Program
             return false;
         }
 
-        Log("个人中心已关闭；开始第二次整窗领取文字扫描。");
+        Log("个人中心已关闭；开始第二次左下固定区域领取文字扫描。");
         var secondCandidates = new HashSet<string>(StringComparer.Ordinal);
         var secondRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, secondCandidates,
             out result, out outcomeKind, out afterNotificationBalance);
@@ -941,7 +941,7 @@ internal static class Program
             return false;
         }
 
-        Log($"重新打开个人中心并读取积分余额 {reopenedEvidence.Balance.RawText}；立即执行第三次整窗扫描。");
+        Log($"重新打开个人中心并读取积分余额 {reopenedEvidence.Balance.RawText}；立即执行第三次左下固定区域扫描。");
         var thirdCandidates = new HashSet<string>(StringComparer.Ordinal);
         var thirdRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, thirdCandidates,
             out result, out outcomeKind, out afterNotificationBalance);
@@ -960,7 +960,7 @@ internal static class Program
                 result = "进入 Buddy加油站前未能重新确认个人中心和明确数字余额。";
                 return false;
             }
-            Log($"进入 Buddy加油站前第 {recoveryScan}/3 次重新确认积分余额 {buddyMenuEvidence.Balance.RawText}；立即执行整窗扫描。");
+            Log($"进入 Buddy加油站前第 {recoveryScan}/3 次重新确认积分余额 {buddyMenuEvidence.Balance.RawText}；立即执行左下固定区域扫描。");
             int candidatesBeforeScan = thirdCandidates.Count;
             var recoveryRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, thirdCandidates,
                 out result, out outcomeKind, out afterNotificationBalance);
@@ -1007,7 +1007,7 @@ internal static class Program
         IntPtr window, Config config, BalanceReading beforeBalance, HashSet<string> triedCandidateIds,
         out string result, out ClaimOutcomeKind outcomeKind, out BalanceReading? afterNotificationBalance)
     {
-        result = "当前整窗未识别到领取动作或已领取状态";
+        result = "当前左下固定区域未识别到领取动作或已领取状态";
         outcomeKind = ClaimOutcomeKind.Failed;
         afterNotificationBalance = null;
         using var currentImage = CaptureWindow(window);
@@ -1017,7 +1017,7 @@ internal static class Program
             return ClaimRouteExecution.Failed;
         }
 
-        var currentOcr = ReadClaimOcr(currentImage);
+        var currentOcr = ReadClaimRegionOcr(currentImage);
         var actionScan = ScanWindowActions(currentImage, currentOcr, config);
         var immediate = actionScan.Immediate;
         bool stableClaimedText = immediate is null && HasClaimSuccessText(currentOcr) &&
@@ -1111,7 +1111,7 @@ internal static class Program
             return false;
         }
 
-        var ocr = ReadClaimOcr(image);
+        var ocr = ReadClaimRegionOcr(image);
         var buddy = FindBuddyFuelStationAction(ocr, config);
         if (FindBalanceLabel(ocr) is null || buddy is null)
         {
@@ -1130,7 +1130,7 @@ internal static class Program
     {
         Thread.Sleep(OcrPollingIntervalMilliseconds);
         using var secondImage = CaptureWindow(window);
-        return secondImage is not null && HasClaimSuccessText(ReadClaimOcr(secondImage));
+        return secondImage is not null && HasClaimSuccessText(ReadClaimRegionOcr(secondImage));
     }
 
     private static bool EnsurePersonalCenterClosedForSecondScan(IntPtr window, Config config)
@@ -1143,14 +1143,14 @@ internal static class Program
         {
             if (before is not null)
             {
-                var beforeOcr = ReadClaimOcr(before);
+                var beforeOcr = ReadClaimRegionOcr(before);
                 if (FindBalanceLabel(beforeOcr) is null)
                 {
                     Thread.Sleep(500);
                     using var confirmation = CaptureWindow(window);
-                    if (confirmation is not null && FindBalanceLabel(ReadClaimOcr(confirmation)) is null)
+                    if (confirmation is not null && FindBalanceLabel(ReadClaimRegionOcr(confirmation)) is null)
                     {
-                        Log("签到入口点击后个人中心已关闭；无需再次点击头像，直接开始下一次整窗扫描。");
+                        Log("签到入口点击后个人中心已关闭；无需再次点击头像，直接开始下一次左下固定区域扫描。");
                         return true;
                     }
                 }
@@ -1161,7 +1161,7 @@ internal static class Program
                 }
             }
         }
-        Log($"首次整窗扫描无领取动作；再次点击个人中心一次以关闭面板：({profileX},{profileY})。");
+        Log($"首次左下固定区域扫描无领取动作；再次点击个人中心一次以关闭面板：({profileX},{profileY})。");
         ClickWindowPoint(window, profileX, profileY);
 
         int consecutiveAbsentFrames = 0;
@@ -1171,7 +1171,7 @@ internal static class Program
             Thread.Sleep(500);
             using var image = CaptureWindow(window);
             if (image is null) continue;
-            var ocr = ReadClaimOcr(image);
+            var ocr = ReadClaimRegionOcr(image);
             consecutiveAbsentFrames = FindBalanceLabel(ocr) is null ? consecutiveAbsentFrames + 1 : 0;
             if (consecutiveAbsentFrames >= 2) return true;
         }
@@ -1204,7 +1204,7 @@ internal static class Program
             return false;
         }
         var beforeClickSignature = CreateUiFrameSignature(beforeClickImage);
-        bool successTextWasPresentBeforeClick = HasClaimSuccessText(ReadClaimOcr(beforeClickImage));
+        bool successTextWasPresentBeforeClick = HasClaimSuccessText(ReadClaimRegionOcr(beforeClickImage));
         Log($"OCR 识别最终立即领取：文本={immediate.Text}，位置=({immediate.CenterX},{immediate.CenterY})，点击前积分余额={beforeBalance.RawText}。");
         ClickWindowPoint(window, immediate.CenterX, immediate.CenterY);
         var verification = WaitForClaimResult(window, config, beforeBalance, beforeClickSignature,
@@ -1243,7 +1243,7 @@ internal static class Program
             using var image = CaptureWindow(window);
             if (image is not null)
             {
-                var ocr = ReadClaimOcr(image);
+                var ocr = ReadClaimRegionOcr(image);
                 var found = FindImmediateClaimAction(image, ocr, config);
                 // “立即领取” was absent before the entry click, so its first appearance
                 // is itself a concrete post-click state change even if the coarse visual
@@ -1297,7 +1297,7 @@ internal static class Program
                     continue;
                 }
 
-                var currentOcr = ReadClaimOcr(current);
+                var currentOcr = ReadClaimRegionOcr(current);
                 evidence = ReadMenuEvidence(current, currentOcr, config);
                 lastCapture?.Dispose();
                 lastCapture = (Bitmap)current.Clone();
@@ -1380,7 +1380,7 @@ internal static class Program
             Thread.Sleep(OcrPollingIntervalMilliseconds);
             using var image = CaptureWindow(window);
             if (image is null) continue;
-            var ocr = ReadClaimOcr(image);
+            var ocr = ReadClaimRegionOcr(image);
             evidence = ReadMenuEvidence(image, ocr, config);
             if (ShouldReopenPersonalCenterAfterRefresh(evidence, ocr) && reopenAttemptsAfterRefresh < 3)
             {
@@ -1652,7 +1652,7 @@ internal static class Program
                     observedUiTransition = true;
                     Log("已观察到立即领取点击后的界面变化。");
                 }
-                bool hasClaimedText = HasClaimSuccessText(ReadClaimOcr(image));
+                bool hasClaimedText = HasClaimSuccessText(ReadClaimRegionOcr(image));
                 bool newlyVisibleClaimedText = hasClaimedText &&
                                                (observedUiTransition || !successTextWasPresentBeforeClick);
                 consecutiveClaimedFrames = newlyVisibleClaimedText ? consecutiveClaimedFrames + 1 : 0;
@@ -1798,7 +1798,7 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
             throw new FileNotFoundException("请提供可读取的截图路径。", imagePath);
         using var bitmap = new Bitmap(imagePath);
-        var ocr = ReadOcr(bitmap);
+        var ocr = ReadClaimRegionOcr(bitmap);
         var evidence = ReadMenuEvidence(bitmap, ocr, config);
         var actionScan = ScanWindowActions(bitmap, ocr, config);
         var immediate = actionScan.Immediate;
@@ -1961,6 +1961,29 @@ internal static class Program
         return snapshot;
     }
 
+    private const int BottomLeftClaimRegionWidth = 366;
+    private const int BottomLeftClaimRegionHeight = 647;
+
+    private static Rectangle GetBottomLeftClaimRegion(int width, int height)
+    {
+        int boundedWidth = Math.Max(1, Math.Min(width, BottomLeftClaimRegionWidth));
+        int boundedHeight = Math.Max(1, Math.Min(height, BottomLeftClaimRegionHeight));
+        return new Rectangle(0, Math.Max(0, height - boundedHeight), boundedWidth, boundedHeight);
+    }
+
+    private static OcrSnapshot ReadClaimRegionOcr(Bitmap bitmap)
+    {
+        var region = GetBottomLeftClaimRegion(bitmap.Width, bitmap.Height);
+        using var crop = bitmap.Clone(region, PixelFormat.Format32bppArgb);
+        var snapshot = ReadClaimOcr(crop);
+        foreach (var word in snapshot.Lines.SelectMany(line => line.Words))
+        {
+            word.X += region.Left;
+            word.Y += region.Top;
+        }
+        return snapshot;
+    }
+
     private enum OcrProcessWaitResult { Completed, TerminatedAfterTimeout, StillRunningAfterTimeout }
 
     private static OcrProcessWaitResult WaitForOcrProcess(Process process, TimeSpan timeout)
@@ -1973,7 +1996,7 @@ internal static class Program
 
     private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, Config config)
     {
-        return ReadMenuEvidence(bitmap, ReadClaimOcr(bitmap), config);
+        return ReadMenuEvidence(bitmap, ReadClaimRegionOcr(bitmap), config);
     }
 
     private static MenuEvidence ReadMenuEvidence(Bitmap bitmap, OcrSnapshot ocr, Config config)
@@ -2640,10 +2663,10 @@ internal static class Program
         return "V:" + Convert.ToHexString(bytes);
     }
 
-    private const int FullWindowActionOcrScale = 2;
-    private const int FullWindowActionOcrColumns = 3;
-    private const int FullWindowActionOcrRows = 2;
-    private const int FullWindowActionOcrOverlapPixels = 40;
+    private const int ClaimRegionActionOcrScale = 2;
+    private const int ClaimRegionActionOcrColumns = 1;
+    private const int ClaimRegionActionOcrRows = 4;
+    private const int ClaimRegionActionOcrOverlapPixels = 40;
 
     private static ClaimAction? FindImmediateClaimAction(Bitmap bitmap, OcrSnapshot directOcr, Config config)
         => ScanWindowActions(bitmap, directOcr, config).Immediate;
@@ -2664,10 +2687,6 @@ internal static class Program
             FindCheckInActions(directOcr, config),
             FindCheckInActions(raw, bitmap, config));
 
-        if (!HasPotentialImmediateClaimText(directOcr) &&
-            !raw.Any(tile => HasPotentialImmediateClaimText(tile.Snapshot)))
-            return new WindowActionScan(null, checkInActions);
-
         var enhanced = ReadWindowActionTiles(bitmap,
             FullWindowOcrTreatment.Grayscale, FullWindowOcrTreatment.Inverted);
         var enhancedAction = FindImmediateClaimAction(enhanced, bitmap, config);
@@ -2682,22 +2701,23 @@ internal static class Program
     {
         var images = new List<Bitmap>();
         var mappings = new List<(Rectangle Source, FullWindowOcrTreatment Treatment)>();
+        var claimRegion = GetBottomLeftClaimRegion(bitmap.Width, bitmap.Height);
         try
         {
             foreach (var treatment in treatments)
-            for (int row = 0; row < FullWindowActionOcrRows; row++)
-            for (int column = 0; column < FullWindowActionOcrColumns; column++)
+            for (int row = 0; row < ClaimRegionActionOcrRows; row++)
+            for (int column = 0; column < ClaimRegionActionOcrColumns; column++)
             {
-                int baseLeft = column * bitmap.Width / FullWindowActionOcrColumns;
-                int baseRight = (column + 1) * bitmap.Width / FullWindowActionOcrColumns;
-                int baseTop = row * bitmap.Height / FullWindowActionOcrRows;
-                int baseBottom = (row + 1) * bitmap.Height / FullWindowActionOcrRows;
+                int baseLeft = claimRegion.Left + column * claimRegion.Width / ClaimRegionActionOcrColumns;
+                int baseRight = claimRegion.Left + (column + 1) * claimRegion.Width / ClaimRegionActionOcrColumns;
+                int baseTop = claimRegion.Top + row * claimRegion.Height / ClaimRegionActionOcrRows;
+                int baseBottom = claimRegion.Top + (row + 1) * claimRegion.Height / ClaimRegionActionOcrRows;
                 var source = Rectangle.FromLTRB(
-                    Math.Max(0, baseLeft - FullWindowActionOcrOverlapPixels),
-                    Math.Max(0, baseTop - FullWindowActionOcrOverlapPixels),
-                    Math.Min(bitmap.Width, baseRight + FullWindowActionOcrOverlapPixels),
-                    Math.Min(bitmap.Height, baseBottom + FullWindowActionOcrOverlapPixels));
-                var image = CreateScaledCrop(bitmap, source, FullWindowActionOcrScale);
+                    Math.Max(claimRegion.Left, baseLeft - ClaimRegionActionOcrOverlapPixels),
+                    Math.Max(claimRegion.Top, baseTop - ClaimRegionActionOcrOverlapPixels),
+                    Math.Min(claimRegion.Right, baseRight + ClaimRegionActionOcrOverlapPixels),
+                    Math.Min(claimRegion.Bottom, baseBottom + ClaimRegionActionOcrOverlapPixels));
+                var image = CreateScaledCrop(bitmap, source, ClaimRegionActionOcrScale);
                 if (treatment == FullWindowOcrTreatment.Grayscale) ConvertToGrayscale(image);
                 else if (treatment == FullWindowOcrTreatment.Inverted) NormalizeDarkThemeOcr(image);
                 images.Add(image);
@@ -2707,7 +2727,7 @@ internal static class Program
             var snapshots = ReadOcrBatch(images.Select(image => (image, "zh-Hans")).ToArray());
             return snapshots.Select((snapshot, index) =>
                     new WindowOcrTile(snapshot, mappings[index].Source,
-                        FullWindowActionOcrScale, mappings[index].Treatment))
+                        ClaimRegionActionOcrScale, mappings[index].Treatment))
                 .ToArray();
         }
         finally
@@ -2730,7 +2750,7 @@ internal static class Program
             if (action is null) continue;
             var mapped = MapScaledActionToWindow(action, originalWindow, config,
                 tile.Scale, tile.Source.Left, tile.Source.Top);
-            Log($"整窗分块 {tile.Treatment} OCR 识别立即领取：文本={action.Text}，位置=({mapped.CenterX},{mapped.CenterY})。");
+            Log($"左下固定区域分块 {tile.Treatment} OCR 识别立即领取：文本={action.Text}，位置=({mapped.CenterX},{mapped.CenterY})。");
             return mapped;
         }
         return null;
@@ -2750,7 +2770,7 @@ internal static class Program
     private static ClaimAction? FindImmediateClaimAction(OcrSnapshot snapshot, Config config)
     {
         return snapshot.Lines
-            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeExactActionText(line.Text)))
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line), Normalized: NormalizeImmediateClaimText(line.Text)))
             .Where(item => item.Line.Words.Count > 0)
             .Select(item => (item.Line, item.Bounds, item.Normalized,
                 Keyword: FindExactImmediateKeyword(item.Normalized)))
@@ -2763,18 +2783,9 @@ internal static class Program
     private static string? FindExactImmediateKeyword(string text)
     {
         const string expected = "立即领取";
-        return StringComparer.Ordinal.Equals(text, expected) ? expected : null;
-    }
-
-    private static bool HasPotentialImmediateClaimText(OcrSnapshot snapshot)
-    {
-        const string expected = "立即领取";
-        return snapshot.Lines.Any(line =>
-        {
-            var text = NormalizeExactActionText(line.Text);
-            return text.Length == expected.Length &&
-                   text.Where((character, index) => character == expected[index]).Count() >= 2;
-        });
+        if (text.Length != expected.Length) return null;
+        int positionalMatches = text.Where((character, index) => character == expected[index]).Count();
+        return positionalMatches >= 2 ? expected : null;
     }
 
     private static ClaimAction? FindBuddyFuelStationAction(OcrSnapshot snapshot, Config config)
@@ -3013,6 +3024,12 @@ internal static class Program
 
     private static string NormalizeExactActionText(string text) =>
         Regex.Replace(text, "[\\s\\p{P}\\p{S}]", string.Empty);
+
+    private static string NormalizeImmediateClaimText(string text)
+    {
+        var normalized = NormalizeExactActionText(text);
+        return StringComparer.Ordinal.Equals(normalized, "立即領取") ? "立即领取" : normalized;
+    }
 
     private static bool IsPersonalMenuCard(BuddyCard card, int windowHeight) =>
         windowHeight > 0 && card.HeaderTop < windowHeight * 0.60;
@@ -3614,7 +3631,7 @@ internal static class Program
 
             using (var initialImage = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。"))
             {
-                var initialOcr = ReadClaimOcr(initialImage);
+                var initialOcr = ReadClaimRegionOcr(initialImage);
                 var initialScan = ScanWindowActions(initialImage, initialOcr, config);
                 if (initialScan.Immediate is not null || HasClaimSuccessText(initialOcr) || initialScan.CheckInActions.Count > 0)
                 {
@@ -3634,7 +3651,7 @@ internal static class Program
                 using var image = CaptureWindow(window);
                 if (image is not null)
                 {
-                    var ocr = ReadClaimOcr(image);
+                    var ocr = ReadClaimRegionOcr(image);
                     var scan = ScanWindowActions(image, ocr, config);
                     if (scan.Immediate is not null || scan.CheckInActions.Count > 0)
                     {
@@ -3999,6 +4016,12 @@ internal static class Program
             throw new InvalidOperationException("OCR 轮询间隔必须足够快，同时保留界面重绘余量。");
 
         var selfTestConfig = new Config();
+        var standardClaimRegion = GetBottomLeftClaimRegion(1513, 967);
+        if (standardClaimRegion != new Rectangle(0, 320, 366, 647))
+            throw new InvalidOperationException($"左下 OCR 区域必须固定为 366x647 并锚定窗口左下角，实际={standardClaimRegion}。");
+        var compactClaimRegion = GetBottomLeftClaimRegion(300, 500);
+        if (compactClaimRegion != new Rectangle(0, 0, 300, 500))
+            throw new InvalidOperationException($"窗口小于固定区域时必须只裁取可用客户区，实际={compactClaimRegion}。");
         if (NormalizeExactActionText("立 即，领 取！") != "立即领取" ||
             NormalizeExactActionText("立 卽 领 取") == "立即领取")
             throw new InvalidOperationException("动作文字规范化只能移除空格和标点。");
@@ -4008,18 +4031,24 @@ internal static class Program
         };
         if (FindImmediateClaimAction(exactImmediateOcr, selfTestConfig) is null)
             throw new InvalidOperationException("完整四字“立即领取”必须在清理空格和标点后精确命中。");
-        foreach (var approximateImmediateText in new[] { "立即領取", "立卽领取", "立即领职", "立即领娶", "立刻领取", "立刻领娶" })
+        var traditionalGlyphImmediateOcr = new OcrSnapshot
         {
-            var approximateOcr = new OcrSnapshot
+            Lines = [new OcrLine { Text = "立即領取", Words = [new OcrWord { Text = "立即領取", X = 60, Y = 290, Width = 74, Height = 22 }] }]
+        };
+        if (FindImmediateClaimAction(traditionalGlyphImmediateOcr, selfTestConfig) is null)
+            throw new InvalidOperationException("Windows OCR 将简体领稳定转录为繁体領时，完整四字必须严格等价命中。");
+        foreach (var positionalImmediateText in new[] { "立卽领取", "立即领职", "立即领娶", "立刻领取", "立刻领娶" })
+        {
+            var positionalOcr = new OcrSnapshot
             {
-                Lines = [new OcrLine { Text = approximateImmediateText, Words = [new OcrWord { Text = approximateImmediateText, X = 60, Y = 290, Width = 74, Height = 22 }] }]
+                Lines = [new OcrLine { Text = positionalImmediateText, Words = [new OcrWord { Text = positionalImmediateText, X = 60, Y = 290, Width = 74, Height = 22 }] }]
             };
-            if (FindImmediateClaimAction(approximateOcr, selfTestConfig) is not null)
-                throw new InvalidOperationException($"非完整精确四字不得被当成立即领取：{approximateImmediateText}。");
+            if (FindImmediateClaimAction(positionalOcr, selfTestConfig) is null)
+                throw new InvalidOperationException($"四字 OCR 中至少两个字位置一致时必须命中立即领取：{positionalImmediateText}。");
         }
         foreach (var unrelatedText in new[]
                  {
-                     "领取说明", "今日可领100积分", "升级套餐", "立即取", "X立即领取",
+                     "领取说明", "今日可领100积分", "升级套餐", "立即取", "X立即领取", "立刻获职",
                      // 四个字中即使包含目标字符，只要不在“立即领取”的对应位置，也不能命中。
                      "领立取即", "马上领娶"
                  })
@@ -4189,7 +4218,7 @@ internal static class Program
             SelectClaimRoute(hasImmediate: false, hasStableClaimedText: true, [routeCheckIn]) != ClaimRouteKind.AlreadyClaimed ||
             SelectClaimRoute(hasImmediate: false, hasStableClaimedText: false, [routeCheckIn]) != ClaimRouteKind.CheckIn ||
             SelectClaimRoute(hasImmediate: false, hasStableClaimedText: false, []) != ClaimRouteKind.None)
-            throw new InvalidOperationException("整窗领取路由必须按立即领取、已领状态、签到入口、无动作排序。");
+            throw new InvalidOperationException("左下固定区域领取路由必须按立即领取、已领状态、签到入口、无动作排序。");
         var labelOnlyOcr = new OcrSnapshot
         {
             Lines =
