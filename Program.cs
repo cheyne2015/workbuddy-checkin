@@ -898,7 +898,7 @@ internal static class Program
         beforeNotificationBalance = beforeBalance;
         var firstCandidates = new HashSet<string>(StringComparer.Ordinal);
         var firstRoute = ExecuteClaimRouteInCurrentWindow(window, config, beforeBalance, firstCandidates,
-            out result, out outcomeKind, out afterNotificationBalance);
+            out result, out outcomeKind, out afterNotificationBalance, ActionOcrDepth.Fast);
         if (firstRoute == ClaimRouteExecution.Succeeded) return true;
         if (firstRoute == ClaimRouteExecution.Failed) return false;
 
@@ -1005,7 +1005,8 @@ internal static class Program
 
     private static ClaimRouteExecution ExecuteClaimRouteInCurrentWindow(
         IntPtr window, Config config, BalanceReading beforeBalance, HashSet<string> triedCandidateIds,
-        out string result, out ClaimOutcomeKind outcomeKind, out BalanceReading? afterNotificationBalance)
+        out string result, out ClaimOutcomeKind outcomeKind, out BalanceReading? afterNotificationBalance,
+        ActionOcrDepth actionOcrDepth = ActionOcrDepth.Enhanced)
     {
         result = "当前左下固定区域未识别到领取动作或已领取状态";
         outcomeKind = ClaimOutcomeKind.Failed;
@@ -1018,7 +1019,7 @@ internal static class Program
         }
 
         var currentOcr = ReadClaimRegionOcr(currentImage);
-        var actionScan = ScanWindowActions(currentImage, currentOcr, config);
+        var actionScan = ScanWindowActions(currentImage, currentOcr, config, actionOcrDepth);
         var immediate = actionScan.Immediate;
         bool stableClaimedText = immediate is null && HasClaimSuccessText(currentOcr) &&
                                  TryConfirmStableClaimSuccessText(window);
@@ -2668,23 +2669,34 @@ internal static class Program
     private const int ClaimRegionActionOcrRows = 4;
     private const int ClaimRegionActionOcrOverlapPixels = 40;
 
+    private enum ActionOcrDepth { Fast, Enhanced }
+
+    private static bool ShouldRunActionOcrTiles(ActionOcrDepth depth) =>
+        depth == ActionOcrDepth.Enhanced;
+
     private static ClaimAction? FindImmediateClaimAction(Bitmap bitmap, OcrSnapshot directOcr, Config config)
         => ScanWindowActions(bitmap, directOcr, config).Immediate;
 
     private sealed record WindowActionScan(
         ClaimAction? Immediate, IReadOnlyList<ClaimAction> CheckInActions);
 
-    private static WindowActionScan ScanWindowActions(Bitmap bitmap, OcrSnapshot directOcr, Config config)
+    private static WindowActionScan ScanWindowActions(
+        Bitmap bitmap, OcrSnapshot directOcr, Config config,
+        ActionOcrDepth actionOcrDepth = ActionOcrDepth.Enhanced)
     {
         var direct = FindImmediateClaimAction(directOcr, config);
         if (direct is not null) return new WindowActionScan(direct, []);
+
+        var directCheckInActions = FindCheckInActions(directOcr, config);
+        if (!ShouldRunActionOcrTiles(actionOcrDepth))
+            return new WindowActionScan(null, directCheckInActions);
 
         var raw = ReadWindowActionTiles(bitmap, FullWindowOcrTreatment.Raw);
         var rawAction = FindImmediateClaimAction(raw, bitmap, config);
         if (rawAction is not null) return new WindowActionScan(rawAction, []);
 
         var checkInActions = MergeCheckInActions(
-            FindCheckInActions(directOcr, config),
+            directCheckInActions,
             FindCheckInActions(raw, bitmap, config));
 
         var enhanced = ReadWindowActionTiles(bitmap,
@@ -3632,7 +3644,7 @@ internal static class Program
             using (var initialImage = CaptureWindow(window) ?? throw new InvalidOperationException("无法捕获个人中心。"))
             {
                 var initialOcr = ReadClaimRegionOcr(initialImage);
-                var initialScan = ScanWindowActions(initialImage, initialOcr, config);
+                var initialScan = ScanWindowActions(initialImage, initialOcr, config, ActionOcrDepth.Fast);
                 if (initialScan.Immediate is not null || HasClaimSuccessText(initialOcr) || initialScan.CheckInActions.Count > 0)
                 {
                     stopwatch.Stop();
@@ -4022,6 +4034,9 @@ internal static class Program
         var compactClaimRegion = GetBottomLeftClaimRegion(300, 500);
         if (compactClaimRegion != new Rectangle(0, 0, 300, 500))
             throw new InvalidOperationException($"窗口小于固定区域时必须只裁取可用客户区，实际={compactClaimRegion}。");
+        if (ShouldRunActionOcrTiles(ActionOcrDepth.Fast) ||
+            !ShouldRunActionOcrTiles(ActionOcrDepth.Enhanced))
+            throw new InvalidOperationException("个人中心快速路径必须只做区域直读，增强路径必须保留原图分块、灰度和反色兜底。");
         if (NormalizeExactActionText("立 即，领 取！") != "立即领取" ||
             NormalizeExactActionText("立 卽 领 取") == "立即领取")
             throw new InvalidOperationException("动作文字规范化只能移除空格和标点。");
