@@ -167,7 +167,7 @@ cd .\release
 - `state.json` 使用原子写入和 `.bak` 备份。两份状态都损坏时，当天安全停止并通知，不会重复领取。
 - 安装的 Windows 任务在登录时启动守护进程；守护异常退出时，任务计划会每分钟最多重启 3 次。
 - 安装、手动测试或安全测试结束时，工具优先请求任务计划恢复守护；只有新守护完成配置加载并主动发出就绪信号后才记录恢复成功，直接启动回退也执行同样确认。
-- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.1.2.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
+- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.1.3.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
 - `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-auto-claim.log` 只保留最近 30 天；`diagnostics\` 仅保留最新 20 份失败诊断。诊断包包含截图、OCR 原文、WorkBuddy 版本、窗口尺寸和 DPI；成功领取不会保留领取截图。
 
 失败通知除余额外，还会包含失败阶段、已执行尝试次数，以及 WorkBuddy 是保留原前台、保留后台最小化，还是由工具启动后关闭。
