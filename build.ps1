@@ -11,6 +11,11 @@ $packagePath = Join-Path $artifactDirectory ($packageName + '.zip')
 $temporaryPackagePath = Join-Path $artifactDirectory ($packageName + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
 $backupPackagePath = Join-Path $artifactDirectory ($packageName + '.' + [Guid]::NewGuid().ToString('N') + '.previous.tmp')
 $rootFiles = @('install.cmd', 'uninstall.cmd', 'README.md', 'QUICKSTART-ZH.txt')
+$documentationFiles = @(
+    'docs\images\tray-icon.png',
+    'docs\images\dashboard-overview.png',
+    'docs\images\dashboard-overview-settings.png'
+)
 $releaseFiles = @(
     'CommunityToolkit.WinUI.Notifications.dll',
     'config.example.json',
@@ -35,6 +40,12 @@ foreach ($file in $rootFiles) {
         throw "Required package file is missing: $source"
     }
 }
+foreach ($file in $documentationFiles) {
+    $source = Join-Path $here $file
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Required documentation image is missing: $source"
+    }
+}
 
 New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
 Add-Type -AssemblyName System.IO.Compression
@@ -45,6 +56,11 @@ try {
         foreach ($file in $rootFiles) {
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $archive, (Join-Path $here $file), "$packageName/$file",
+                [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+        }
+        foreach ($file in $documentationFiles) {
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, (Join-Path $here $file), "$packageName/$($file.Replace('\', '/'))",
                 [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
         foreach ($file in $releaseFiles) {

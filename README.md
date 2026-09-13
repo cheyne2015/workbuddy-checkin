@@ -2,6 +2,18 @@
 
 在 Windows 后台按计划领取 WorkBuddy 积分的本地工具。它复用已经登录的 WorkBuddy 会话，通过个人中心读取“积分余额”并核验结果；不会保存账号密码，也不会上传截图或 OCR 文字。
 
+<p align="center">
+  <img src="docs/images/tray-icon.png" width="64" alt="WorkBuddy 自动领取守护托盘图标">
+</p>
+
+## 界面预览
+
+| 概览 | 设置 |
+| --- | --- |
+| <img src="docs/images/dashboard-overview.png" width="420" alt="WorkBuddy 自动领取守护概览窗口"> | <img src="docs/images/dashboard-overview-settings.png" width="420" alt="WorkBuddy 自动领取守护设置窗口"> |
+
+概览页展示本机最近一次真实执行记录；截图中的 `尝试 5/5` 是升级到 v1.1.5 前的历史结果，不代表新版默认会执行五次。
+
 ## 它会做什么
 
 - 默认每天 `00:00` 尝试领取一次；时间可在 `config.json` 的 `ClaimTime` 中修改。
