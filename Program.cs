@@ -58,6 +58,8 @@ internal static class Program
         if (command == "--verify-immediate-ocr") return RunImmediateOcrVerification(args.Skip(1).FirstOrDefault());
         if (command == "--verify-personal-center-ocr")
             return RunPersonalCenterOcrVerification(args.Skip(1).FirstOrDefault(), args.Skip(2).FirstOrDefault());
+        if (command == "--verify-balance-loading-refresh")
+            return RunBalanceLoadingRefreshVerification(args.Skip(1).FirstOrDefault());
         if (command is "--run-now" or "--manual-test") return RunManualTest();
         if (IsInteractiveNonClaimTest(command)) return RunInteractiveNonClaimTest(command);
 
@@ -803,6 +805,31 @@ internal static class Program
         }
     }
 
+    private static int RunBalanceLoadingRefreshVerification(string? imagePath)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
+                throw new FileNotFoundException("请提供余额正在加载的个人中心截图路径。", imagePath);
+            using var bitmap = new Bitmap(imagePath);
+            var config = LoadConfig();
+            var ocr = ReadClaimRegionOcr(bitmap);
+            if (!LooksLikePersonalCenterShell(ocr))
+                throw new InvalidOperationException("未识别到个人中心菜单外壳。");
+            if (!IsBalanceLoadingState(ocr, config))
+                throw new InvalidOperationException("未识别到积分余额同行的获取中状态。");
+            if (!TryFindBalanceRefreshPoint(ocr, config, out var refreshPoint))
+                throw new InvalidOperationException("余额加载状态下未识别到刷新图标。");
+            Console.WriteLine($"个人中心=true; 余额加载中=true; 刷新X={refreshPoint.X}; 刷新Y={refreshPoint.Y}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Log("余额加载状态刷新图标验证失败: " + ex);
+            return 1;
+        }
+    }
+
     private static bool ShouldTreatWorkBuddyAsToolLaunched(bool hadVisibleWindow, bool hadExistingProcess) =>
         !hadVisibleWindow && !hadExistingProcess;
 
@@ -1019,10 +1046,19 @@ internal static class Program
         }
 
         var currentOcr = ReadClaimRegionOcr(currentImage);
-        var actionScan = ScanWindowActions(currentImage, currentOcr, config, actionOcrDepth);
-        var immediate = actionScan.Immediate;
-        bool stableClaimedText = immediate is null && HasClaimSuccessText(currentOcr) &&
+        // The normal OCR frame is enough for the common “already claimed” path.
+        // Preserve immediate-claim priority in that same frame, but do not launch
+        // the expensive enhanced tile/gray/invert OCR before confirming a visible
+        // claimed state. Enhanced OCR remains the fallback when neither is present.
+        var directImmediate = FindImmediateClaimAction(currentOcr, config);
+        bool stableClaimedText = directImmediate is null && HasClaimSuccessText(currentOcr) &&
                                  TryConfirmStableClaimSuccessText(window);
+        var actionScan = directImmediate is not null
+            ? new WindowActionScan(directImmediate, [])
+            : stableClaimedText
+                ? new WindowActionScan(null, [])
+                : ScanWindowActions(currentImage, currentOcr, config, actionOcrDepth);
+        var immediate = actionScan.Immediate;
         var checkInActions = immediate is null && !stableClaimedText
             ? actionScan.CheckInActions
             : [];
@@ -1308,6 +1344,12 @@ internal static class Program
 
                 if (LooksLikePersonalCenterShell(currentOcr))
                 {
+                    if (IsBalanceLoadingState(currentOcr, config) ||
+                        TryFindBalanceRefreshPoint(currentOcr, config, out _))
+                    {
+                        Log("个人中心余额尚未形成稳定数字，但已直接识别到同行刷新图标；在本次尝试内点击并等待，不消耗下一次尝试。");
+                        return TryRefreshAndConfirmPersonalCenterBalance(window, config, currentOcr, out evidence);
+                    }
                     personalCenterShellWaitUntil ??=
                         DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
                     if (DateTime.UtcNow < personalCenterShellWaitUntil.Value)
@@ -1383,7 +1425,8 @@ internal static class Program
         ClickWindowPoint(window, refreshPoint.X, refreshPoint.Y);
         var balanceFrames = new List<BalanceReading?>();
         int reopenAttemptsAfterRefresh = 0;
-        var until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
+        int balanceReadyTimeoutSeconds = GetBalanceReadyTimeoutSeconds(openingOcr, config);
+        var until = DateTime.UtcNow.AddSeconds(balanceReadyTimeoutSeconds);
         do
         {
             Thread.Sleep(OcrPollingIntervalMilliseconds);
@@ -1403,7 +1446,7 @@ internal static class Program
                     Log($"刷新后个人中心面板意外消失；重新点击个人中心第 {reopenAttemptsAfterRefresh}/3 次：({entryPoint.X},{entryPoint.Y})。");
                     ClickWindowPoint(window, entryPoint.X, entryPoint.Y);
                     balanceFrames.Clear();
-                    until = DateTime.UtcNow.AddSeconds(config.CardReadyTimeoutSeconds);
+                    until = DateTime.UtcNow.AddSeconds(balanceReadyTimeoutSeconds);
                     Thread.Sleep(1_000);
                     continue;
                 }
@@ -2030,6 +2073,33 @@ internal static class Program
             lines.Any(line => line.Contains(anchor, StringComparison.Ordinal))) >= 2;
     }
 
+    private static bool IsBalanceLoadingState(OcrSnapshot snapshot, Config config)
+    {
+        var label = FindBalanceLabel(snapshot);
+        return label is not null && TryFindBalanceLoadingRow(snapshot, label, config, out _);
+    }
+
+    private static int GetBalanceReadyTimeoutSeconds(OcrSnapshot snapshot, Config config) =>
+        IsBalanceLoadingState(snapshot, config) || !HasConfirmedNumericBalance(TryReadBalance(snapshot, config))
+            ? Math.Max(config.CardReadyTimeoutSeconds, 90)
+            : config.CardReadyTimeoutSeconds;
+
+    private static bool TryFindBalanceLoadingRow(
+        OcrSnapshot snapshot, BalanceLabel label, Config config, out OcrLine loadingRow)
+    {
+        loadingRow = snapshot.Lines
+            .Where(line => !ReferenceEquals(line, label.Line) && line.Words.Count > 0 &&
+                           NormalizeOcrText(line.Text).Contains("获取", StringComparison.Ordinal))
+            .Select(line => (Line: line, Bounds: GetOcrBounds(line)))
+            .Where(item => item.Bounds.Left >= label.Bounds.Right - 12 &&
+                           item.Bounds.Left <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
+                           Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY) <= config.BalanceValueSameRowTolerance)
+            .OrderBy(item => Math.Abs(item.Bounds.CenterY - label.Bounds.CenterY))
+            .Select(item => item.Line)
+            .FirstOrDefault()!;
+        return loadingRow is not null;
+    }
+
     private static bool IsConfirmedPersonalCenterMenu(
         OcrSnapshot snapshot, BalanceReading? balance, Config config)
     {
@@ -2070,6 +2140,53 @@ internal static class Program
         {
             point = default;
             return false;
+        }
+
+        if (LooksLikePersonalCenterShell(snapshot))
+        {
+            var standaloneRefresh = snapshot.Lines.SelectMany(line => line.Words)
+                .Where(word => word.X >= label.Bounds.Right + 40 &&
+                               word.X <= label.Bounds.Right + config.BalanceValueDirectRightPixels &&
+                               Math.Abs((word.Y + word.Height / 2) - label.Bounds.CenterY) <= config.BalanceValueSameRowTolerance &&
+                               word.Width is >= 6 and <= 24 && word.Height is >= 6 and <= 24)
+                .Where(word => word.Text.Trim() is "0" or "O" or "o" or "Q" or "q" or "C" or "c")
+                .OrderBy(word => word.X)
+                .FirstOrDefault();
+            if (standaloneRefresh is not null)
+            {
+                point = new Point(standaloneRefresh.X + standaloneRefresh.Width / 2,
+                    standaloneRefresh.Y + standaloneRefresh.Height / 2);
+                return true;
+            }
+        }
+
+        // At midnight WorkBuddy can render the exact balance row as
+        // “refresh glyph + 获取中” for over 30 seconds. The glyph is still direct OCR
+        // evidence between the exact label and the loading text, so it is safe to
+        // click without waiting for a numeric value that does not exist yet.
+        if (TryFindBalanceLoadingRow(snapshot, label, config, out var loadingRow))
+        {
+            var loadingWord = loadingRow.Words
+                .Where(word => NormalizeOcrText(word.Text).Contains("获", StringComparison.Ordinal))
+                .OrderBy(word => word.X)
+                .FirstOrDefault();
+            // Windows OCR commonly separates the circular refresh glyph and
+            // “获取中” into two lines despite their shared baseline.
+            var loadingBounds = GetOcrBounds(loadingRow);
+            var refreshWord = snapshot.Lines.SelectMany(line => line.Words)
+                .Where(word => word.X >= label.Bounds.Right &&
+                               word.X + word.Width < (loadingWord?.X ?? loadingBounds.Left) &&
+                               Math.Abs((word.Y + word.Height / 2) - loadingBounds.CenterY) <= config.BalanceValueSameRowTolerance &&
+                               word.Width is >= 6 and <= 24 && word.Height is >= 6 and <= 24)
+                .Where(word => word.Text.Trim() is "0" or "O" or "o" or "Q" or "q" or "C" or "c")
+                .OrderBy(word => word.X)
+                .FirstOrDefault();
+            if (refreshWord is not null)
+            {
+                point = new Point(refreshWord.X + refreshWord.Width / 2,
+                    refreshWord.Y + refreshWord.Height / 2);
+                return true;
+            }
         }
 
         foreach (var line in snapshot.Lines)
@@ -3698,8 +3815,9 @@ internal static class Program
                 if (image is not null)
                 {
                     var ocr = ReadClaimRegionOcr(image);
-                    var scan = ScanWindowActions(image, ocr, config);
-                    if (scan.Immediate is not null || scan.CheckInActions.Count > 0)
+                    var directImmediate = FindImmediateClaimAction(ocr, config);
+                    var directCheckIn = FindCheckInActions(ocr, config);
+                    if (directImmediate is not null || directCheckIn.Count > 0)
                     {
                         stopwatch.Stop();
                         Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，Buddy加油站已出现领取入口，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
@@ -3711,6 +3829,16 @@ internal static class Program
                         stopwatch.Stop();
                         Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，Buddy加油站连续两帧识别今日已领，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
                         return 0;
+                    }
+                    if (claimedFrames == 0)
+                    {
+                        var enhancedScan = ScanWindowActions(image, ocr, config);
+                        if (enhancedScan.Immediate is not null || enhancedScan.CheckInActions.Count > 0)
+                        {
+                            stopwatch.Stop();
+                            Log($"快速路径安全测试完成：余额={evidence.Balance.RawText}，增强 OCR 识别领取入口，耗时={stopwatch.ElapsedMilliseconds}ms；未执行领取点击。");
+                            return 0;
+                        }
                     }
                 }
                 Thread.Sleep(OcrPollingIntervalMilliseconds);
@@ -4204,6 +4332,29 @@ internal static class Program
         if (!TryFindBalanceRefreshPoint(refreshOcr, selfTestConfig, out var refreshPoint) ||
             refreshPoint.X != 175 || refreshPoint.Y != 358)
             throw new InvalidOperationException("必须根据积分余额与数字之间的刷新图标确定点击点。");
+        var loadingBalanceOcr = new OcrSnapshot
+        {
+            Lines =
+            [
+                new OcrLine { Text = "积分余额", Words = [new OcrWord { Text = "积分余额", X = 53, Y = 585, Width = 56, Height = 14 }] },
+                new OcrLine { Text = "0 丿获取中>", Words =
+                [
+                    new OcrWord { Text = "0", X = 227, Y = 586, Width = 12, Height = 12 },
+                    new OcrWord { Text = "丿", X = 254, Y = 590, Width = 7, Height = 8 },
+                    new OcrWord { Text = "获取中", X = 266, Y = 587, Width = 34, Height = 11 },
+                    new OcrWord { Text = ">", X = 306, Y = 588, Width = 4, Height = 8 }
+                ] },
+                new OcrLine { Text = "Buddy加油站", Words = [new OcrWord { Text = "Buddy加油站", X = 53, Y = 545, Width = 90, Height = 14 }] },
+                new OcrLine { Text = "设置", Words = [new OcrWord { Text = "设置", X = 53, Y = 646, Width = 28, Height = 14 }] },
+                new OcrLine { Text = "外观", Words = [new OcrWord { Text = "外观", X = 53, Y = 728, Width = 28, Height = 14 }] }
+            ]
+        };
+        if (!IsBalanceLoadingState(loadingBalanceOcr, selfTestConfig) ||
+            !TryFindBalanceRefreshPoint(loadingBalanceOcr, selfTestConfig, out var loadingRefreshPoint) ||
+            loadingRefreshPoint.X != 233 || loadingRefreshPoint.Y != 592)
+            throw new InvalidOperationException("余额显示获取中时必须直接识别同行刷新图标，不得消耗下一次领取尝试。");
+        if (GetBalanceReadyTimeoutSeconds(loadingBalanceOcr, selfTestConfig) < 90)
+            throw new InvalidOperationException("午夜余额获取中必须在同一次尝试内自适应等待，避免误计为多次领取。");
         var noRefreshOcr = new OcrSnapshot
         {
             Lines =
