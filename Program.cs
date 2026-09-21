@@ -2816,6 +2816,7 @@ internal static class Program
     }
 
     private const int ClaimRegionActionOcrScale = 2;
+    private const int FocusedActionOcrScale = 5;
     private const int ClaimRegionActionOcrColumns = 1;
     private const int ClaimRegionActionOcrRows = 4;
     private const int ClaimRegionActionOcrOverlapPixels = 40;
@@ -2842,6 +2843,13 @@ internal static class Program
         if (!ShouldRunActionOcrTiles(actionOcrDepth))
             return new WindowActionScan(null, directCheckInActions);
 
+        // Windows OCR can omit short white text when it lays out a large page. Try
+        // dynamically detected button-shaped crops first; the crop is never a click
+        // target, and the existing four-character positional OCR rule still gates it.
+        var focused = ReadFocusedImmediateActionTiles(bitmap);
+        var focusedAction = FindImmediateClaimAction(focused, bitmap, config);
+        if (focusedAction is not null) return new WindowActionScan(focusedAction, []);
+
         var raw = ReadWindowActionTiles(bitmap, FullWindowOcrTreatment.Raw);
         var rawAction = FindImmediateClaimAction(raw, bitmap, config);
         if (rawAction is not null) return new WindowActionScan(rawAction, []);
@@ -2857,6 +2865,99 @@ internal static class Program
             ? new WindowActionScan(enhancedAction, [])
             : new WindowActionScan(null, MergeCheckInActions(checkInActions,
                 FindCheckInActions(enhanced, bitmap, config)));
+    }
+
+    private static IReadOnlyList<WindowOcrTile> ReadFocusedImmediateActionTiles(Bitmap bitmap)
+    {
+        var sources = FindNeutralDarkButtonCandidates(bitmap).Take(8).ToArray();
+        if (sources.Length == 0) return [];
+        var images = new List<Bitmap>(sources.Length * 2);
+        var mappings = new List<(Rectangle Source, FullWindowOcrTreatment Treatment)>(sources.Length * 2);
+        try
+        {
+            foreach (var source in sources)
+            {
+                var raw = CreateScaledCrop(bitmap, source, FocusedActionOcrScale);
+                images.Add(raw);
+                mappings.Add((source, FullWindowOcrTreatment.Raw));
+
+                var inverted = CreateScaledCrop(bitmap, source, FocusedActionOcrScale);
+                NormalizeDarkThemeOcr(inverted);
+                images.Add(inverted);
+                mappings.Add((source, FullWindowOcrTreatment.Inverted));
+            }
+
+            var snapshots = ReadOcrBatch(images.Select(image => (image, "zh-Hans")).ToArray());
+            return snapshots.Select((snapshot, index) =>
+                    new WindowOcrTile(snapshot, mappings[index].Source,
+                        FocusedActionOcrScale, mappings[index].Treatment))
+                .ToArray();
+        }
+        finally
+        {
+            foreach (var image in images) image.Dispose();
+        }
+    }
+
+    private static IEnumerable<Rectangle> FindNeutralDarkButtonCandidates(Bitmap bitmap)
+    {
+        var region = GetBottomLeftClaimRegion(bitmap.Width, bitmap.Height);
+        var seen = new bool[region.Width, region.Height];
+        var candidates = new List<(Rectangle Bounds, int Pixels)>();
+        for (int localY = 0; localY < region.Height; localY++)
+        for (int localX = 0; localX < region.Width; localX++)
+        {
+            if (seen[localX, localY]) continue;
+            int startX = region.Left + localX, startY = region.Top + localY;
+            if (!IsNeutralDarkButtonPixel(bitmap.GetPixel(startX, startY))) continue;
+            var pending = new Queue<Point>();
+            pending.Enqueue(new Point(startX, startY));
+            seen[localX, localY] = true;
+            int count = 0, minX = startX, maxX = startX, minY = startY, maxY = startY;
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                count++;
+                minX = Math.Min(minX, current.X); maxX = Math.Max(maxX, current.X);
+                minY = Math.Min(minY, current.Y); maxY = Math.Max(maxY, current.Y);
+                for (int offsetY = -1; offsetY <= 1; offsetY++)
+                for (int offsetX = -1; offsetX <= 1; offsetX++)
+                {
+                    if (offsetX == 0 && offsetY == 0) continue;
+                    int nextX = current.X + offsetX, nextY = current.Y + offsetY;
+                    int nextLocalX = nextX - region.Left, nextLocalY = nextY - region.Top;
+                    if (nextLocalX < 0 || nextLocalX >= region.Width ||
+                        nextLocalY < 0 || nextLocalY >= region.Height ||
+                        seen[nextLocalX, nextLocalY] ||
+                        !IsNeutralDarkButtonPixel(bitmap.GetPixel(nextX, nextY))) continue;
+                    seen[nextLocalX, nextLocalY] = true;
+                    pending.Enqueue(new Point(nextX, nextY));
+                }
+            }
+
+            var bounds = Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
+            double fill = count / (double)Math.Max(1, bounds.Width * bounds.Height);
+            if (bounds.Width is >= 48 and <= 220 && bounds.Height is >= 18 and <= 72 &&
+                bounds.Width >= bounds.Height * 2 && fill >= 0.45)
+                candidates.Add((bounds, count));
+        }
+
+        foreach (var candidate in candidates.OrderByDescending(candidate => candidate.Pixels))
+        {
+            const int horizontalPadding = 12, verticalPadding = 8;
+            int left = Math.Max(region.Left, candidate.Bounds.Left - horizontalPadding);
+            int top = Math.Max(region.Top, candidate.Bounds.Top - verticalPadding);
+            int right = Math.Min(region.Right, candidate.Bounds.Right + horizontalPadding);
+            int bottom = Math.Min(region.Bottom, candidate.Bounds.Bottom + verticalPadding);
+            yield return Rectangle.FromLTRB(left, top, right, bottom);
+        }
+    }
+
+    private static bool IsNeutralDarkButtonPixel(Color color)
+    {
+        int max = Math.Max(color.R, Math.Max(color.G, color.B));
+        int min = Math.Min(color.R, Math.Min(color.G, color.B));
+        return max <= 170 && max - min <= 22;
     }
 
     private static IReadOnlyList<WindowOcrTile> ReadWindowActionTiles(
@@ -3936,6 +4037,24 @@ internal static class Program
 
     private static Bitmap? CaptureWindow(IntPtr hwnd)
     {
+        const int attempts = 3;
+        for (int attempt = 1; attempt <= attempts; attempt++)
+        {
+            var bitmap = CaptureWindowOnce(hwnd);
+            if (bitmap is null) return null;
+            if (!IsEffectivelyBlackFrame(bitmap)) return bitmap;
+            bitmap.Dispose();
+            Log($"PrintWindow 返回纯黑帧，正在重绘后重试捕获（{attempt}/{attempts}）。");
+            Native.RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
+                Native.RDW_INVALIDATE | Native.RDW_UPDATENOW | Native.RDW_ALLCHILDREN | Native.RDW_FRAME);
+            Thread.Sleep(150 * attempt);
+        }
+        Log("PrintWindow 连续返回纯黑帧；本次捕获失败，不将黑图送入 OCR。");
+        return null;
+    }
+
+    private static Bitmap? CaptureWindowOnce(IntPtr hwnd)
+    {
         Native.GetWindowRect(hwnd, out var rect);
         int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
         if (width <= 0 || height <= 0) return null;
@@ -3950,6 +4069,20 @@ internal static class Program
         finally { graphics.ReleaseHdc(hdc); }
         bitmap.Dispose();
         return null;
+    }
+
+    private static bool IsEffectivelyBlackFrame(Bitmap bitmap)
+    {
+        const int columns = 16, rows = 10, maximumBlackChannel = 4;
+        for (int row = 0; row < rows; row++)
+        for (int column = 0; column < columns; column++)
+        {
+            int x = Math.Min(bitmap.Width - 1, (column * 2 + 1) * bitmap.Width / (columns * 2));
+            int y = Math.Min(bitmap.Height - 1, (row * 2 + 1) * bitmap.Height / (rows * 2));
+            var color = bitmap.GetPixel(x, y);
+            if (Math.Max(color.R, Math.Max(color.G, color.B)) > maximumBlackChannel) return false;
+        }
+        return true;
     }
 
     private static int SelfTest(Config config)
@@ -4054,6 +4187,15 @@ internal static class Program
             if (HasMeaningfulUiChange(CreateUiFrameSignature(unchangedFrame), CreateUiFrameSignature(unchangedFrame)) ||
                 !HasMeaningfulUiChange(CreateUiFrameSignature(unchangedFrame), CreateUiFrameSignature(changedFrame)))
                 throw new InvalidOperationException("点击后必须观察到实际界面变化，不能接受旧帧 OCR。");
+        }
+        using (var blackFrame = new Bitmap(120, 80))
+        using (var darkButRenderedFrame = new Bitmap(120, 80))
+        {
+            using var darkGraphics = Graphics.FromImage(darkButRenderedFrame);
+            darkGraphics.Clear(Color.FromArgb(24, 24, 24));
+            darkGraphics.FillRectangle(Brushes.White, 30, 30, 20, 10);
+            if (!IsEffectivelyBlackFrame(blackFrame) || IsEffectivelyBlackFrame(darkButRenderedFrame))
+                throw new InvalidOperationException("纯黑捕获必须被拒绝，但正常深色界面不能被误判为黑帧。");
         }
         var detailedFailureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed, "100", null, 5, 5,
             "保留原后台并最小化", "未能在个人中心读取积分余额");
@@ -5019,6 +5161,8 @@ internal sealed class State
 internal static class Native
 {
     internal const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
+    internal const uint RDW_INVALIDATE = 0x0001, RDW_FRAME = 0x0400,
+        RDW_UPDATENOW = 0x0100, RDW_ALLCHILDREN = 0x0080;
     internal const uint SMTO_BLOCK = 0x0001, SMTO_ABORTIFHUNG = 0x0002;
     internal const uint ClickMessageTimeoutMilliseconds = 2_000;
     internal const int SW_SHOWNOACTIVATE = 4, SW_MINIMIZE = 6;
@@ -5043,6 +5187,8 @@ internal static class Native
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr SendMessageTimeout(
         IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeoutMilliseconds, out IntPtr result);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint flags);
+    [DllImport("user32.dll", SetLastError = true)] internal static extern bool RedrawWindow(
+        IntPtr hwnd, IntPtr updateRect, IntPtr updateRegion, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
     [DllImport("user32.dll")] internal static extern bool CloseDesktop(IntPtr hDesktop);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool GetUserObjectInformation(IntPtr hObj, int index, IntPtr info, uint length, out uint needed);
