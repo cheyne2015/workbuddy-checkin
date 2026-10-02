@@ -314,7 +314,7 @@ internal static class WorkBuddyApiFastPath
                 FallbackReason: response.TimedOut ? "领取接口超时" : "领取接口网络失败", ClaimMayHaveBeenSent: true);
         if (response.StatusCode == 401)
             return new ApiAttemptResult(ApiAttemptKind.RefreshCredentials, "领取接口认证失效，准备重新读取一次登录会话。",
-                HttpStatus: 401, ClaimMayHaveBeenSent: true);
+                HttpStatus: 401, ClaimMayHaveBeenSent: false);
         if (response.StatusCode == 403)
             return new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "领取接口拒绝操作，转入 OCR 保底。",
                 HttpStatus: 403, FallbackReason: "HTTP 403", ClaimMayHaveBeenSent: true);
@@ -347,7 +347,7 @@ internal static class WorkBuddyApiFastPath
                     StreakDays: FindInt(root, "streak_days"), TotalCredits: FindNumberText(root, "total_credits"),
                     HttpStatus: response.StatusCode, ClaimMayHaveBeenSent: true);
             var safeMessage = FindSafeMessage(root);
-            if (safeMessage is not null || TryFind(root, "code", out _))
+            if (IsExplicitBusinessFailure(root, safeMessage))
                 return new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
                     $"领取接口返回明确业务失败{(safeMessage is null ? "" : "：" + safeMessage)}，转入 OCR 保底。",
                     HttpStatus: response.StatusCode, FallbackReason: "领取接口业务失败", ClaimMayHaveBeenSent: true);
@@ -499,17 +499,22 @@ internal static class WorkBuddyApiFastPath
         {
             if (!process.Start()) throw new ApiCredentialException("无法启动本地凭据助手");
             started = true;
-            var stdout = ReadBoundedTextAsync(process.StandardOutput, 65_536);
-            var stderr = ReadBoundedTextAsync(process.StandardError, 8_192);
-            process.StandardInput.Write(JsonSerializer.Serialize(new { version = 1, operation = "decrypt", value = encryptedToken }));
-            process.StandardInput.Close();
-            if (!process.WaitForExit(10_000))
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var stdout = ReadBoundedTextAsync(process.StandardOutput, 65_536, deadline.Token);
+            var stderr = ReadBoundedTextAsync(process.StandardError, 8_192, deadline.Token);
+            var input = JsonSerializer.Serialize(new { version = 1, operation = "decrypt", value = encryptedToken });
+            var writeInput = WriteCredentialInputAsync(process.StandardInput, input, deadline.Token);
+            var waitForExit = process.WaitForExitAsync(deadline.Token);
+            try
+            {
+                Task.WhenAll(writeInput, waitForExit, stdout, stderr).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
+                try { process.WaitForExit(2_000); } catch { }
                 throw new ApiCredentialException("本地凭据助手超时");
             }
-            if (!Task.WaitAll([stdout, stderr], 1_000))
-                throw new ApiCredentialException("本地凭据助手管道未能及时关闭");
             using var reply = JsonDocument.Parse(stdout.Result);
             var root = reply.RootElement;
             if (process.ExitCode != 0 || !root.TryGetProperty("version", out var version) || version.GetInt32() != 1 ||
@@ -529,6 +534,13 @@ internal static class WorkBuddyApiFastPath
                 try { process.Kill(entireProcessTree: true); } catch { }
             }
         }
+    }
+
+    private static async Task WriteCredentialInputAsync(StreamWriter writer, string input, CancellationToken cancellationToken)
+    {
+        await writer.WriteAsync(input.AsMemory(), cancellationToken).ConfigureAwait(false);
+        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        writer.Close();
     }
 
     internal static ProcessStartInfo CreateCredentialHelperStartInfo(string executable, string? scriptPrefix = null)
@@ -763,6 +775,26 @@ process.stdin.on('end',()=>{ try { const request=JSON.parse(utf8(Buffer.concat(c
                (message.Contains("已领", StringComparison.Ordinal) || message.Contains("已签", StringComparison.Ordinal));
     }
 
+    private static bool IsExplicitBusinessFailure(JsonElement root, string? message)
+    {
+        if (TryFind(root, "code", out var code))
+        {
+            if (code.ValueKind == JsonValueKind.Number && code.TryGetInt64(out var number) && number != 0) return true;
+            if (code.ValueKind == JsonValueKind.String)
+            {
+                var text = code.GetString()?.Trim();
+                if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out number)) return number != 0;
+                if (!string.IsNullOrWhiteSpace(text) &&
+                    !text.Equals("OK", StringComparison.OrdinalIgnoreCase) &&
+                    !text.Equals("SUCCESS", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(message)) return false;
+        string[] failureWords = ["失败", "不可用", "未开启", "拒绝", "过期", "无效", "异常",
+            "fail", "error", "denied", "unavailable", "invalid", "expired"];
+        return failureWords.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string? FindSafeMessage(JsonElement root)
     {
         foreach (var key in new[] { "msg", "message" })
@@ -803,7 +835,8 @@ process.stdin.on('end',()=>{ try { const request=JSON.parse(utf8(Buffer.concat(c
         return new UTF8Encoding(false, true).GetString(buffer.ToArray());
     }
 
-    private static async Task<string> ReadBoundedTextAsync(StreamReader reader, int maximumCharacters)
+    private static async Task<string> ReadBoundedTextAsync(
+        StreamReader reader, int maximumCharacters, CancellationToken cancellationToken)
     {
         var builder = new StringBuilder();
         var buffer = new char[4096];
@@ -811,7 +844,8 @@ process.stdin.on('end',()=>{ try { const request=JSON.parse(utf8(Buffer.concat(c
         {
             var remaining = maximumCharacters + 1 - builder.Length;
             if (remaining <= 0) throw new IOException("Credential helper output exceeded its limit.");
-            var read = await reader.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, remaining))).ConfigureAwait(false);
+            var read = await reader.ReadAsync(
+                buffer.AsMemory(0, Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
             if (read == 0) return builder.ToString();
             builder.Append(buffer, 0, read);
             if (builder.Length > maximumCharacters) throw new IOException("Credential helper output exceeded its limit.");
@@ -862,6 +896,10 @@ internal static class WorkBuddyApiSelfTests
             new ApiHttpResult(200, "{\"code\":40001,\"msg\":\"activity unavailable\"}"));
         if (businessFailure.Kind != ApiAttemptKind.NeedsOcr || businessFailure.FallbackReason != "领取接口业务失败")
             throw new InvalidOperationException("明确的接口业务失败应进入 OCR，而不是反复发送领取请求。");
+        var ambiguousSuccess = WorkBuddyApiFastPath.ClassifyClaimResponse(
+            new ApiHttpResult(200, "{\"code\":0,\"message\":\"success\"}"));
+        if (ambiguousSuccess.Kind != ApiAttemptKind.Retry || !ambiguousSuccess.ClaimMayHaveBeenSent)
+            throw new InvalidOperationException("HTTP 200 但缺少 credit 的成功样式未知响应必须先复查状态，不得盲目进入 OCR。");
         var timeoutAfterClaim = WorkBuddyApiFastPath.ClassifyStatusResponse(
             new ApiHttpResult(null, null, TimedOut: true), claimMayHaveBeenSent: true);
         if (timeoutAfterClaim.Kind != ApiAttemptKind.Retry || !timeoutAfterClaim.ClaimMayHaveBeenSent)
@@ -870,6 +908,9 @@ internal static class WorkBuddyApiSelfTests
             new ApiHttpResult(401, "{}"), claimMayHaveBeenSent: true);
         if (unauthorizedAfterClaim.Kind != ApiAttemptKind.RefreshCredentials || !unauthorizedAfterClaim.ClaimMayHaveBeenSent)
             throw new InvalidOperationException("领取待确认状态必须穿过 HTTP 401 会话刷新。");
+        var rejectedClaim = WorkBuddyApiFastPath.ClassifyClaimResponse(new ApiHttpResult(401, "{}"));
+        if (rejectedClaim.Kind != ApiAttemptKind.RefreshCredentials || rejectedClaim.ClaimMayHaveBeenSent)
+            throw new InvalidOperationException("领取接口明确返回 401 时应允许刷新后安全回退，不得误记为响应丢失。");
         var serverFailure = WorkBuddyApiFastPath.ClassifyClaimResponse(
             new ApiHttpResult(503, "{\"msg\":\"temporarily unavailable\"}"));
         if (serverFailure.Kind != ApiAttemptKind.Retry || !serverFailure.ClaimMayHaveBeenSent)

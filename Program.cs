@@ -561,6 +561,7 @@ internal static class Program
         var session = sessionLoad.Session!;
         bool refreshedCredentials = false;
         bool claimMayHaveBeenSent = false;
+        string? pendingEndpointHost = null;
         ApiAttemptResult? lastResult = null;
         int[] backoffSeconds = [5, 15, 30, 60];
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
@@ -623,19 +624,29 @@ internal static class Program
                     }
                     else if (!string.IsNullOrWhiteSpace(refreshed.PendingHost))
                     {
-                        Log("HTTP 401 刷新会话时发现未知服务端域名；未发送新令牌，转入 OCR 保底。");
+                        var pendingClaim = lastResult.ClaimMayHaveBeenSent;
+                        Log(pendingClaim
+                            ? "HTTP 401 刷新会话时发现未知服务端域名；未发送新令牌，领取结果待确认且不进入 OCR。"
+                            : "HTTP 401 刷新会话时发现未知服务端域名；未发送新令牌，转入 OCR 保底。");
                         Notify("WorkBuddy 接口域名待确认",
-                            $"刷新登录会话时发现未知服务端域名：{refreshed.PendingHost}\n登录令牌未发送，已转入 OCR 保底。",
+                            $"刷新登录会话时发现未知服务端域名：{refreshed.PendingHost}\n登录令牌未发送，" +
+                            (pendingClaim ? "领取结果待确认且不会进入 OCR。" : "已转入 OCR 保底。"),
                             ToolTipIcon.Warning);
-                        return RunOcrOnlyCore(config, mode, Math.Max(1, maxAttempts - attempt + 1),
-                            attempt - 1, maxAttempts, refreshed.FallbackReason,
-                            endpointHost: refreshed.PendingHost, pendingEndpointHost: refreshed.PendingHost,
-                            executionChannel: "OcrFallback");
+                        if (!pendingClaim)
+                            return RunOcrOnlyCore(config, mode, Math.Max(1, maxAttempts - attempt + 1),
+                                attempt - 1, maxAttempts, refreshed.FallbackReason,
+                                endpointHost: refreshed.PendingHost, pendingEndpointHost: refreshed.PendingHost,
+                                executionChannel: "OcrFallback");
+                        pendingEndpointHost = refreshed.PendingHost;
                     }
                 }
-                lastResult = new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
-                    "接口认证在唯一一次会话刷新后仍失败，转入 OCR 保底。", HttpStatus: 401,
-                    FallbackReason: "HTTP 401");
+                lastResult = lastResult.ClaimMayHaveBeenSent
+                    ? new ApiAttemptResult(ApiAttemptKind.Retry,
+                        "领取结果待确认且状态认证失败；不得进入 OCR，将继续先查状态或安全停止。",
+                        HttpStatus: 401, FallbackReason: "HTTP 401", ClaimMayHaveBeenSent: true)
+                    : new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
+                        "接口认证在唯一一次会话刷新后仍失败，转入 OCR 保底。", HttpStatus: 401,
+                        FallbackReason: "HTTP 401");
             }
 
             if (lastResult.Kind is ApiAttemptKind.NeedsOcr or ApiAttemptKind.InactiveNeedsSingleOcr)
@@ -675,6 +686,7 @@ internal static class Program
             ExecutionChannel = "Api",
             ApiResult = claimMayHaveBeenSent ? "Pending" : "Failed",
             EndpointHost = session.Endpoint.Host,
+            PendingEndpointHost = pendingEndpointHost,
             FallbackReason = lastResult?.FallbackReason,
             BalanceFresh = false,
             AfterBalance = lastKnownBalance
