@@ -210,7 +210,7 @@ internal static class Program
                         var nextGrowth = NextGrowthPollTime(state, now, config);
                         if (nextGrowth <= now)
                         {
-                            RunGrowthPoll(config);
+                            if (RunGrowthPoll(config, manualTestRequest)) return 0;
                             continue;
                         }
                         var nextWake = nextGrowth < NextClaimTime(now, claimTime) ? nextGrowth : NextClaimTime(now, claimTime);
@@ -221,7 +221,20 @@ internal static class Program
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), $"今天已完成 {config.MaxAttempts} 次领取尝试，等待明天", manualTestRequest, configChanged)) return 0;
+                    if (config.EnableGrowthCenter && config.UseApiFastPath)
+                    {
+                        var nextGrowth = NextGrowthPollTime(state, now, config);
+                        if (nextGrowth <= now)
+                        {
+                            if (RunGrowthPoll(config, manualTestRequest)) return 0;
+                            continue;
+                        }
+                        var nextWake = nextGrowth < NextClaimTime(now, claimTime) ? nextGrowth : NextClaimTime(now, claimTime);
+                        if (SleepUntilOrManualTestRequest(nextWake,
+                                $"今天已完成 {config.MaxAttempts} 次领取尝试；仅等待成长中心轮询或明日任务",
+                                manualTestRequest, configChanged)) return 0;
+                    }
+                    else if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), $"今天已完成 {config.MaxAttempts} 次领取尝试，等待明天", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
 
@@ -238,12 +251,20 @@ internal static class Program
                 }
                 else
                 {
-                    int exitCode = RunOnce(config, ClaimRunMode.Automatic);
-                    if (exitCode == 0)
+                    int exitCode = RunOnce(config, ClaimRunMode.Automatic, manualTestRequest);
+                    if (exitCode == 4)
+                    {
+                        LogManualTestYield();
+                        return 0;
+                    }
+                    var afterRun = LoadState();
+                    if (ShouldReenterSchedulerAfterRun(exitCode, afterRun, DateOnly.FromDateTime(now)))
                     {
                         // Re-enter the state-driven scheduler so a successful daily run
                         // can sleep until the next growth poll instead of always sleeping
                         // straight through to tomorrow.
+                        if (exitCode != 0)
+                            Log("每日领取已成功，成长中心存在待处理结果；保留成功状态并进入成长中心轮询计划。");
                         continue;
                     }
                     if (exitCode == 3)
@@ -253,12 +274,6 @@ internal static class Program
                     }
                     else
                     {
-                        var afterRun = LoadState();
-                        if (afterRun.IsUsable && afterRun.State!.SuccessDate == DateOnly.FromDateTime(now))
-                        {
-                            Log("每日领取已成功，成长中心存在待处理结果；保留成功状态并进入成长中心轮询计划。");
-                            continue;
-                        }
                         // RunOnce has already completed the configured consecutive
                         // attempts and sent the one terminal-failure notification. Do not
                         // start another attempt batch every minute for the rest of today.
@@ -289,6 +304,12 @@ internal static class Program
 
     private static bool HasDailyTerminalState(State state, DateOnly date) =>
         state.SuccessDate == date || state.TerminalFailureDate == date;
+
+    private static bool ShouldReenterSchedulerAfterRun(int exitCode, StateLoadResult afterRun, DateOnly today) =>
+        exitCode == 0 || afterRun.IsUsable && afterRun.State!.SuccessDate == today;
+
+    private static bool GrowthPollMaySubmitDailyClaim(StateLoadResult stateLoad, DateOnly today) =>
+        !stateLoad.IsUsable || stateLoad.State!.TerminalFailureDate != today;
 
     private static bool SleepUntilOrManualTestRequest(
         DateTime wakeAt, string reason, WaitHandle? interrupt = null, WaitHandle? configChanged = null)
@@ -495,10 +516,10 @@ internal static class Program
 
     private static bool ShouldPersistDailyState(ClaimRunMode mode) => mode == ClaimRunMode.Automatic;
 
-    private static int RunOnce(Config config, ClaimRunMode mode)
+    private static int RunOnce(Config config, ClaimRunMode mode, WaitHandle? handoffRequest = null)
     {
         ClaimExecutionGate.Wait();
-        try { return RunOnceCore(config, mode); }
+        try { return RunOnceCore(config, mode, handoffRequest); }
         finally { ClaimExecutionGate.Release(); }
     }
 
@@ -533,7 +554,7 @@ internal static class Program
         }
     }
 
-    private static int RunOnceCore(Config config, ClaimRunMode mode)
+    private static int RunOnceCore(Config config, ClaimRunMode mode, WaitHandle? handoffRequest = null)
     {
         if (!config.UseApiFastPath)
             return RunOcrOnlyCore(config, mode, fallbackReason: "接口快速通道已关闭", executionChannel: "OcrFallback");
@@ -593,6 +614,7 @@ internal static class Program
         int[] backoffSeconds = [5, 15, 30, 60];
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
+            if (handoffRequest?.WaitOne(0) == true) return 4;
             int currentAttempt = attempt;
             Log($"接口快速通道第 {attempt}/{maxAttempts} 次：先查询今日状态。");
             try
@@ -630,7 +652,8 @@ internal static class Program
             Log($"接口结果：HTTP {lastResult.HttpStatus?.ToString() ?? "无"}，{lastResult.Message}");
 
             if (lastResult.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed)
-                return CompleteApiSuccess(config, mode, session, lastResult, attempt, maxAttempts, lastKnownBalance);
+                return CompleteApiSuccess(config, mode, session, lastResult, attempt, maxAttempts, lastKnownBalance,
+                    handoffRequest);
 
             if (lastResult.Kind == ApiAttemptKind.RefreshCredentials)
             {
@@ -645,7 +668,9 @@ internal static class Program
                         Log("HTTP 401 后已重新读取一次本地登录会话；下一次仍先查状态。");
                         if (attempt < maxAttempts)
                         {
-                            Thread.Sleep(TimeSpan.FromSeconds(backoffSeconds[Math.Min(attempt - 1, backoffSeconds.Length - 1)]));
+                            if (WaitForHandoffOrDelay(handoffRequest,
+                                    TimeSpan.FromSeconds(backoffSeconds[Math.Min(attempt - 1, backoffSeconds.Length - 1)])))
+                                return 4;
                             continue;
                         }
                     }
@@ -695,7 +720,7 @@ internal static class Program
                 var delay = lastResult.RetryAfter ??
                     TimeSpan.FromSeconds(backoffSeconds[Math.Min(attempt - 1, backoffSeconds.Length - 1)]);
                 Log($"接口将在 {delay.TotalSeconds:0} 秒后重试；下次仍先查状态。");
-                Thread.Sleep(delay);
+                if (WaitForHandoffOrDelay(handoffRequest, delay)) return 4;
             }
         }
 
@@ -724,8 +749,15 @@ internal static class Program
         return 1;
     }
 
+    private static bool WaitForHandoffOrDelay(WaitHandle? handoffRequest, TimeSpan delay)
+    {
+        if (handoffRequest is not null) return handoffRequest.WaitOne(delay);
+        Thread.Sleep(delay);
+        return false;
+    }
+
     private static int CompleteApiSuccess(Config config, ClaimRunMode mode, WorkBuddyApiSession session, ApiAttemptResult result,
-        int attempt, int maxAttempts, string? lastKnownBalance)
+        int attempt, int maxAttempts, string? lastKnownBalance, WaitHandle? handoffRequest)
     {
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         var outcome = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "AlreadyClaimed";
@@ -740,13 +772,35 @@ internal static class Program
         GrowthCenterResult? growth = null;
         if (config.EnableGrowthCenter)
         {
-            try { growth = WorkBuddyGrowthCenter.Execute(session, config); }
+            bool handoffObserved = false;
+            bool IsHandoffRequested()
+            {
+                if (handoffObserved) return true;
+                if (handoffRequest?.WaitOne(0) != true) return false;
+                handoffObserved = true;
+                return true;
+            }
+            bool WaitOrHandoff(TimeSpan duration)
+            {
+                if (handoffObserved) return true;
+                if (handoffRequest is null)
+                {
+                    Thread.Sleep(duration);
+                    return false;
+                }
+                if (!handoffRequest.WaitOne(duration)) return false;
+                handoffObserved = true;
+                return true;
+            }
+            try { growth = WorkBuddyGrowthCenter.Execute(session, config, wait: WaitOrHandoff,
+                cancellationRequested: IsHandoffRequested); }
             catch (Exception ex)
             {
                 growth = new GrowthCenterResult(true, false,
                     $"成长中心异常（{ex.GetType().Name}: {ex.Message}）");
             }
             Log("成长中心：" + growth.Report);
+            if (growth.Cancelled) return 4;
         }
         if (persistedState is not null && growth is not null)
         {
@@ -786,20 +840,106 @@ internal static class Program
         return growth?.NeedsAttention == true ? 1 : 0;
     }
 
-    private static int RunGrowthPoll(Config config)
+    private static bool RunGrowthPoll(Config config, WaitHandle handoffRequest)
     {
         var loaded = WorkBuddyApiFastPath.LoadSession(config);
         var previous = LoadRunStatus();
+        var stateLoad = LoadState();
         GrowthCenterResult result;
+        ApiAttemptResult? daily = null;
         if (!loaded.IsReady)
         {
             result = new GrowthCenterResult(true, false, "成长中心登录会话不可用：" + loaded.Message);
         }
         else
         {
-            result = WorkBuddyGrowthCenter.Execute(loaded.Session!, config);
+            bool handoffObserved = false;
+            bool IsHandoffRequested()
+            {
+                if (handoffObserved) return true;
+                if (!handoffRequest.WaitOne(0)) return false;
+                handoffObserved = true;
+                return true;
+            }
+            bool WaitOrHandoff(TimeSpan duration)
+            {
+                if (handoffObserved) return true;
+                if (!handoffRequest.WaitOne(duration)) return false;
+                handoffObserved = true;
+                return true;
+            }
+            var today = DateOnly.FromDateTime(DateTime.Today);
+            var maySubmitDailyClaim = GrowthPollMaySubmitDailyClaim(stateLoad, today);
+            using var dailyCancellation = new CancellationTokenSource();
+            var cancellationRegistration = ThreadPool.RegisterWaitForSingleObject(handoffRequest,
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(), dailyCancellation,
+                Timeout.InfiniteTimeSpan, executeOnlyOnce: true);
+            try
+            {
+                ApiAttemptResult ExecuteDailyStatus(WorkBuddyApiSession session) => maySubmitDailyClaim
+                    ? WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent: false,
+                        beforeClaimSend: () => Log("成长中心轮询确认今日未签到；按上游 auto 策略提交一次每日签到。"),
+                        cancellationToken: dailyCancellation.Token)
+                    : WorkBuddyApiFastPath.QueryStatusOnly(session, config,
+                        cancellationToken: dailyCancellation.Token);
+
+                daily = ExecuteDailyStatus(loaded.Session!);
+                if (daily.Kind == ApiAttemptKind.RefreshCredentials && config.ApiRefreshOnUnauthorized &&
+                    !dailyCancellation.IsCancellationRequested)
+                {
+                    Log("成长中心轮询认证失效；按配置重新读取一次 WorkBuddy 登录会话。");
+                    var refreshed = WorkBuddyApiFastPath.LoadSession(config);
+                    if (refreshed.IsReady)
+                    {
+                        loaded = refreshed;
+                        daily = ExecuteDailyStatus(refreshed.Session!);
+                    }
+                    else
+                    {
+                        daily = daily with
+                        {
+                            Message = "重新读取 WorkBuddy 登录会话失败，成长中心跳过：" + refreshed.Message,
+                            FallbackReason = refreshed.FallbackReason ?? "重新读取登录会话失败"
+                        };
+                    }
+                }
+            }
+            finally
+            {
+                cancellationRegistration.Unregister(null);
+            }
+
+            if (daily.Kind == ApiAttemptKind.Cancelled)
+            {
+                LogManualTestYield();
+                return true;
+            }
+
+            if (daily.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed && stateLoad.IsUsable)
+            {
+                stateLoad.State!.SuccessDate = today;
+                stateLoad.State.TerminalFailureDate = null;
+            }
+
+            var stopForDailyAuthOrNetwork =
+                daily.Kind == ApiAttemptKind.RefreshCredentials ||
+                daily.HttpStatus is 401 or 403 or >= 500 ||
+                daily.Kind == ApiAttemptKind.Retry && daily.HttpStatus is null ||
+                daily.FallbackReason is "接口超时" or "网络失败" or "领取接口超时" or "领取接口网络失败";
+            result = stopForDailyAuthOrNetwork
+                ? new GrowthCenterResult(true, false, "签到状态检查失败，成长中心跳过：" + daily.Message)
+                : WorkBuddyGrowthCenter.Execute(loaded.Session!, config, wait: WaitOrHandoff,
+                    cancellationRequested: IsHandoffRequested);
+            if (!result.Cancelled && daily.Kind == ApiAttemptKind.Claimed)
+                result = result with { Idle = false, Report = daily.Message + "；" + result.Report };
+            else if (!result.Cancelled && !maySubmitDailyClaim && daily.FallbackReason == "STATUS_UNCLAIMED")
+                result = result with { Report = "签到仍未完成，保留今日五次停止；" + result.Report };
         }
-        var stateLoad = LoadState();
+        if (result.Cancelled)
+        {
+            LogManualTestYield();
+            return true;
+        }
         if (stateLoad.IsUsable)
         {
             stateLoad.State!.LastGrowthPollAt = DateTimeOffset.Now;
@@ -822,7 +962,7 @@ internal static class Program
         if (!result.Idle || result.NeedsAttention)
             Notify("WorkBuddy 成长中心", result.Report,
                 result.NeedsAttention ? ToolTipIcon.Warning : ToolTipIcon.Info);
-        return result.NeedsAttention ? 1 : 0;
+        return false;
     }
 
     private static int RunOcrOnlyCore(Config config, ClaimRunMode mode, int? attemptLimitOverride = null,
@@ -4508,6 +4648,17 @@ internal static class Program
         if (!HasDailyTerminalState(new State { SuccessDate = new DateOnly(2026, 8, 11) }, new DateOnly(2026, 8, 11)) ||
             HasDailyTerminalState(new State { SuccessDate = new DateOnly(2026, 8, 10) }, new DateOnly(2026, 8, 11)))
             throw new InvalidOperationException("从备份恢复时必须能区分已确认的今日终态与未知的今日状态。");
+        var schedulerDate = new DateOnly(2026, 8, 11);
+        if (!ShouldReenterSchedulerAfterRun(0, new StateLoadResult(new State(), StateLoadSource.Primary), schedulerDate) ||
+            !ShouldReenterSchedulerAfterRun(1,
+                new StateLoadResult(new State { SuccessDate = schedulerDate }, StateLoadSource.Primary), schedulerDate) ||
+            ShouldReenterSchedulerAfterRun(1, new StateLoadResult(new State(), StateLoadSource.Primary), schedulerDate))
+            throw new InvalidOperationException("每日成功后必须重新进入状态调度，成长中心失败不得抹掉已确认的签到成功。");
+        if (GrowthPollMaySubmitDailyClaim(
+                new StateLoadResult(new State { TerminalFailureDate = schedulerDate }, StateLoadSource.Primary), schedulerDate) ||
+            !GrowthPollMaySubmitDailyClaim(
+                new StateLoadResult(new State { TerminalFailureDate = schedulerDate.AddDays(-1) }, StateLoadSource.Primary), schedulerDate))
+            throw new InvalidOperationException("成长中心轮询可以兜底漏签，但当天五次失败后只能查询签到状态，不得再次提交领取。");
         var retainedDiagnostics = SelectRetainedFailureDiagnosticBases(
             Enumerable.Range(1, FailureDiagnosticRetentionCount + 1).Select(index => $"20260811-0000{index:D2}-failure"));
         if (retainedDiagnostics.Count != FailureDiagnosticRetentionCount ||

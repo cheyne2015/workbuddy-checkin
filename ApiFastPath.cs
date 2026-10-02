@@ -17,6 +17,7 @@ internal enum ApiAttemptKind
     InactiveNeedsSingleOcr,
     Retry,
     RefreshCredentials,
+    Cancelled,
     UnknownHost
 }
 
@@ -55,6 +56,7 @@ internal sealed record ApiHttpResult(
     string? Body,
     bool TimedOut = false,
     bool NetworkFailed = false,
+    bool Cancelled = false,
     TimeSpan? RetryAfter = null,
     long ElapsedMilliseconds = 0);
 
@@ -151,29 +153,33 @@ internal static class WorkBuddyApiFastPath
         Config config,
         bool claimMayHaveBeenSent,
         Action beforeClaimSend,
-        HttpMessageHandler? handler = null)
+        HttpMessageHandler? handler = null,
+        CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         using var client = CreateClient(session, config, handler);
-        var status = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds);
+        var status = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
         var statusDecision = ClassifyStatusResponse(status, claimMayHaveBeenSent);
         if (statusDecision.Kind != ApiAttemptKind.NeedsOcr || statusDecision.FallbackReason != "STATUS_UNCLAIMED")
             return statusDecision with { EndpointHost = session.Endpoint.Host };
 
+        if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         beforeClaimSend();
-        var claim = Send(client, BuildApiUri(session.Endpoint, ClaimPath), config.ApiTimeoutSeconds);
+        if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
+        var claim = Send(client, BuildApiUri(session.Endpoint, ClaimPath), config.ApiTimeoutSeconds, cancellationToken);
         var claimDecision = ClassifyClaimResponse(claim);
         if (claimDecision.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed or
             ApiAttemptKind.RefreshCredentials or ApiAttemptKind.NeedsOcr or ApiAttemptKind.Retry)
         {
             if (claimDecision.Kind == ApiAttemptKind.Claimed)
             {
-                var freshStatus = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds);
+                var freshStatus = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
                 claimDecision = EnrichClaimedFromStatus(claimDecision, freshStatus);
             }
             else if (claimDecision.Kind == ApiAttemptKind.Retry && claimDecision.ClaimMayHaveBeenSent &&
                      claim.StatusCode is >= 200 and < 300)
             {
-                var verification = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds);
+                var verification = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
                 var verified = ClassifyStatusResponse(verification, claimMayHaveBeenSent: true);
                 if (verified.Kind == ApiAttemptKind.AlreadyClaimed) claimDecision = verified;
                 else if (verified.FallbackReason == "STATUS_UNCLAIMED")
@@ -186,13 +192,19 @@ internal static class WorkBuddyApiFastPath
         return claimDecision with { EndpointHost = session.Endpoint.Host };
     }
 
-    internal static ApiAttemptResult QueryStatusOnly(WorkBuddyApiSession session, Config config, HttpMessageHandler? handler = null)
+    internal static ApiAttemptResult QueryStatusOnly(WorkBuddyApiSession session, Config config,
+        HttpMessageHandler? handler = null, CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         using var client = CreateClient(session, config, handler);
         return ClassifyStatusResponse(
-            Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds), claimMayHaveBeenSent: false)
+            Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken), claimMayHaveBeenSent: false)
             with { EndpointHost = session.Endpoint.Host };
     }
+
+    private static ApiAttemptResult CancelledResult(WorkBuddyApiSession session) =>
+        new(ApiAttemptKind.Cancelled, "接口操作已让出执行权。", EndpointHost: session.Endpoint.Host,
+            FallbackReason: "操作已取消");
 
     private static HttpClient CreateClient(WorkBuddyApiSession session, Config config, HttpMessageHandler? handler)
     {
@@ -214,7 +226,7 @@ internal static class WorkBuddyApiFastPath
         return client;
     }
 
-    private static ApiHttpResult Send(HttpClient client, Uri uri, int timeoutSeconds)
+    private static ApiHttpResult Send(HttpClient client, Uri uri, int timeoutSeconds, CancellationToken cancellationToken = default)
     {
         var started = Stopwatch.StartNew();
         using var request = new HttpRequestMessage(HttpMethod.Post, uri)
@@ -222,7 +234,8 @@ internal static class WorkBuddyApiFastPath
             Content = new ByteArrayContent([])
         };
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)));
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
         try
         {
             using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token);
@@ -238,7 +251,9 @@ internal static class WorkBuddyApiFastPath
         }
         catch (OperationCanceledException)
         {
-            return new ApiHttpResult(null, null, TimedOut: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
+            return cancellationToken.IsCancellationRequested
+                ? new ApiHttpResult(null, null, Cancelled: true, ElapsedMilliseconds: started.ElapsedMilliseconds)
+                : new ApiHttpResult(null, null, TimedOut: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
         }
         catch (HttpRequestException)
         {
@@ -252,6 +267,8 @@ internal static class WorkBuddyApiFastPath
 
     internal static ApiAttemptResult ClassifyStatusResponse(ApiHttpResult response, bool claimMayHaveBeenSent)
     {
+        if (response.Cancelled)
+            return new ApiAttemptResult(ApiAttemptKind.Cancelled, "接口状态查询已让出执行权。", FallbackReason: "操作已取消");
         if (response.TimedOut || response.NetworkFailed)
             return claimMayHaveBeenSent
                 ? new ApiAttemptResult(ApiAttemptKind.Retry, "领取请求结果未知，状态复查失败；下次先查状态。",
@@ -308,6 +325,8 @@ internal static class WorkBuddyApiFastPath
 
     internal static ApiAttemptResult ClassifyClaimResponse(ApiHttpResult response)
     {
+        if (response.Cancelled)
+            return new ApiAttemptResult(ApiAttemptKind.Cancelled, "领取请求已让出执行权。", FallbackReason: "操作已取消");
         if (response.TimedOut || response.NetworkFailed)
             return new ApiAttemptResult(ApiAttemptKind.Retry,
                 "领取请求可能已送达但响应丢失；下次先查询状态。",
@@ -904,6 +923,10 @@ internal static class WorkBuddyApiSelfTests
             new ApiHttpResult(null, null, TimedOut: true), claimMayHaveBeenSent: true);
         if (timeoutAfterClaim.Kind != ApiAttemptKind.Retry || !timeoutAfterClaim.ClaimMayHaveBeenSent)
             throw new InvalidOperationException("领取后状态查询超时必须保持待确认状态。");
+        var cancelledStatus = WorkBuddyApiFastPath.ClassifyStatusResponse(
+            new ApiHttpResult(null, null, Cancelled: true), claimMayHaveBeenSent: false);
+        if (cancelledStatus.Kind != ApiAttemptKind.Cancelled)
+            throw new InvalidOperationException("守护进程交接取消不得误判为超时或网络失败。");
         var unauthorizedAfterClaim = WorkBuddyApiFastPath.ClassifyStatusResponse(
             new ApiHttpResult(401, "{}"), claimMayHaveBeenSent: true);
         if (unauthorizedAfterClaim.Kind != ApiAttemptKind.RefreshCredentials || !unauthorizedAfterClaim.ClaimMayHaveBeenSent)
@@ -964,6 +987,15 @@ internal static class WorkBuddyApiSelfTests
             !claimHandler.Paths.SequenceEqual(new[]
                 { WorkBuddyApiFastPath.StatusPath, WorkBuddyApiFastPath.ClaimPath, WorkBuddyApiFastPath.StatusPath }))
             throw new InvalidOperationException("接口领取必须按 状态→领取→状态核验 顺序执行并先持久化 Pending。");
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var cancelledHandler = new SequenceHandler([]);
+        var cancelledAttempt = WorkBuddyApiFastPath.ExecuteAttempt(session, new Config(), false,
+            () => throw new InvalidOperationException("取消后不得发送领取请求。"), cancelledHandler,
+            cancelled.Token);
+        if (cancelledAttempt.Kind != ApiAttemptKind.Cancelled || cancelledHandler.Paths.Count != 0)
+            throw new InvalidOperationException("交接请求必须在任何每日接口请求发出前停止。");
 
         var unknownHostDirectory = Path.Combine(Path.GetTempPath(), "WorkBuddyApiHostSelfTest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(unknownHostDirectory);

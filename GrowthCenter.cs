@@ -15,7 +15,8 @@ internal sealed record GrowthCenterResult(
     int CreditsGained = 0,
     int? Energy = null,
     int? StreakDays = null,
-    bool AuthenticationRejected = false);
+    bool AuthenticationRejected = false,
+    bool Cancelled = false);
 
 internal static class WorkBuddyGrowthCenter
 {
@@ -25,10 +26,13 @@ internal static class WorkBuddyGrowthCenter
         WorkBuddyApiSession session,
         Config config,
         HttpMessageHandler? handler = null,
-        Action<TimeSpan>? delay = null)
+        Func<TimeSpan, bool>? wait = null,
+        Func<bool>? cancellationRequested = null)
     {
         using var client = CreateClient(session, handler);
-        var context = new GrowthContext(client, session.Endpoint, config, delay ?? Thread.Sleep);
+        var context = new GrowthContext(client, session.Endpoint, config,
+            wait ?? (duration => { Thread.Sleep(duration); return false; }),
+            cancellationRequested ?? (() => false));
         context.RunModule(context.RunTravel, "旅行");
         context.RunModule(context.RunTasks, "任务");
         context.RunModule(context.RunMakeup, "补登");
@@ -63,7 +67,8 @@ internal static class WorkBuddyGrowthCenter
         HttpClient client,
         Uri endpoint,
         Config config,
-        Action<TimeSpan> delay)
+        Func<TimeSpan, bool> wait,
+        Func<bool> cancellationRequested)
     {
         private readonly Stopwatch _elapsed = Stopwatch.StartNew();
         private readonly List<string> _parts = [];
@@ -73,6 +78,7 @@ internal static class WorkBuddyGrowthCenter
         private int _successes;
         private bool _authenticationRejected;
         private bool _stopAll;
+        private bool _cancelled;
         private JsonNode? _streakBody;
         private bool _streakStale;
         private int? _energy;
@@ -80,6 +86,7 @@ internal static class WorkBuddyGrowthCenter
 
         internal void RunModule(Action action, string label)
         {
+            if (CheckCancellation()) return;
             if (_stopAll) return;
             try { action(); }
             catch (Exception ex) { ModuleException(label, ex); }
@@ -500,11 +507,12 @@ internal static class WorkBuddyGrowthCenter
             if (tail.Count > 0) report += "（" + string.Join("，", tail) + "）";
             return new GrowthCenterResult(_hardFailures > 0 || _authenticationRejected,
                 _successes == 0 && _failures == 0, report, _credits, _energy, _streakDays,
-                _authenticationRejected);
+                _authenticationRejected, _cancelled);
         }
 
         private bool CannotContinue(string label)
         {
+            if (CheckCancellation()) return true;
             if (_authenticationRejected || _stopAll) return true;
             if (BudgetLeft > 0) return false;
             _parts.Add($"时间预算耗尽，{label}跳过");
@@ -529,20 +537,26 @@ internal static class WorkBuddyGrowthCenter
             var serverUsed = 0;
             while (true)
             {
+                if (CheckCancellation()) return GrowthResponse.CancelledRequest();
                 var response = SendOnce(method, path, payload);
                 if (!retryRead) return response;
-                int wait = response.NetworkFailed && networkUsed < networkDelays.Length
+                int waitSeconds = response.NetworkFailed && networkUsed < networkDelays.Length
                     ? networkDelays[networkUsed++]
                     : response.StatusCode >= 500 && serverUsed < serverDelays.Length
                         ? serverDelays[serverUsed++]
                         : 0;
-                if (wait == 0 || BudgetLeft <= wait + config.GrowthRequestTimeoutSeconds) return response;
-                delay(TimeSpan.FromSeconds(wait));
+                if (waitSeconds == 0 || BudgetLeft <= waitSeconds + config.GrowthRequestTimeoutSeconds) return response;
+                if (wait(TimeSpan.FromSeconds(waitSeconds)))
+                {
+                    Cancel();
+                    return GrowthResponse.CancelledRequest();
+                }
             }
         }
 
         private GrowthResponse SendOnce(HttpMethod method, string path, object? payload)
         {
+            if (CheckCancellation()) return GrowthResponse.CancelledRequest();
             if (BudgetLeft <= 1) return GrowthResponse.BudgetExpired();
             using var request = new HttpRequestMessage(method, new Uri(endpoint, path.TrimStart('/')));
             if (payload is not null)
@@ -552,8 +566,16 @@ internal static class WorkBuddyGrowthCenter
             try
             {
                 using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token);
-                var bytes = response.Content.ReadAsByteArrayAsync(cancellation.Token).GetAwaiter().GetResult();
-                if (bytes.Length > 131_072) return new GrowthResponse(0, new JsonObject { ["error"] = "响应过大" }, true);
+                const int maximumBytes = 131_072;
+                if (response.Content.Headers.ContentLength is > maximumBytes)
+                    return new GrowthResponse(-4, new JsonObject { ["error"] = "响应过大" }, TooLarge: true);
+                using var stream = response.Content.ReadAsStream(cancellation.Token);
+                byte[] bytes;
+                try { bytes = ReadBounded(stream, maximumBytes, cancellation.Token); }
+                catch (ResponseTooLargeException)
+                {
+                    return new GrowthResponse(-4, new JsonObject { ["error"] = "响应过大" }, TooLarge: true);
+                }
                 JsonNode body;
                 try { body = JsonNode.Parse(bytes) ?? new JsonObject(); }
                 catch { body = new JsonObject { ["raw"] = Encoding.UTF8.GetString(bytes.AsSpan(0, Math.Min(500, bytes.Length))) }; }
@@ -567,8 +589,43 @@ internal static class WorkBuddyGrowthCenter
 
         private double BudgetLeft => Math.Max(0, config.GrowthRunBudgetSeconds - _elapsed.Elapsed.TotalSeconds);
 
+        private bool CheckCancellation()
+        {
+            if (_cancelled) return true;
+            if (!cancellationRequested()) return false;
+            Cancel();
+            return true;
+        }
+
+        private void Cancel()
+        {
+            _cancelled = true;
+            _stopAll = true;
+            if (!_parts.Contains("成长中心已让出执行权", StringComparer.Ordinal))
+                _parts.Add("成长中心已让出执行权");
+        }
+
+        private static byte[] ReadBounded(Stream stream, int maximumBytes, CancellationToken cancellationToken)
+        {
+            using var buffer = new MemoryStream();
+            var chunk = new byte[8192];
+            while (true)
+            {
+                var remaining = maximumBytes + 1 - (int)buffer.Length;
+                if (remaining <= 0) throw new ResponseTooLargeException();
+                var read = stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellationToken)
+                    .GetAwaiter().GetResult();
+                if (read == 0) return buffer.ToArray();
+                buffer.Write(chunk, 0, read);
+                if (buffer.Length > maximumBytes) throw new ResponseTooLargeException();
+            }
+        }
+
+        private sealed class ResponseTooLargeException : Exception;
+
         private bool StopForAuth(GrowthResponse response)
         {
+            if (response.Cancelled) return true;
             if (response.StatusCode is not (401 or 403)) return false;
             _authenticationRejected = true;
             _stopAll = true;
@@ -695,12 +752,15 @@ internal static class WorkBuddyGrowthCenter
         }
     }
 
-    private sealed record GrowthResponse(int StatusCode, JsonNode Body, bool NetworkFailed = false, bool BudgetOut = false)
+    private sealed record GrowthResponse(int StatusCode, JsonNode Body, bool NetworkFailed = false, bool BudgetOut = false,
+        bool Cancelled = false, bool TooLarge = false)
     {
         internal bool IsSuccess => StatusCode is >= 200 and < 300;
-        internal bool IsHardFailure => NetworkFailed || BudgetOut || StatusCode >= 500;
+        internal bool IsHardFailure => NetworkFailed || BudgetOut || TooLarge || StatusCode >= 500;
         internal static GrowthResponse BudgetExpired() =>
             new(-2, new JsonObject { ["error"] = "时间预算耗尽" }, BudgetOut: true);
+        internal static GrowthResponse CancelledRequest() =>
+            new(-3, new JsonObject { ["error"] = "已让出执行权" }, Cancelled: true);
     }
 
     private static JsonNode? Find(JsonNode? node, string key, int depth = 0)
@@ -767,7 +827,7 @@ internal static class GrowthCenterSelfTests
             Json(HttpStatusCode.OK, "{\"data\":{\"balance\":3}}"),
             Json(HttpStatusCode.OK, "{\"data\":{\"streak\":{\"days\":7}}}")
         ]);
-        var result = WorkBuddyGrowthCenter.Execute(Session(), new Config(), handler, _ => { });
+        var result = WorkBuddyGrowthCenter.Execute(Session(), new Config(), handler, _ => false);
         string[] expected =
         [
             "/v2/activity/growth/buddy/travel/status",
@@ -820,7 +880,7 @@ internal static class GrowthCenterSelfTests
             Json(HttpStatusCode.OK, "{\"data\":{\"affordable\":0}}"),
             Json(HttpStatusCode.OK, "{\"data\":{\"balance\":1}}")
         ]);
-        var failedClaim = WorkBuddyGrowthCenter.Execute(Session(), new Config(), claimFailure, _ => { });
+        var failedClaim = WorkBuddyGrowthCenter.Execute(Session(), new Config(), claimFailure, _ => false);
         if (!failedClaim.NeedsAttention ||
             claimFailure.Paths.Count(path => path.EndsWith("/buddy/travel/claim", StringComparison.Ordinal)) != 1 ||
             claimFailure.Paths.Any(path => path.EndsWith("/buddy/travel/config", StringComparison.Ordinal) ||
@@ -828,10 +888,22 @@ internal static class GrowthCenterSelfTests
             throw new InvalidOperationException("旅行领奖写请求不得自动重试，失败后也不得覆盖奖励并派出 Buddy。");
 
         var disconnected = new ThrowingHandler();
-        var networkResult = WorkBuddyGrowthCenter.Execute(Session(), new Config(), disconnected, _ => { });
+        var networkResult = WorkBuddyGrowthCenter.Execute(Session(), new Config(), disconnected, _ => false);
         if (!networkResult.NeedsAttention || disconnected.Attempts != 6 ||
             !networkResult.Report.Contains("网络不可达，成长中心跳过", StringComparison.Ordinal))
             throw new InvalidOperationException("首个旅行状态查询网络失败时，应按上游节奏有限重试并停止后续模块。");
+
+        var cancellable = new ThrowingHandler();
+        var cancelled = WorkBuddyGrowthCenter.Execute(Session(), new Config(), cancellable, _ => true);
+        if (!cancelled.Cancelled || cancelled.NeedsAttention || cancellable.Attempts != 1)
+            throw new InvalidOperationException("成长中心网络退避必须能立即让出执行权，不能阻塞托盘手动重试。");
+
+        var oversized = new OversizedHandler();
+        var oversizedResult = WorkBuddyGrowthCenter.Execute(Session(), new Config(), oversized, _ => false);
+        if (!oversizedResult.NeedsAttention ||
+            oversized.Paths.Count(path => path.EndsWith("/buddy/travel/status", StringComparison.Ordinal)) != 1 ||
+            !oversizedResult.Report.Contains("响应过大", StringComparison.Ordinal))
+            throw new InvalidOperationException("超限响应必须明确报告且不得按网络故障重试。");
     }
 
     private static WorkBuddyApiSession Session() => new()
@@ -874,6 +946,23 @@ internal static class GrowthCenterSelfTests
         {
             Attempts++;
             throw new HttpRequestException("offline fixture");
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(Send(request, cancellationToken));
+    }
+
+    private sealed class OversizedHandler : HttpMessageHandler
+    {
+        internal List<string> Paths { get; } = [];
+
+        protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Paths.Add(request.RequestUri?.AbsolutePath ?? string.Empty);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new MemoryStream(new byte[131_073], writable: false))
+            };
         }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
