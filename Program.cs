@@ -51,6 +51,7 @@ internal static class Program
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
         if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
         if (command == "--self-test") return RunSelfTest();
+        if (command == "--api-status-test") return RunApiStatusTest();
         if (command == "--ui-smoke-test") return TrayApplication.RunSmokeTest(args.Skip(1).FirstOrDefault());
         if (command == "--startup-status") return RunStartupStatusProbe();
         if (command == "--set-startup") return RunSetStartup(args.Skip(1).FirstOrDefault());
@@ -218,7 +219,7 @@ internal static class Program
                     continue;
                 }
 
-                if (!IsInteractiveDesktop())
+                if (!IsInteractiveDesktop() && !config.UseApiFastPath)
                 {
                     retryDelay = TimeSpan.FromSeconds(60);
                     Log("桌面已锁定；将在 60 秒后重试，且不计入领取次数。");
@@ -507,8 +508,196 @@ internal static class Program
 
     private static int RunOnceCore(Config config, ClaimRunMode mode)
     {
+        if (!config.UseApiFastPath)
+            return RunOcrOnlyCore(config, mode, fallbackReason: "接口快速通道已关闭", executionChannel: "OcrFallback");
+
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         int maxAttempts = GetAttemptLimit(config, mode);
+        var previousStatus = LoadRunStatus();
+        var lastKnownBalance = previousStatus?.AfterBalance ?? previousStatus?.BeforeBalance;
+        RecordRunStatus(new RunStatus
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Mode = isManualTest ? "Manual" : "Automatic",
+            Outcome = "Running",
+            Message = "正在通过服务端接口查询今日领取状态。",
+            AttemptsPerformed = 0,
+            MaxAttempts = maxAttempts,
+            ExecutionChannel = "Api",
+            BalanceFresh = false,
+            AfterBalance = lastKnownBalance
+        });
+
+        var sessionLoad = WorkBuddyApiFastPath.LoadSession(config);
+        if (!sessionLoad.IsReady)
+        {
+            Log("接口快速通道不可用: " + sessionLoad.Message);
+            if (!string.IsNullOrWhiteSpace(sessionLoad.PendingHost))
+            {
+                RecordRunStatus(new RunStatus
+                {
+                    UpdatedAt = DateTimeOffset.Now,
+                    Mode = isManualTest ? "Manual" : "Automatic",
+                    Outcome = "Running",
+                    Message = sessionLoad.Message,
+                    AttemptsPerformed = 0,
+                    MaxAttempts = maxAttempts,
+                    ExecutionChannel = "OcrFallback",
+                    EndpointHost = sessionLoad.PendingHost,
+                    PendingEndpointHost = sessionLoad.PendingHost,
+                    FallbackReason = sessionLoad.FallbackReason,
+                    BalanceFresh = false,
+                    AfterBalance = lastKnownBalance
+                });
+                Notify("WorkBuddy 接口域名待确认",
+                    $"发现未知服务端域名：{sessionLoad.PendingHost}\n登录令牌未发送，已转入 OCR 保底。",
+                    ToolTipIcon.Warning);
+            }
+            return RunOcrOnlyCore(config, mode, fallbackReason: sessionLoad.FallbackReason,
+                endpointHost: sessionLoad.PendingHost, pendingEndpointHost: sessionLoad.PendingHost,
+                executionChannel: "OcrFallback");
+        }
+
+        var session = sessionLoad.Session!;
+        bool refreshedCredentials = false;
+        bool claimMayHaveBeenSent = false;
+        ApiAttemptResult? lastResult = null;
+        int[] backoffSeconds = [5, 15, 30, 60];
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            int currentAttempt = attempt;
+            Log($"接口快速通道第 {attempt}/{maxAttempts} 次：先查询今日状态。");
+            lastResult = WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent, () =>
+            {
+                claimMayHaveBeenSent = true;
+                RecordRunStatus(new RunStatus
+                {
+                    UpdatedAt = DateTimeOffset.Now,
+                    Mode = isManualTest ? "Manual" : "Automatic",
+                    Outcome = "Pending",
+                    Message = "领取请求即将发送；若响应丢失，下次将先查询状态。",
+                    AttemptsPerformed = currentAttempt,
+                    MaxAttempts = maxAttempts,
+                    ExecutionChannel = "Api",
+                    ApiResult = "Pending",
+                    EndpointHost = session.Endpoint.Host,
+                    BalanceFresh = false,
+                    AfterBalance = lastKnownBalance
+                });
+            });
+            Log($"接口结果：HTTP {lastResult.HttpStatus?.ToString() ?? "无"}，{lastResult.Message}");
+
+            if (lastResult.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed)
+                return CompleteApiSuccess(config, mode, lastResult, attempt, maxAttempts, lastKnownBalance);
+
+            if (lastResult.Kind == ApiAttemptKind.RefreshCredentials)
+            {
+                if (config.ApiRefreshOnUnauthorized && !refreshedCredentials)
+                {
+                    refreshedCredentials = true;
+                    var refreshed = WorkBuddyApiFastPath.LoadSession(config);
+                    if (refreshed.IsReady)
+                    {
+                        session = refreshed.Session!;
+                        claimMayHaveBeenSent = lastResult.ClaimMayHaveBeenSent;
+                        Log("HTTP 401 后已重新读取一次本地登录会话；下一次仍先查状态。");
+                        if (attempt < maxAttempts)
+                        {
+                            Thread.Sleep(TimeSpan.FromSeconds(backoffSeconds[Math.Min(attempt - 1, backoffSeconds.Length - 1)]));
+                            continue;
+                        }
+                    }
+                }
+                lastResult = new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
+                    "接口认证在唯一一次会话刷新后仍失败，转入 OCR 保底。", HttpStatus: 401,
+                    FallbackReason: "HTTP 401");
+            }
+
+            if (lastResult.Kind is ApiAttemptKind.NeedsOcr or ApiAttemptKind.InactiveNeedsSingleOcr)
+            {
+                var ocrAttempts = lastResult.Kind == ApiAttemptKind.InactiveNeedsSingleOcr
+                    ? 1
+                    : Math.Max(1, maxAttempts - attempt + 1);
+                Log($"接口快速通道转入 OCR 保底：{lastResult.FallbackReason ?? lastResult.Message}；OCR 最多 {ocrAttempts} 次。");
+                return RunOcrOnlyCore(config, mode, ocrAttempts, attempt - 1, maxAttempts,
+                    lastResult.FallbackReason ?? lastResult.Message, session.Endpoint.Host,
+                    executionChannel: "OcrFallback");
+            }
+
+            claimMayHaveBeenSent |= lastResult.ClaimMayHaveBeenSent;
+            if (attempt < maxAttempts)
+            {
+                var delay = lastResult.RetryAfter ??
+                    TimeSpan.FromSeconds(backoffSeconds[Math.Min(attempt - 1, backoffSeconds.Length - 1)]);
+                Log($"接口将在 {delay.TotalSeconds:0} 秒后重试；下次仍先查状态。");
+                Thread.Sleep(delay);
+            }
+        }
+
+        var terminalMessage = claimMayHaveBeenSent
+            ? "领取请求结果仍无法确认，已停止到第二天；未盲目重复点击或进入 OCR。"
+            : lastResult?.Message ?? "接口快速通道失败。";
+        RecordRunStatus(new RunStatus
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Mode = isManualTest ? "Manual" : "Automatic",
+            Outcome = claimMayHaveBeenSent ? "Pending" : "Failed",
+            Message = terminalMessage,
+            AttemptsPerformed = maxAttempts,
+            MaxAttempts = maxAttempts,
+            ExecutionChannel = "Api",
+            ApiResult = claimMayHaveBeenSent ? "Pending" : "Failed",
+            EndpointHost = session.Endpoint.Host,
+            FallbackReason = lastResult?.FallbackReason,
+            BalanceFresh = false,
+            AfterBalance = lastKnownBalance
+        });
+        Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
+            $"{terminalMessage}\n尝试：{maxAttempts}/{maxAttempts}\n余额：{lastKnownBalance ?? "未读取到"}（接口后未刷新）",
+            ToolTipIcon.Error);
+        return 1;
+    }
+
+    private static int CompleteApiSuccess(Config config, ClaimRunMode mode, ApiAttemptResult result,
+        int attempt, int maxAttempts, string? lastKnownBalance)
+    {
+        bool isManualTest = mode == ClaimRunMode.ManualTest;
+        var outcome = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "AlreadyClaimed";
+        if (ShouldPersistDailyState(mode))
+            SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
+        var message = result.Message + " 未启动 WorkBuddy 图形界面。";
+        RecordRunStatus(new RunStatus
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Mode = isManualTest ? "Manual" : "Automatic",
+            Outcome = outcome,
+            Message = message,
+            AfterBalance = lastKnownBalance,
+            AttemptsPerformed = attempt,
+            MaxAttempts = maxAttempts,
+            ExecutionChannel = "Api",
+            ApiResult = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "Already",
+            CreditGained = result.Credit,
+            StreakDays = result.StreakDays,
+            EndpointHost = result.EndpointHost,
+            BalanceFresh = false
+        });
+        var reward = string.IsNullOrWhiteSpace(result.Credit) ? "" : $"\n本次：+{result.Credit} 积分";
+        var streak = result.StreakDays.HasValue ? $"\n连签：{result.StreakDays} 天" : "";
+        Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
+            $"{result.Message}{reward}{streak}\n账户余额：{lastKnownBalance ?? "未读取到"}（接口领取后未刷新）\n尝试：{attempt}/{maxAttempts}",
+            ToolTipIcon.Info);
+        Log("接口快速通道完成: " + result.Message);
+        return 0;
+    }
+
+    private static int RunOcrOnlyCore(Config config, ClaimRunMode mode, int? attemptLimitOverride = null,
+        int attemptOffset = 0, int? totalAttemptLimit = null, string? fallbackReason = null,
+        string? endpointHost = null, string? pendingEndpointHost = null, string executionChannel = "Ocr")
+    {
+        bool isManualTest = mode == ClaimRunMode.ManualTest;
+        int maxAttempts = attemptLimitOverride ?? GetAttemptLimit(config, mode);
+        int displayedMaxAttempts = totalAttemptLimit ?? maxAttempts;
         MaintainDiagnosticRetention();
         if (!IsInteractiveDesktop())
         {
@@ -520,7 +709,11 @@ internal static class Program
                 Outcome = "Failed",
                 Message = "桌面已锁定，未执行领取。",
                 AttemptsPerformed = 0,
-                MaxAttempts = maxAttempts
+                MaxAttempts = displayedMaxAttempts,
+                ExecutionChannel = executionChannel,
+                FallbackReason = fallbackReason,
+                EndpointHost = endpointHost,
+                PendingEndpointHost = pendingEndpointHost
             });
             if (isManualTest)
                 NotifyManualTestFailure("桌面已锁定，测试未执行",
@@ -547,7 +740,11 @@ internal static class Program
             Outcome = "Running",
             Message = "正在打开个人中心并读取积分余额。",
             AttemptsPerformed = 0,
-            MaxAttempts = maxAttempts
+            MaxAttempts = displayedMaxAttempts,
+            ExecutionChannel = executionChannel,
+            FallbackReason = fallbackReason,
+            EndpointHost = endpointHost,
+            PendingEndpointHost = pendingEndpointHost
         });
         try
         {
@@ -579,12 +776,12 @@ internal static class Program
                         Log("手动测试开始前检测到桌面锁定；测试未执行且不计入尝试次数。");
                         return 3;
                     }
-                    WaitForInteractiveDesktopWithinBatch(attemptsPerformed, maxAttempts);
+                    WaitForInteractiveDesktopWithinBatch(attemptsPerformed, displayedMaxAttempts);
                 }
-                attemptsPerformed = attempt;
+                attemptsPerformed = attemptOffset + attempt;
                 try
                 {
-                    Log($"开始{(isManualTest ? "手动测试" : "领取")}，第 {attempt}/{maxAttempts} 次。");
+                    Log($"开始{(isManualTest ? "手动测试" : "领取")}，第 {attemptsPerformed}/{displayedMaxAttempts} 次。");
                     succeeded = TryClaimFromPersonalCenter(window, config, out result, out outcomeKind,
                         out notificationBeforeBalance, out notificationAfterBalance);
                 }
@@ -616,8 +813,8 @@ internal static class Program
                         Log("手动测试过程中检测到桌面锁定；当前失败不计入测试次数。");
                         return 3;
                     }
-                    attemptsPerformed = Math.Max(0, attempt - 1);
-                    WaitForInteractiveDesktopWithinBatch(attemptsPerformed, maxAttempts);
+                    attemptsPerformed = Math.Max(attemptOffset, attemptOffset + attempt - 1);
+                    WaitForInteractiveDesktopWithinBatch(attemptsPerformed, displayedMaxAttempts);
                     attempt--;
                 }
             }
@@ -652,11 +849,15 @@ internal static class Program
                 BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
                 AfterBalance = FormatNotificationBalance(notificationAfterBalance),
                 AttemptsPerformed = attemptsPerformed,
-                MaxAttempts = maxAttempts
+                MaxAttempts = displayedMaxAttempts,
+                ExecutionChannel = executionChannel,
+                FallbackReason = fallbackReason,
+                EndpointHost = endpointHost,
+                PendingEndpointHost = pendingEndpointHost
             });
             Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
                 BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
-                    FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, maxAttempts,
+                    FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, displayedMaxAttempts,
                     DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result), ToolTipIcon.Info);
             return 0;
         }
@@ -671,11 +872,15 @@ internal static class Program
             BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
             AfterBalance = FormatNotificationBalance(notificationAfterBalance),
             AttemptsPerformed = attemptsPerformed,
-            MaxAttempts = maxAttempts
+            MaxAttempts = displayedMaxAttempts,
+            ExecutionChannel = executionChannel,
+            FallbackReason = fallbackReason,
+            EndpointHost = endpointHost,
+            PendingEndpointHost = pendingEndpointHost
         });
         var failureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed,
             FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance),
-            attemptsPerformed, maxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result);
+            attemptsPerformed, displayedMaxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result);
         if (isManualTest)
             NotifyManualTestFailure(result, failureNotification);
         else
@@ -739,6 +944,35 @@ internal static class Program
         catch (Exception ex)
         {
             Log("Self test failed: " + ex);
+            return 1;
+        }
+    }
+
+    private static int RunApiStatusTest()
+    {
+        try
+        {
+            var config = LoadConfig();
+            var loaded = WorkBuddyApiFastPath.LoadSession(config);
+            if (!loaded.IsReady)
+            {
+                Log("接口只读状态测试未执行: " + loaded.Message);
+                Notify("WorkBuddy 接口只读测试", loaded.Message, ToolTipIcon.Warning);
+                return 1;
+            }
+            var result = WorkBuddyApiFastPath.QueryStatusOnly(loaded.Session!, config);
+            Log($"接口只读状态测试：HTTP {result.HttpStatus?.ToString() ?? "无"}，{result.Message}");
+            var ok = result.Kind is ApiAttemptKind.AlreadyClaimed or ApiAttemptKind.InactiveNeedsSingleOcr ||
+                     result.FallbackReason == "STATUS_UNCLAIMED";
+            Notify("WorkBuddy 接口只读测试",
+                $"{result.Message}\n域名：{loaded.Session!.Endpoint.Host}\n本测试未调用领取接口。",
+                ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+            return ok ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            Log("接口只读状态测试失败: " + ex.GetType().Name + " - " + ex.Message);
+            Notify("WorkBuddy 接口只读测试", "只读状态查询失败；未调用领取接口。", ToolTipIcon.Error);
             return 1;
         }
     }
@@ -4772,6 +5006,7 @@ internal static class Program
         {
             if (Directory.Exists(statusTestDirectory)) Directory.Delete(statusTestDirectory, recursive: true);
         }
+        WorkBuddyApiSelfTests.Run(config);
         Log("Self test OK.");
         return 0;
     }
@@ -4806,9 +5041,52 @@ internal static class Program
             throw new InvalidOperationException("失败重试间隔必须在 10 到 3600 秒之间。");
         if (config.LaunchWaitSeconds is < 5 or > 120 || config.CardReadyTimeoutSeconds is < 5 or > 120)
             throw new InvalidOperationException("启动等待和界面等待必须在 5 到 120 秒之间。");
+        if (config.ApiTimeoutSeconds is < 5 or > 60)
+            throw new InvalidOperationException("接口请求超时必须在 5 到 60 秒之间。");
+        if (config.ApiAllowedHosts is null || config.ApiAllowedHosts.Count == 0 ||
+            config.ApiAllowedHosts.Any(host => string.IsNullOrWhiteSpace(host) ||
+                host.Contains('/') || host.Contains('\\') || host.Contains('@') || host.Contains(':')))
+            throw new InvalidOperationException("接口域名白名单必须至少包含一个纯域名，不能包含协议、端口或路径。");
+        config.ApiRejectedHosts ??= [];
+        if (config.ApiRejectedHosts.Any(host => string.IsNullOrWhiteSpace(host) ||
+                host.Contains('/') || host.Contains('\\') || host.Contains('@') || host.Contains(':')))
+            throw new InvalidOperationException("已拒绝接口域名列表只能包含纯域名。");
     }
 
     internal static void SaveConfig(Config config) => SaveConfig(config, ConfigPath);
+
+    internal static void ApproveApiHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host) || host.Contains('/') || host.Contains('\\') ||
+            host.Contains('@') || host.Contains(':'))
+            throw new InvalidOperationException("待允许的接口域名格式无效。");
+        var config = LoadConfig();
+        if (!config.ApiAllowedHosts.Contains(host, StringComparer.OrdinalIgnoreCase))
+            config.ApiAllowedHosts.Add(host.ToLowerInvariant());
+        config.ApiRejectedHosts.RemoveAll(value => string.Equals(value, host, StringComparison.OrdinalIgnoreCase));
+        SaveConfig(config);
+        ClearPendingApiHost(host, $"已允许接口域名 {host}；下一轮可使用接口快速通道。");
+    }
+
+    internal static void RejectPendingApiHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host) || host.Contains('/') || host.Contains('\\') ||
+            host.Contains('@') || host.Contains(':'))
+            throw new InvalidOperationException("待拒绝的接口域名格式无效。");
+        var config = LoadConfig();
+        if (!config.ApiRejectedHosts.Contains(host, StringComparer.OrdinalIgnoreCase))
+            config.ApiRejectedHosts.Add(host.ToLowerInvariant());
+        config.ApiAllowedHosts.RemoveAll(value => string.Equals(value, host, StringComparison.OrdinalIgnoreCase));
+        SaveConfig(config);
+        ClearPendingApiHost(host, $"已拒绝接口域名 {host}；该域名不会收到登录令牌。");
+    }
+
+    private static void ClearPendingApiHost(string host, string message)
+    {
+        var status = LoadRunStatus();
+        if (status is null || !string.Equals(status.PendingEndpointHost, host, StringComparison.OrdinalIgnoreCase)) return;
+        SaveRunStatus(status with { PendingEndpointHost = null, Message = message, UpdatedAt = DateTimeOffset.Now });
+    }
 
     internal static void SaveConfig(Config config, string path)
     {
@@ -5120,6 +5398,12 @@ internal sealed class Config
     public int ManualMaxAttempts { get; set; } = 1;
     public int LaunchWaitSeconds { get; set; } = 20;
     public int CardReadyTimeoutSeconds { get; set; } = 30;
+    public bool UseApiFastPath { get; set; } = true;
+    public string ApiAuthFilePath { get; set; } = "";
+    public int ApiTimeoutSeconds { get; set; } = 15;
+    public bool ApiRefreshOnUnauthorized { get; set; } = true;
+    public List<string> ApiAllowedHosts { get; set; } = ["copilot.tencent.com"];
+    public List<string> ApiRejectedHosts { get; set; } = [];
     public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
     public List<string> CheckInKeywords { get; set; } = [.. DefaultCheckInKeywords];
     public int BalanceValueVerticalTolerance { get; set; } = 80;

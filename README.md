@@ -1,6 +1,6 @@
 # WorkBuddy 自动领取
 
-在 Windows 后台按计划领取 WorkBuddy 积分的本地工具。它复用已经登录的 WorkBuddy 会话，通过个人中心读取“积分余额”并核验结果；不会保存账号密码，也不会上传截图或 OCR 文字。
+在 Windows 后台按计划领取 WorkBuddy 积分的本地工具。默认先复用本机已登录的 WorkBuddy 会话，通过服务端接口快速查询/领取；接口不可用时自动回到原有个人中心 OCR 流程。不会保存账号密码或令牌，也不会上传截图或 OCR 文字。
 
 <p align="center">
   <img src="docs/images/tray-icon.png" width="64" alt="WorkBuddy 自动领取守护托盘图标">
@@ -17,9 +17,9 @@
 ## 它会做什么
 
 - 默认每天 `00:00` 尝试领取一次；时间可在 `config.json` 的 `ClaimTime` 中修改。
-- 电脑锁屏、睡眠或桌面暂不可操作时，每 `60` 秒等待一次，且不计入领取次数；解锁后当天最多尝试 `5` 次。
+- 接口快速通道不依赖可交互桌面；只有回退到 OCR 时，锁屏、睡眠或桌面暂不可操作才每 `60` 秒等待一次，且不计入领取次数。
 - 成功、确认“今日已领取”或达到当天失败上限后，守护进程休眠到下一天，不会全天轮询或反复点击。
-- WorkBuddy 未运行时会后台启动；由工具启动的 WorkBuddy 会在流程结束后关闭。开始领取时只要 WorkBuddy 窗口可见且未最小化，结束后就保持展开，不依赖当时键盘焦点；只有原本已最小化的窗口才恢复为最小化。
+- 接口成功时不会启动 WorkBuddy 图形界面。只有 OCR 保底需要窗口：未运行时后台启动并在结束后关闭；原本前台则保持前台；原本最小化则完成后恢复最小化。
 - 成功、今日已领取、失败都会发送 Windows 通知中心通知，并保留三天。
 - 守护进程常驻在右下角通知区域：左键图标打开面板，右键可以打开面板、重试领取或退出守护。
 - 右键菜单中的“开机启动”带勾选状态；取消勾选只关闭下次登录自启，当前守护不会退出。
@@ -30,12 +30,23 @@
 
 - “概览”显示最近领取状态、当前余额、更新时间、领取详情和下一次自动领取时间。
 - “重试领取”按照“手动尝试次数”执行；运行期间按钮会锁定，避免重复提交。
-- “设置”可修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
+- “设置”可开关接口快速通道，并修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
 - 点击“保存并立即应用”会唤醒守护并重新计算计划，不需要重启程序。
 - 关闭面板只会隐藏到右下角；要停止常驻守护，请右键托盘图标并选择“退出守护”。
 - “打开高级配置”可编辑 OCR 与界面适配参数，面板保存常用设置时会保留这些高级参数。
 
 ## 领取与核验逻辑
+
+### 接口快速通道（默认）
+
+1. 从 WorkBuddy 本机登录会话读取接口地址、用户标识和访问令牌；兼容明文令牌及 `sym-v1` 加密令牌。令牌只保留在本次进程内存中，不写入配置、日志、状态或通知。
+2. 只允许向 `ApiAllowedHosts` 白名单中的 HTTPS 域名发送令牌，默认仅 `copilot.tencent.com`。发现未知域名时立即提示，绝不发送令牌，并转入 OCR；可在概览页手动允许或拒绝该域名。
+3. 每次先调用只读状态接口。已领取则直接结束；未领取才调用每日领取接口；`credit` 字段是接口领取成功的必要依据。
+4. 领取请求超时或响应丢失后，不立即启动 OCR，而是在下一次先查状态，避免重复领取。HTTP 429 最多按服务端要求等待 60 秒；HTTP 401 全程只重新读取一次本地会话。
+5. 自动任务最多 5 次，间隔依次为 5、15、30、60 秒。`active=false` 时只执行一次完整 OCR；接口状态查询在发送领取前就失败时，可在当前尝试转入 OCR。
+6. 接口成功会显示本次增加积分及连签天数。由于没有打开个人中心，余额沿用最近一次 OCR 数值并明确标注“接口领取后未刷新”。
+
+### OCR 保底通道
 
 每次尝试严格按以下顺序执行：
 
@@ -101,6 +112,12 @@
 | `ManualMaxAttempts` | `1` | 面板或 `--manual-test` 手动领取的最多尝试次数 |
 | `LaunchWaitSeconds` | `20` | 启动 WorkBuddy 后的等待秒数 |
 | `CardReadyTimeoutSeconds` | `30` | 普通界面等待秒数；明确处于余额加载态时自动扩展至至少 90 秒，数字出现后立即结束等待 |
+| `UseApiFastPath` | `true` | 优先使用服务端接口；关闭后始终使用 OCR |
+| `ApiTimeoutSeconds` | `15` | 单次接口请求超时，允许 5～60 秒 |
+| `ApiRefreshOnUnauthorized` | `true` | HTTP 401 后重新读取一次本机登录会话 |
+| `ApiAllowedHosts` | `copilot.tencent.com` | 可接收登录令牌的精确域名白名单 |
+| `ApiRejectedHosts` | 空 | 在概览页拒绝过的域名；不会再次询问或发送令牌 |
+| `ApiAuthFilePath` | 空 | 可选的 WorkBuddy 会话文件路径；留空时自动发现 |
 | `ImmediateClaimKeywords` | `立即领取` | 最终领取按钮的识别文字 |
 | `CheckInKeywords` | `签到领积分`、`去签到`、`签到` | 进入领取流程的入口文字 |
 
@@ -115,6 +132,9 @@ cd .\release
 
 # 运行内置回归检查；不会领取
 .\WorkBuddyAutoClaim.exe --self-test
+
+# 使用真实本机会话只查询签到状态；明确不会调用领取接口
+.\WorkBuddyAutoClaim.exe --api-status-test
 
 # 验证托盘图标和 GUI 能创建；不会启动或控制 WorkBuddy
 .\WorkBuddyAutoClaim.exe --ui-smoke-test
@@ -180,7 +200,7 @@ cd .\release
 - `state.json` 使用原子写入和 `.bak` 备份。两份状态都损坏时，当天安全停止并通知，不会重复领取。
 - 安装的 Windows 任务在登录时启动守护进程；守护异常退出时，任务计划会每分钟最多重启 3 次。
 - 安装、手动测试或安全测试结束时，工具优先请求任务计划恢复守护；只有新守护完成配置加载并主动发出就绪信号后才记录恢复成功，直接启动回退也执行同样确认。
-- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.1.6.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
+- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.2.0.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
 - `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-auto-claim.log` 只保留最近 30 天；`diagnostics\` 仅保留最新 20 份失败诊断。诊断包包含截图、OCR 原文、WorkBuddy 版本、窗口尺寸和 DPI；成功领取不会保留领取截图。
 
 失败通知除余额外，还会包含失败阶段、已执行尝试次数，以及 WorkBuddy 是保留原前台、保留后台最小化，还是由工具启动后关闭。
@@ -188,3 +208,5 @@ cd .\release
 ## 项目关系
 
 本项目是独立仓库实现，不是 `GitOfUser/workbuddy-checkin` 的 Fork，也不共享提交历史。早期仅参考了其流程思路；本工具的后台行为、OCR 校验、通知和维护均独立实现。
+
+接口会话兼容和签到端点实现参考并改写自 MIT 许可项目 [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)，固定参考提交为 `cb2bf1f02db8900922dc0f06090cdb7334d45ff5`。完整许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本项目不会自动下载或执行上游代码；上游变化只会提示人工审查并随本项目新版 EXE 发布。

@@ -290,6 +290,8 @@ internal sealed class DashboardForm : Form
     private readonly Label _nextRunValue = new();
     private readonly Label _detailValue = new();
     private readonly Button _retryButton = new();
+    private readonly FlowLayoutPanel _endpointApprovalPanel = new();
+    private readonly Label _endpointApprovalLabel = new();
     private readonly TextBox _workBuddyPath = new();
     private readonly DateTimePicker _claimTime = new();
     private readonly NumericUpDown _automaticAttempts = new();
@@ -297,6 +299,7 @@ internal sealed class DashboardForm : Form
     private readonly NumericUpDown _retryInterval = new();
     private readonly NumericUpDown _launchWait = new();
     private readonly NumericUpDown _cardWait = new();
+    private readonly CheckBox _apiFastPath = new();
     private readonly Label _saveMessage = new();
     private readonly TabControl _tabs = new() { Dock = DockStyle.Fill, Padding = new Point(16, 7) };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1500 };
@@ -339,7 +342,7 @@ internal sealed class DashboardForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 8,
+            RowCount = 9,
             AutoScroll = true
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
@@ -349,6 +352,7 @@ internal sealed class DashboardForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
 
         _statusTitle.Font = new Font(Font.FontFamily, 15, FontStyle.Bold);
@@ -371,6 +375,19 @@ internal sealed class DashboardForm : Form
         _retryButton.FlatStyle = FlatStyle.Flat;
         _retryButton.Click += (_, _) => _retry();
 
+        _endpointApprovalPanel.Dock = DockStyle.Fill;
+        _endpointApprovalPanel.FlowDirection = FlowDirection.LeftToRight;
+        _endpointApprovalPanel.Visible = false;
+        _endpointApprovalLabel.AutoSize = true;
+        _endpointApprovalLabel.Padding = new Padding(0, 8, 8, 0);
+        var allowEndpoint = new Button { Text = "允许域名", AutoSize = true, Height = 34 };
+        allowEndpoint.Click += (_, _) => UpdatePendingEndpoint(allow: true);
+        var rejectEndpoint = new Button { Text = "拒绝", AutoSize = true, Height = 34 };
+        rejectEndpoint.Click += (_, _) => UpdatePendingEndpoint(allow: false);
+        _endpointApprovalPanel.Controls.Add(_endpointApprovalLabel);
+        _endpointApprovalPanel.Controls.Add(allowEndpoint);
+        _endpointApprovalPanel.Controls.Add(rejectEndpoint);
+
         var hint = new Label
         {
             Text = "关闭此窗口只会隐藏到右下角，守护仍会继续运行。",
@@ -384,6 +401,7 @@ internal sealed class DashboardForm : Form
         layout.Controls.Add(new Label { Text = "最近详情", Dock = DockStyle.Fill, Font = new Font(Font, FontStyle.Bold) });
         layout.Controls.Add(_detailValue);
         layout.Controls.Add(_retryButton);
+        layout.Controls.Add(_endpointApprovalPanel);
         layout.Controls.Add(hint);
         page.Controls.Add(layout);
         return page;
@@ -396,13 +414,13 @@ internal sealed class DashboardForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            RowCount = 9,
+            RowCount = 10,
             AutoScroll = true
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
-        for (var i = 0; i < 8; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        for (var i = 0; i < 9; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         _workBuddyPath.Dock = DockStyle.Fill;
@@ -414,6 +432,8 @@ internal sealed class DashboardForm : Form
         ConfigureNumeric(_retryInterval, 10, 3600, 60);
         ConfigureNumeric(_launchWait, 5, 120, 20);
         ConfigureNumeric(_cardWait, 5, 120, 30);
+        _apiFastPath.Text = "优先使用服务端接口（推荐）";
+        _apiFastPath.Dock = DockStyle.Fill;
 
         AddSettingRow(layout, 0, "WorkBuddy 程序", _workBuddyPath, browse);
         AddSettingRow(layout, 1, "每天领取时间", _claimTime, new Label { Text = "HH:mm", TextAlign = ContentAlignment.MiddleCenter });
@@ -422,6 +442,7 @@ internal sealed class DashboardForm : Form
         AddSettingRow(layout, 4, "失败重试间隔", _retryInterval, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 5, "程序启动等待", _launchWait, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 6, "领取界面等待", _cardWait, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
+        AddSettingRow(layout, 7, "接口快速通道", _apiFastPath, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
         var save = new Button { Text = "保存并立即应用", AutoSize = true, Height = 36 };
@@ -430,12 +451,12 @@ internal sealed class DashboardForm : Form
         advanced.Click += (_, _) => OpenAdvancedConfig();
         actions.Controls.Add(save);
         actions.Controls.Add(advanced);
-        layout.Controls.Add(actions, 0, 7);
+        layout.Controls.Add(actions, 0, 8);
         layout.SetColumnSpan(actions, 3);
         _saveMessage.Dock = DockStyle.Fill;
         _saveMessage.AutoSize = false;
         _saveMessage.Padding = new Padding(0, 10, 0, 0);
-        layout.Controls.Add(_saveMessage, 0, 8);
+        layout.Controls.Add(_saveMessage, 0, 9);
         layout.SetColumnSpan(_saveMessage, 3);
         page.Controls.Add(layout);
         return page;
@@ -478,12 +499,16 @@ internal sealed class DashboardForm : Form
         _statusTitle.ForeColor = status?.Outcome switch
         {
             "Failed" => Color.FromArgb(232, 93, 88),
-            "Running" or "Queued" => Color.FromArgb(226, 168, 51),
+            "Running" or "Queued" or "Pending" => Color.FromArgb(226, 168, 51),
             _ => Color.FromArgb(20, 168, 118)
         };
         _balanceValue.Text = view.Balance;
         _updatedValue.Text = "更新时间：" + view.UpdatedAt;
         _detailValue.Text = view.Detail;
+        _endpointApprovalPanel.Visible = !string.IsNullOrWhiteSpace(status?.PendingEndpointHost);
+        _endpointApprovalLabel.Text = status?.PendingEndpointHost is { Length: > 0 } host
+            ? $"待确认接口域名：{host}"
+            : "";
         try
         {
             var config = Program.LoadConfig();
@@ -546,6 +571,7 @@ internal sealed class DashboardForm : Form
             _retryInterval.Value = Math.Clamp(config.RetryIntervalSeconds, (int)_retryInterval.Minimum, (int)_retryInterval.Maximum);
             _launchWait.Value = Math.Clamp(config.LaunchWaitSeconds, (int)_launchWait.Minimum, (int)_launchWait.Maximum);
             _cardWait.Value = Math.Clamp(config.CardReadyTimeoutSeconds, (int)_cardWait.Minimum, (int)_cardWait.Maximum);
+            _apiFastPath.Checked = config.UseApiFastPath;
         }
         catch (Exception ex)
         {
@@ -565,6 +591,7 @@ internal sealed class DashboardForm : Form
             config.RetryIntervalSeconds = Decimal.ToInt32(_retryInterval.Value);
             config.LaunchWaitSeconds = Decimal.ToInt32(_launchWait.Value);
             config.CardReadyTimeoutSeconds = Decimal.ToInt32(_cardWait.Value);
+            config.UseApiFastPath = _apiFastPath.Checked;
             Program.SaveConfig(config);
             _configSaved();
             _saveMessage.Text = $"已保存并应用 · {DateTime.Now:HH:mm:ss}";
@@ -573,6 +600,24 @@ internal sealed class DashboardForm : Form
         catch (Exception ex)
         {
             _saveMessage.Text = "保存失败：" + ex.Message;
+        }
+    }
+
+    private void UpdatePendingEndpoint(bool allow)
+    {
+        try
+        {
+            var host = Program.LoadRunStatus()?.PendingEndpointHost;
+            if (string.IsNullOrWhiteSpace(host)) return;
+            if (allow) Program.ApproveApiHost(host);
+            else Program.RejectPendingApiHost(host);
+            _configSaved();
+            _saveMessage.Text = allow ? $"已允许接口域名：{host}" : $"已拒绝接口域名：{host}";
+            RefreshFromDisk();
+        }
+        catch (Exception ex)
+        {
+            _saveMessage.Text = "更新接口域名失败：" + ex.Message;
         }
     }
 
