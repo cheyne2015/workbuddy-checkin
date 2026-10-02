@@ -241,7 +241,9 @@ internal static class Program
                     int exitCode = RunOnce(config, ClaimRunMode.Automatic);
                     if (exitCode == 0)
                     {
-                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
+                        // Re-enter the state-driven scheduler so a successful daily run
+                        // can sleep until the next growth poll instead of always sleeping
+                        // straight through to tomorrow.
                         continue;
                     }
                     if (exitCode == 3)
