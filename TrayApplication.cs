@@ -300,6 +300,7 @@ internal sealed class DashboardForm : Form
     private readonly NumericUpDown _launchWait = new();
     private readonly NumericUpDown _cardWait = new();
     private readonly CheckBox _apiFastPath = new();
+    private readonly CheckBox _growthCenter = new();
     private readonly Label _saveMessage = new();
     private readonly TabControl _tabs = new() { Dock = DockStyle.Fill, Padding = new Point(16, 7) };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1500 };
@@ -414,13 +415,13 @@ internal sealed class DashboardForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            RowCount = 10,
+            RowCount = 11,
             AutoScroll = true
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
-        for (var i = 0; i < 9; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        for (var i = 0; i < 10; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         _workBuddyPath.Dock = DockStyle.Fill;
@@ -434,6 +435,8 @@ internal sealed class DashboardForm : Form
         ConfigureNumeric(_cardWait, 5, 120, 30);
         _apiFastPath.Text = "优先使用服务端接口（推荐）";
         _apiFastPath.Dock = DockStyle.Fill;
+        _growthCenter.Text = "成长中心全套（每 4 小时）";
+        _growthCenter.Dock = DockStyle.Fill;
 
         AddSettingRow(layout, 0, "WorkBuddy 程序", _workBuddyPath, browse);
         AddSettingRow(layout, 1, "每天领取时间", _claimTime, new Label { Text = "HH:mm", TextAlign = ContentAlignment.MiddleCenter });
@@ -443,6 +446,7 @@ internal sealed class DashboardForm : Form
         AddSettingRow(layout, 5, "程序启动等待", _launchWait, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 6, "领取界面等待", _cardWait, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 7, "接口快速通道", _apiFastPath, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
+        AddSettingRow(layout, 8, "成长中心", _growthCenter, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
         var save = new Button { Text = "保存并立即应用", AutoSize = true, Height = 36 };
@@ -451,12 +455,12 @@ internal sealed class DashboardForm : Form
         advanced.Click += (_, _) => OpenAdvancedConfig();
         actions.Controls.Add(save);
         actions.Controls.Add(advanced);
-        layout.Controls.Add(actions, 0, 8);
+        layout.Controls.Add(actions, 0, 9);
         layout.SetColumnSpan(actions, 3);
         _saveMessage.Dock = DockStyle.Fill;
         _saveMessage.AutoSize = false;
         _saveMessage.Padding = new Padding(0, 10, 0, 0);
-        layout.Controls.Add(_saveMessage, 0, 9);
+        layout.Controls.Add(_saveMessage, 0, 10);
         layout.SetColumnSpan(_saveMessage, 3);
         page.Controls.Add(layout);
         return page;
@@ -547,7 +551,8 @@ internal sealed class DashboardForm : Form
         if (_tabs.TabPages.Count != 2 || _tabs.TabPages[0].Text != "概览" || _tabs.TabPages[1].Text != "设置")
             throw new InvalidOperationException("守护面板必须包含概览和设置页。");
         if (!_retryButton.Text.Contains("重试领取", StringComparison.Ordinal) ||
-            _automaticAttempts.Minimum != 1 || _manualAttempts.Minimum != 1)
+            _automaticAttempts.Minimum != 1 || _manualAttempts.Minimum != 1 ||
+            !_growthCenter.Text.Contains("成长中心", StringComparison.Ordinal))
             throw new InvalidOperationException("守护面板缺少可用的重试领取或次数配置控件。");
     }
 
@@ -572,6 +577,7 @@ internal sealed class DashboardForm : Form
             _launchWait.Value = Math.Clamp(config.LaunchWaitSeconds, (int)_launchWait.Minimum, (int)_launchWait.Maximum);
             _cardWait.Value = Math.Clamp(config.CardReadyTimeoutSeconds, (int)_cardWait.Minimum, (int)_cardWait.Maximum);
             _apiFastPath.Checked = config.UseApiFastPath;
+            _growthCenter.Checked = config.EnableGrowthCenter;
         }
         catch (Exception ex)
         {
@@ -592,6 +598,7 @@ internal sealed class DashboardForm : Form
             config.LaunchWaitSeconds = Decimal.ToInt32(_launchWait.Value);
             config.CardReadyTimeoutSeconds = Decimal.ToInt32(_cardWait.Value);
             config.UseApiFastPath = _apiFastPath.Checked;
+            config.EnableGrowthCenter = _growthCenter.Checked;
             Program.SaveConfig(config);
             _configSaved();
             _saveMessage.Text = $"已保存并应用 · {DateTime.Now:HH:mm:ss}";

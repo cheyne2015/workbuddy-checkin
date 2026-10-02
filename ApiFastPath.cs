@@ -398,7 +398,7 @@ internal static class WorkBuddyApiFastPath
         {
             using var handler = new HttpClientHandler { AllowAutoRedirect = false };
             using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("WorkBuddyAutoClaim/1.2");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("WorkBuddyAutoClaim/1.3");
             using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             using var response = client.GetAsync(UpstreamHeadApi, HttpCompletionOption.ResponseHeadersRead,
                 cancellation.Token).GetAwaiter().GetResult();

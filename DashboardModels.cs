@@ -18,6 +18,12 @@ internal sealed record RunStatus
     public string? FallbackReason { get; init; }
     public bool BalanceFresh { get; init; } = true;
     public string? PendingEndpointHost { get; init; }
+    public string? GrowthMessage { get; init; }
+    public DateTimeOffset? GrowthUpdatedAt { get; init; }
+    public int GrowthCreditsGained { get; init; }
+    public int? GrowthEnergy { get; init; }
+    public int? GrowthStreakDays { get; init; }
+    public bool GrowthNeedsAttention { get; init; }
 }
 
 internal sealed record DashboardStatusView(string Title, string Balance, string Detail, string UpdatedAt)
@@ -55,8 +61,10 @@ internal sealed record DashboardStatusView(string Title, string Balance, string 
         var reward = string.IsNullOrWhiteSpace(status.CreditGained) ? "" : $" · 本次 +{status.CreditGained}";
         var streak = status.StreakDays.HasValue ? $" · 连签 {status.StreakDays} 天" : "";
         var fallback = string.IsNullOrWhiteSpace(status.FallbackReason) ? "" : $" · 接口回退：{status.FallbackReason}";
+        var growth = string.IsNullOrWhiteSpace(status.GrowthMessage) ? "" :
+            $"\n成长中心（{status.GrowthUpdatedAt?.LocalDateTime:MM-dd HH:mm}）：{status.GrowthMessage}";
         return new DashboardStatusView(title, balance,
-            $"{balanceDetail}{reward}{streak} · {attempts}{fallback}\n{mode} · {channel}：{status.Message}",
+            $"{balanceDetail}{reward}{streak} · {attempts}{fallback}\n{mode} · {channel}：{status.Message}{growth}",
             status.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
     }
 }

@@ -51,6 +51,7 @@ internal static class Program
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
         if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
         if (command == "--self-test") return RunSelfTest();
+        if (command == "--growth-test") return GrowthCenterSelfTests.RunPublic();
         if (command == "--api-status-test") return RunApiStatusTest();
         if (command == "--ui-smoke-test") return TrayApplication.RunSmokeTest(args.Skip(1).FirstOrDefault());
         if (command == "--startup-status") return RunStartupStatusProbe();
@@ -204,7 +205,18 @@ internal static class Program
                 var scheduledToday = now.Date.Add(claimTime);
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
-                    if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
+                    if (config.EnableGrowthCenter && config.UseApiFastPath)
+                    {
+                        var nextGrowth = NextGrowthPollTime(state, now, config);
+                        if (nextGrowth <= now)
+                        {
+                            RunGrowthPoll(config);
+                            continue;
+                        }
+                        var nextWake = nextGrowth < NextClaimTime(now, claimTime) ? nextGrowth : NextClaimTime(now, claimTime);
+                        if (SleepUntilOrManualTestRequest(nextWake, "今天已成功领取，等待成长中心轮询", manualTestRequest, configChanged)) return 0;
+                    }
+                    else if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
@@ -239,6 +251,12 @@ internal static class Program
                     }
                     else
                     {
+                        var afterRun = LoadState();
+                        if (afterRun.IsUsable && afterRun.State!.SuccessDate == DateOnly.FromDateTime(now))
+                        {
+                            Log("每日领取已成功，成长中心存在待处理结果；保留成功状态并进入成长中心轮询计划。");
+                            continue;
+                        }
                         // RunOnce has already completed the configured consecutive
                         // attempts and sent the one terminal-failure notification. Do not
                         // start another attempt batch every minute for the rest of today.
@@ -258,6 +276,13 @@ internal static class Program
     {
         var scheduledToday = now.Date.Add(claimTime);
         return now < scheduledToday ? scheduledToday : scheduledToday.AddDays(1);
+    }
+
+    private static DateTime NextGrowthPollTime(State state, DateTime now, Config config)
+    {
+        if (!state.LastGrowthPollAt.HasValue) return now;
+        var next = state.LastGrowthPollAt.Value.LocalDateTime.AddHours(config.GrowthPollHours);
+        return next <= now ? now : next;
     }
 
     private static bool HasDailyTerminalState(State state, DateOnly date) =>
@@ -603,7 +628,7 @@ internal static class Program
             Log($"接口结果：HTTP {lastResult.HttpStatus?.ToString() ?? "无"}，{lastResult.Message}");
 
             if (lastResult.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed)
-                return CompleteApiSuccess(config, mode, lastResult, attempt, maxAttempts, lastKnownBalance);
+                return CompleteApiSuccess(config, mode, session, lastResult, attempt, maxAttempts, lastKnownBalance);
 
             if (lastResult.Kind == ApiAttemptKind.RefreshCredentials)
             {
@@ -697,13 +722,35 @@ internal static class Program
         return 1;
     }
 
-    private static int CompleteApiSuccess(Config config, ClaimRunMode mode, ApiAttemptResult result,
+    private static int CompleteApiSuccess(Config config, ClaimRunMode mode, WorkBuddyApiSession session, ApiAttemptResult result,
         int attempt, int maxAttempts, string? lastKnownBalance)
     {
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         var outcome = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "AlreadyClaimed";
+        State? persistedState = null;
         if (ShouldPersistDailyState(mode))
-            SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
+        {
+            var loaded = LoadState();
+            persistedState = loaded.IsUsable ? loaded.State! : new State();
+            persistedState.SuccessDate = DateOnly.FromDateTime(DateTime.Today);
+            SaveState(persistedState);
+        }
+        GrowthCenterResult? growth = null;
+        if (config.EnableGrowthCenter)
+        {
+            try { growth = WorkBuddyGrowthCenter.Execute(session, config); }
+            catch (Exception ex)
+            {
+                growth = new GrowthCenterResult(true, false,
+                    $"成长中心异常（{ex.GetType().Name}: {ex.Message}）");
+            }
+            Log("成长中心：" + growth.Report);
+        }
+        if (persistedState is not null && growth is not null)
+        {
+            persistedState.LastGrowthPollAt = DateTimeOffset.Now;
+            SaveState(persistedState);
+        }
         var message = result.Message + " 未启动 WorkBuddy 图形界面。";
         RecordRunStatus(new RunStatus
         {
@@ -719,15 +766,61 @@ internal static class Program
             CreditGained = result.Credit,
             StreakDays = result.StreakDays,
             EndpointHost = result.EndpointHost,
-            BalanceFresh = false
+            BalanceFresh = false,
+            GrowthMessage = growth?.Report,
+            GrowthUpdatedAt = growth is null ? null : DateTimeOffset.Now,
+            GrowthCreditsGained = growth?.CreditsGained ?? 0,
+            GrowthEnergy = growth?.Energy,
+            GrowthStreakDays = growth?.StreakDays,
+            GrowthNeedsAttention = growth?.NeedsAttention ?? false
         });
         var reward = string.IsNullOrWhiteSpace(result.Credit) ? "" : $"\n本次：+{result.Credit} 积分";
         var streak = result.StreakDays.HasValue ? $"\n连签：{result.StreakDays} 天" : "";
+        var growthText = growth is null || growth.Idle ? "" : "\n成长中心：" + growth.Report;
         Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
-            $"{result.Message}{reward}{streak}\n账户余额：{lastKnownBalance ?? "未读取到"}（接口领取后未刷新）\n尝试：{attempt}/{maxAttempts}",
-            ToolTipIcon.Info);
+            $"{result.Message}{reward}{streak}\n账户余额：{lastKnownBalance ?? "未读取到"}（接口领取后未刷新）\n尝试：{attempt}/{maxAttempts}{growthText}",
+            growth?.NeedsAttention == true ? ToolTipIcon.Warning : ToolTipIcon.Info);
         Log("接口快速通道完成: " + result.Message);
-        return 0;
+        return growth?.NeedsAttention == true ? 1 : 0;
+    }
+
+    private static int RunGrowthPoll(Config config)
+    {
+        var loaded = WorkBuddyApiFastPath.LoadSession(config);
+        var previous = LoadRunStatus();
+        GrowthCenterResult result;
+        if (!loaded.IsReady)
+        {
+            result = new GrowthCenterResult(true, false, "成长中心登录会话不可用：" + loaded.Message);
+        }
+        else
+        {
+            result = WorkBuddyGrowthCenter.Execute(loaded.Session!, config);
+        }
+        var stateLoad = LoadState();
+        if (stateLoad.IsUsable)
+        {
+            stateLoad.State!.LastGrowthPollAt = DateTimeOffset.Now;
+            SaveState(stateLoad.State);
+        }
+        RecordRunStatus((previous ?? new RunStatus()) with
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            GrowthMessage = result.Report,
+            GrowthUpdatedAt = DateTimeOffset.Now,
+            GrowthCreditsGained = result.CreditsGained,
+            GrowthEnergy = result.Energy,
+            GrowthStreakDays = result.StreakDays,
+            GrowthNeedsAttention = result.NeedsAttention,
+            EndpointHost = loaded.Session?.Endpoint.Host ?? previous?.EndpointHost,
+            PendingEndpointHost = loaded.PendingHost ?? previous?.PendingEndpointHost,
+            FallbackReason = loaded.IsReady ? previous?.FallbackReason : loaded.FallbackReason
+        });
+        Log("成长中心轮询：" + result.Report);
+        if (!result.Idle || result.NeedsAttention)
+            Notify("WorkBuddy 成长中心", result.Report,
+                result.NeedsAttention ? ToolTipIcon.Warning : ToolTipIcon.Info);
+        return result.NeedsAttention ? 1 : 0;
     }
 
     private static int RunOcrOnlyCore(Config config, ClaimRunMode mode, int? attemptLimitOverride = null,
@@ -877,7 +970,13 @@ internal static class Program
 
         if (succeeded)
         {
-            if (ShouldPersistDailyState(mode)) SaveState(new State { SuccessDate = DateOnly.FromDateTime(DateTime.Today) });
+            if (ShouldPersistDailyState(mode))
+            {
+                var loadedState = LoadState();
+                var successfulState = loadedState.IsUsable ? loadedState.State! : new State();
+                successfulState.SuccessDate = DateOnly.FromDateTime(DateTime.Today);
+                SaveState(successfulState);
+            }
             Log("完成: " + result);
             RecordRunStatus(new RunStatus
             {
@@ -4385,12 +4484,14 @@ internal static class Program
         var stateTestBackupPath = stateTestPath + ".bak";
         try
         {
-            SaveState(new State { SuccessDate = new DateOnly(2026, 8, 10) }, stateTestPath, stateTestBackupPath);
+            var preservedGrowthTime = new DateTimeOffset(2026, 8, 10, 4, 0, 0, TimeSpan.FromHours(8));
+            SaveState(new State { SuccessDate = new DateOnly(2026, 8, 10), LastGrowthPollAt = preservedGrowthTime }, stateTestPath, stateTestBackupPath);
             SaveState(new State { TerminalFailureDate = new DateOnly(2026, 8, 11) }, stateTestPath, stateTestBackupPath);
             File.WriteAllText(stateTestPath, "{invalid json");
             var recoveredState = LoadState(stateTestPath, stateTestBackupPath);
             if (recoveredState.Source != StateLoadSource.Backup ||
-                recoveredState.State?.SuccessDate != new DateOnly(2026, 8, 10))
+                recoveredState.State?.SuccessDate != new DateOnly(2026, 8, 10) ||
+                recoveredState.State?.LastGrowthPollAt != preservedGrowthTime)
                 throw new InvalidOperationException("状态主文件损坏时必须从有效备份恢复，而不能重新执行领取。");
             File.WriteAllText(stateTestBackupPath, "{invalid backup");
             if (LoadState(stateTestPath, stateTestBackupPath).Source != StateLoadSource.Invalid)
@@ -4483,8 +4584,16 @@ internal static class Program
         ValidateUserConfig(config);
         var defaultConfig = new Config();
         if (defaultConfig.MaxAttempts != 5 || defaultConfig.ManualMaxAttempts != 1 ||
-            defaultConfig.RetryIntervalSeconds != 60)
+            defaultConfig.RetryIntervalSeconds != 60 || !defaultConfig.EnableGrowthCenter ||
+            defaultConfig.GrowthPollHours != 4 || defaultConfig.GrowthRunBudgetSeconds != 180 ||
+            defaultConfig.GrowthRequestTimeoutSeconds != 30)
             throw new InvalidOperationException("新配置的自动/手动尝试次数和重试间隔默认值不正确。");
+        var pollState = new State { LastGrowthPollAt = new DateTimeOffset(2026, 10, 2, 0, 0, 0, TimeSpan.FromHours(8)) };
+        if (NextGrowthPollTime(pollState, new DateTime(2026, 10, 2, 1, 0, 0), defaultConfig) !=
+            new DateTime(2026, 10, 2, 4, 0, 0) ||
+            NextGrowthPollTime(new State(), new DateTime(2026, 10, 2, 1, 0, 0), defaultConfig) !=
+            new DateTime(2026, 10, 2, 1, 0, 0))
+            throw new InvalidOperationException("成长中心必须按每四小时调度，首次无记录时立即补跑。");
         if (ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: true))
             throw new InvalidOperationException("已有后台 WorkBuddy 进程时不得被视为工具启动并关闭。");
         if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
@@ -4529,13 +4638,20 @@ internal static class Program
                 RetryIntervalSeconds = 75,
                 MaxAttempts = 4,
                 ManualMaxAttempts = 2,
+                EnableGrowthCenter = false,
+                GrowthPollHours = 6,
+                GrowthRunBudgetSeconds = 210,
+                GrowthRequestTimeoutSeconds = 25,
                 BalanceValueCropScale = 7
             };
             ValidateUserConfig(editableConfig);
             SaveConfig(editableConfig, configTestPath);
             var reloadedConfig = LoadConfig(configTestPath, createFromExample: false);
             if (reloadedConfig.ClaimTime != "01:25" || reloadedConfig.MaxAttempts != 4 ||
-                reloadedConfig.ManualMaxAttempts != 2 || reloadedConfig.BalanceValueCropScale != 7)
+                reloadedConfig.ManualMaxAttempts != 2 || reloadedConfig.EnableGrowthCenter ||
+                reloadedConfig.GrowthPollHours != 6 || reloadedConfig.GrowthRunBudgetSeconds != 210 ||
+                reloadedConfig.GrowthRequestTimeoutSeconds != 25 ||
+                reloadedConfig.BalanceValueCropScale != 7)
                 throw new InvalidOperationException("GUI 保存配置时必须保留高级 OCR 参数并立即可重新读取。");
         }
         finally
@@ -5041,12 +5157,21 @@ internal static class Program
             });
             if (alreadyView.Title != "今日已领取" || alreadyView.Balance != "1822.8")
                 throw new InvalidOperationException("GUI 必须把余额不变且已领状态显示为今日已领取。");
+            var growthView = DashboardStatusView.From(completedStatus with
+            {
+                GrowthMessage = "领旅行礼物 +20 积分",
+                GrowthUpdatedAt = new DateTimeOffset(2026, 10, 2, 4, 0, 0, TimeSpan.FromHours(8)),
+                GrowthCreditsGained = 20
+            });
+            if (!growthView.Detail.Contains("成长中心（10-02 04:00）：领旅行礼物 +20 积分", StringComparison.Ordinal))
+                throw new InvalidOperationException("GUI 必须显示最近一次成长中心结果和执行时间。");
         }
         finally
         {
             if (Directory.Exists(statusTestDirectory)) Directory.Delete(statusTestDirectory, recursive: true);
         }
         WorkBuddyApiSelfTests.Run(config);
+        GrowthCenterSelfTests.Run();
         Log("Self test OK.");
         return 0;
     }
@@ -5083,6 +5208,12 @@ internal static class Program
             throw new InvalidOperationException("启动等待和界面等待必须在 5 到 120 秒之间。");
         if (config.ApiTimeoutSeconds is < 5 or > 60)
             throw new InvalidOperationException("接口请求超时必须在 5 到 60 秒之间。");
+        if (config.GrowthPollHours is < 1 or > 24)
+            throw new InvalidOperationException("成长中心轮询间隔必须在 1 到 24 小时之间。");
+        if (config.GrowthRunBudgetSeconds is < 30 or > 240)
+            throw new InvalidOperationException("成长中心运行预算必须在 30 到 240 秒之间。");
+        if (config.GrowthRequestTimeoutSeconds is < 5 or > 60)
+            throw new InvalidOperationException("成长中心单次请求超时必须在 5 到 60 秒之间。");
         if (config.ApiAllowedHosts is null || config.ApiAllowedHosts.Count == 0 ||
             config.ApiAllowedHosts.Any(host => string.IsNullOrWhiteSpace(host) ||
                 host.Contains('/') || host.Contains('\\') || host.Contains('@') || host.Contains(':')))
@@ -5447,6 +5578,10 @@ internal sealed class Config
     public string ApiAuthFilePath { get; set; } = "";
     public int ApiTimeoutSeconds { get; set; } = 15;
     public bool ApiRefreshOnUnauthorized { get; set; } = true;
+    public bool EnableGrowthCenter { get; set; } = true;
+    public int GrowthPollHours { get; set; } = 4;
+    public int GrowthRunBudgetSeconds { get; set; } = 180;
+    public int GrowthRequestTimeoutSeconds { get; set; } = 30;
     public List<string> ApiAllowedHosts { get; set; } = ["copilot.tencent.com"];
     public List<string> ApiRejectedHosts { get; set; } = [];
     public List<string> ImmediateClaimKeywords { get; set; } = [.. DefaultImmediateClaimKeywords];
@@ -5485,6 +5620,7 @@ internal sealed class State
 {
     public DateOnly? SuccessDate { get; set; }
     public DateOnly? TerminalFailureDate { get; set; }
+    public DateTimeOffset? LastGrowthPollAt { get; set; }
 }
 
 internal static class Native

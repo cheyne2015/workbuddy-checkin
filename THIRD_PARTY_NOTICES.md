@@ -2,7 +2,7 @@
 
 ## workbuddy-auto-signin
 
-The API session discovery, encrypted credential compatibility, and WorkBuddy daily check-in endpoint integration were adapted from:
+The API session discovery, encrypted credential compatibility, WorkBuddy daily check-in endpoint integration, and growth-center business strategy were adapted from:
 
 - Project: `88lin/workbuddy-auto-signin`
 - Source: https://github.com/88lin/workbuddy-auto-signin
