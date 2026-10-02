@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -62,6 +63,8 @@ internal static class WorkBuddyApiFastPath
     internal const string DefaultEndpoint = "https://copilot.tencent.com";
     internal const string StatusPath = "/v2/billing/meter/checkin-activity-status";
     internal const string ClaimPath = "/v2/billing/meter/daily-checkin";
+    internal const string UpstreamPinnedCommit = "cb2bf1f02db8900922dc0f06090cdb7334d45ff5";
+    private const string UpstreamHeadApi = "https://api.github.com/repos/88lin/workbuddy-auto-signin/commits/HEAD";
     private const int MaximumAuthFileBytes = 1_048_576;
     private const int MaximumTokenLength = 32_768;
     private const int MaximumResponseBytes = 131_072;
@@ -193,7 +196,9 @@ internal static class WorkBuddyApiFastPath
 
     private static HttpClient CreateClient(WorkBuddyApiSession session, Config config, HttpMessageHandler? handler)
     {
-        var client = handler is null ? new HttpClient() : new HttpClient(handler, disposeHandler: false);
+        var client = handler is null
+            ? new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }, disposeHandler: true)
+            : new HttpClient(handler, disposeHandler: false);
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", session.AccessToken);
@@ -223,7 +228,10 @@ internal static class WorkBuddyApiFastPath
             using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token);
             string body;
             using (var stream = response.Content.ReadAsStream(cancellation.Token))
-                body = ReadBoundedUtf8(stream, MaximumResponseBytes);
+            {
+                try { body = ReadBoundedUtf8Async(stream, MaximumResponseBytes, cancellation.Token).GetAwaiter().GetResult(); }
+                catch (DecoderFallbackException) { body = string.Empty; }
+            }
             var retryAfter = ParseRetryAfter(response.Headers.RetryAfter);
             return new ApiHttpResult((int)response.StatusCode, body, RetryAfter: retryAfter,
                 ElapsedMilliseconds: started.ElapsedMilliseconds);
@@ -233,6 +241,10 @@ internal static class WorkBuddyApiFastPath
             return new ApiHttpResult(null, null, TimedOut: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
         }
         catch (HttpRequestException)
+        {
+            return new ApiHttpResult(null, null, NetworkFailed: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
+        }
+        catch (IOException)
         {
             return new ApiHttpResult(null, null, NetworkFailed: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
         }
@@ -247,7 +259,8 @@ internal static class WorkBuddyApiFastPath
                 : new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "接口状态查询失败，转入 OCR 保底。",
                     FallbackReason: response.TimedOut ? "接口超时" : "网络失败");
         if (response.StatusCode == 401)
-            return new ApiAttemptResult(ApiAttemptKind.RefreshCredentials, "接口认证失效，准备重新读取一次登录会话。", HttpStatus: 401);
+            return new ApiAttemptResult(ApiAttemptKind.RefreshCredentials, "接口认证失效，准备重新读取一次登录会话。",
+                HttpStatus: 401, ClaimMayHaveBeenSent: claimMayHaveBeenSent);
         if (response.StatusCode == 403)
             return new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "接口拒绝状态查询，转入 OCR 保底。", HttpStatus: 403,
                 FallbackReason: "HTTP 403");
@@ -259,7 +272,8 @@ internal static class WorkBuddyApiFastPath
                 ? new ApiAttemptResult(ApiAttemptKind.Retry, $"领取结果待确认；状态接口 HTTP {response.StatusCode?.ToString() ?? "未知"}。",
                     HttpStatus: response.StatusCode, FallbackReason: "状态接口异常", ClaimMayHaveBeenSent: true)
                 : new ApiAttemptResult(ApiAttemptKind.NeedsOcr, $"状态接口 HTTP {response.StatusCode?.ToString() ?? "未知"}，转入 OCR 保底。",
-                    HttpStatus: response.StatusCode, FallbackReason: "状态接口异常");
+                    HttpStatus: response.StatusCode,
+                    FallbackReason: $"状态接口 HTTP {response.StatusCode?.ToString() ?? "未知"}");
 
         if (!TryParseJson(response.Body, out var document))
             return claimMayHaveBeenSent
@@ -307,6 +321,15 @@ internal static class WorkBuddyApiFastPath
         if (response.StatusCode == 429)
             return new ApiAttemptResult(ApiAttemptKind.Retry, "领取接口限流；下次先查询状态。", HttpStatus: 429,
                 RetryAfter: ClampRetryAfter(response.RetryAfter), ClaimMayHaveBeenSent: true);
+        if (response.StatusCode is >= 500 || response.StatusCode is >= 300 and < 400)
+            return new ApiAttemptResult(ApiAttemptKind.Retry,
+                $"领取接口 HTTP {response.StatusCode}，结果待确认；下次先查询状态。",
+                HttpStatus: response.StatusCode, FallbackReason: "领取接口暂时异常", ClaimMayHaveBeenSent: true);
+        if (response.StatusCode is not (>= 200 and < 300))
+            return new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
+                $"领取接口 HTTP {response.StatusCode?.ToString() ?? "未知"}，转入 OCR 保底。",
+                HttpStatus: response.StatusCode, FallbackReason: $"领取接口 HTTP {response.StatusCode?.ToString() ?? "未知"}",
+                ClaimMayHaveBeenSent: true);
         if (!TryParseJson(response.Body, out var document))
             return new ApiAttemptResult(ApiAttemptKind.Retry, "领取接口返回未知结构；准备复查状态。",
                 HttpStatus: response.StatusCode, FallbackReason: "领取响应结构变化", ClaimMayHaveBeenSent: true);
@@ -324,10 +347,6 @@ internal static class WorkBuddyApiFastPath
                     StreakDays: FindInt(root, "streak_days"), TotalCredits: FindNumberText(root, "total_credits"),
                     HttpStatus: response.StatusCode, ClaimMayHaveBeenSent: true);
             var safeMessage = FindSafeMessage(root);
-            if (response.StatusCode is not (>= 200 and < 300))
-                return new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
-                    $"领取接口 HTTP {response.StatusCode?.ToString() ?? "未知"}{(safeMessage is null ? "" : "：" + safeMessage)}，转入 OCR 保底。",
-                    HttpStatus: response.StatusCode, FallbackReason: "领取接口业务失败", ClaimMayHaveBeenSent: true);
             if (safeMessage is not null || TryFind(root, "code", out _))
                 return new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
                     $"领取接口返回明确业务失败{(safeMessage is null ? "" : "：" + safeMessage)}，转入 OCR 保底。",
@@ -370,6 +389,41 @@ internal static class WorkBuddyApiFastPath
         if (Uri.TryCreate(value, UriKind.Absolute, out var uri)) return uri.IdnHost.ToLowerInvariant();
         return value.TrimEnd('.').ToLowerInvariant();
     }
+
+    internal static string AddManualUpstreamUpdateHint(string fallbackReason)
+    {
+        if (!IsCompatibilityFailure(fallbackReason)) return fallbackReason;
+        const string manualHint = "请手动检查 88lin/workbuddy-auto-signin，并安装本项目审核后的新版 EXE";
+        try
+        {
+            using var handler = new HttpClientHandler { AllowAutoRedirect = false };
+            using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("WorkBuddyAutoClaim/1.2");
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var response = client.GetAsync(UpstreamHeadApi, HttpCompletionOption.ResponseHeadersRead,
+                cancellation.Token).GetAwaiter().GetResult();
+            if (response.StatusCode != HttpStatusCode.OK)
+                return fallbackReason + "；" + manualHint;
+            using var stream = response.Content.ReadAsStream(cancellation.Token);
+            var body = ReadBoundedUtf8Async(stream, 32_768, cancellation.Token).GetAwaiter().GetResult();
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.TryGetProperty("sha", out var shaElement) &&
+                shaElement.ValueKind == JsonValueKind.String)
+            {
+                var sha = shaElement.GetString() ?? string.Empty;
+                if (Regex.IsMatch(sha, @"\A[0-9a-f]{40}\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) &&
+                    !string.Equals(sha, UpstreamPinnedCommit, StringComparison.OrdinalIgnoreCase))
+                    return fallbackReason + $"；检测到上游新提交 {sha[..7]}，{manualHint}";
+            }
+        }
+        catch { }
+        return fallbackReason + "；" + manualHint;
+    }
+
+    internal static bool IsCompatibilityFailure(string reason) =>
+        reason.Contains("结构变化", StringComparison.Ordinal) ||
+        reason.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase) ||
+        reason.Contains("HTTP 410", StringComparison.OrdinalIgnoreCase);
 
     private static Uri BuildApiUri(Uri endpoint, string path) => new(endpoint, path.TrimStart('/'));
 
@@ -437,9 +491,9 @@ internal static class WorkBuddyApiFastPath
             throw new FormatException();
     }
 
-    private static string RunCredentialHelper(string executable, JsonElement encryptedToken)
+    private static string RunCredentialHelper(string executable, JsonElement encryptedToken, string? scriptPrefix = null)
     {
-        using var process = new Process { StartInfo = CreateCredentialHelperStartInfo(executable) };
+        using var process = new Process { StartInfo = CreateCredentialHelperStartInfo(executable, scriptPrefix) };
         bool started = false;
         try
         {
@@ -477,7 +531,7 @@ internal static class WorkBuddyApiFastPath
         }
     }
 
-    internal static ProcessStartInfo CreateCredentialHelperStartInfo(string executable)
+    internal static ProcessStartInfo CreateCredentialHelperStartInfo(string executable, string? scriptPrefix = null)
     {
         var startInfo = new ProcessStartInfo(executable)
         {
@@ -488,7 +542,7 @@ internal static class WorkBuddyApiFastPath
             RedirectStandardError = true
         };
         startInfo.ArgumentList.Add("-e");
-        startInfo.ArgumentList.Add(CredentialHelperJavaScript);
+        startInfo.ArgumentList.Add((scriptPrefix ?? string.Empty) + CredentialHelperJavaScript);
         foreach (var key in startInfo.Environment.Keys
                      .Where(key => key.StartsWith("NODE_", StringComparison.OrdinalIgnoreCase) ||
                                    key.StartsWith("ELECTRON_", StringComparison.OrdinalIgnoreCase) ||
@@ -496,6 +550,67 @@ internal static class WorkBuddyApiFastPath
             startInfo.Environment.Remove(key);
         startInfo.Environment["ELECTRON_RUN_AS_NODE"] = "1";
         return startInfo;
+    }
+
+    internal static void VerifyEncryptedCredentialFixture(string executable)
+    {
+        var secretBytes = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
+        var secretText = Convert.ToBase64String(secretBytes);
+        var key = SHA256.HashData(Encoding.UTF8.GetBytes(secretText));
+        var keyId = Convert.ToHexString(SHA256.HashData(key)).ToLowerInvariant()[..16];
+        var nonce = Enumerable.Range(17, 12).Select(value => (byte)value).ToArray();
+        var plaintext = Encoding.UTF8.GetBytes("fixture.Token_123");
+        var ciphertext = new byte[plaintext.Length];
+        var tag = new byte[16];
+        var aad = BuildFixtureAad(keyId);
+        using (var cipher = new AesGcm(key, tag.Length))
+            cipher.Encrypt(nonce, plaintext, ciphertext, tag, aad);
+        CryptographicOperations.ZeroMemory(key);
+
+        var envelopeJson = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object>
+        {
+            ["suite"] = 1,
+            ["keyId"] = keyId,
+            ["nonce"] = Convert.ToBase64String(nonce),
+            ["authTag"] = Convert.ToBase64String(tag),
+            ["ciphertext"] = Convert.ToBase64String(ciphertext)
+        });
+        var wrapperJson = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["$wbEncrypted"] = 1,
+            ["envelope"] = Convert.ToBase64String(envelopeJson)
+        });
+        using var wrapper = JsonDocument.Parse(wrapperJson);
+        var nativePayload = JsonSerializer.Serialize(new { version = 1, atRestSecretKey = secretText });
+        var prefix = "const __wbFixture=" + JsonSerializer.Serialize(nativePayload) +
+                     ";process._linkedBinding=()=>({loggerGet:()=>__wbFixture});\n";
+        var decrypted = RunCredentialHelper(executable, wrapper.RootElement, prefix);
+        if (decrypted != "fixture.Token_123")
+            throw new InvalidOperationException("sym-v1 固定夹具解密结果不一致。");
+        CryptographicOperations.ZeroMemory(plaintext);
+    }
+
+    private static byte[] BuildFixtureAad(string keyId)
+    {
+        using var stream = new MemoryStream();
+        stream.Write(Encoding.ASCII.GetBytes("WB-AAD\0"));
+        stream.WriteByte(1);
+        WriteLengthPrefixed(stream, "WBEV1");
+        WriteLengthPrefixed(stream, "sym-v1");
+        stream.Write([0, 0, 0, 1]);
+        WriteLengthPrefixed(stream, keyId);
+        stream.Write([2, 0, 0]);
+        return stream.ToArray();
+    }
+
+    private static void WriteLengthPrefixed(Stream stream, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        stream.WriteByte((byte)(bytes.Length >> 24));
+        stream.WriteByte((byte)(bytes.Length >> 16));
+        stream.WriteByte((byte)(bytes.Length >> 8));
+        stream.WriteByte((byte)bytes.Length);
+        stream.Write(bytes);
     }
 
     private const string CredentialHelperJavaScript = """
@@ -672,13 +787,15 @@ process.stdin.on('end',()=>{ try { const request=JSON.parse(utf8(Buffer.concat(c
         return value > TimeSpan.FromSeconds(60) ? TimeSpan.FromSeconds(60) : value;
     }
 
-    private static string ReadBoundedUtf8(Stream stream, int maximumBytes)
+    private static async Task<string> ReadBoundedUtf8Async(Stream stream, int maximumBytes, CancellationToken cancellationToken)
     {
         using var buffer = new MemoryStream();
         var chunk = new byte[8192];
         while (true)
         {
-            var read = stream.Read(chunk, 0, Math.Min(chunk.Length, maximumBytes + 1 - (int)buffer.Length));
+            var read = await stream.ReadAsync(
+                chunk.AsMemory(0, Math.Min(chunk.Length, maximumBytes + 1 - (int)buffer.Length)),
+                cancellationToken).ConfigureAwait(false);
             if (read == 0) break;
             buffer.Write(chunk, 0, read);
             if (buffer.Length > maximumBytes) throw new HttpRequestException("Response too large.");
@@ -718,7 +835,8 @@ internal static class WorkBuddyApiSelfTests
             throw new InvalidOperationException("接口域名白名单不得接受未知域名。");
         if (!WorkBuddyApiFastPath.TryValidateEndpoint("https://copilot.tencent.com", out _, out var host) ||
             host != "copilot.tencent.com" ||
-            WorkBuddyApiFastPath.TryValidateEndpoint("http://copilot.tencent.com", out _, out _))
+            WorkBuddyApiFastPath.TryValidateEndpoint("http://copilot.tencent.com", out _, out _) ||
+            WorkBuddyApiFastPath.TryValidateEndpoint("https://copilot.tencent.com:444", out _, out _))
             throw new InvalidOperationException("接口地址必须使用无凭据的 HTTPS 地址。");
 
         var unclaimed = WorkBuddyApiFastPath.ClassifyStatusResponse(
@@ -740,10 +858,25 @@ internal static class WorkBuddyApiSelfTests
         var unknownClaim = WorkBuddyApiFastPath.ClassifyClaimResponse(new ApiHttpResult(200, "{\"data\":{}}"));
         if (unknownClaim.Kind != ApiAttemptKind.Retry || !unknownClaim.ClaimMayHaveBeenSent)
             throw new InvalidOperationException("已发送领取但响应未知时不得盲目进入 OCR。");
+        var businessFailure = WorkBuddyApiFastPath.ClassifyClaimResponse(
+            new ApiHttpResult(200, "{\"code\":40001,\"msg\":\"activity unavailable\"}"));
+        if (businessFailure.Kind != ApiAttemptKind.NeedsOcr || businessFailure.FallbackReason != "领取接口业务失败")
+            throw new InvalidOperationException("明确的接口业务失败应进入 OCR，而不是反复发送领取请求。");
         var timeoutAfterClaim = WorkBuddyApiFastPath.ClassifyStatusResponse(
             new ApiHttpResult(null, null, TimedOut: true), claimMayHaveBeenSent: true);
         if (timeoutAfterClaim.Kind != ApiAttemptKind.Retry || !timeoutAfterClaim.ClaimMayHaveBeenSent)
             throw new InvalidOperationException("领取后状态查询超时必须保持待确认状态。");
+        var unauthorizedAfterClaim = WorkBuddyApiFastPath.ClassifyStatusResponse(
+            new ApiHttpResult(401, "{}"), claimMayHaveBeenSent: true);
+        if (unauthorizedAfterClaim.Kind != ApiAttemptKind.RefreshCredentials || !unauthorizedAfterClaim.ClaimMayHaveBeenSent)
+            throw new InvalidOperationException("领取待确认状态必须穿过 HTTP 401 会话刷新。");
+        var serverFailure = WorkBuddyApiFastPath.ClassifyClaimResponse(
+            new ApiHttpResult(503, "{\"msg\":\"temporarily unavailable\"}"));
+        if (serverFailure.Kind != ApiAttemptKind.Retry || !serverFailure.ClaimMayHaveBeenSent)
+            throw new InvalidOperationException("领取 POST 的 5xx 必须先重查状态，不得直接进入 OCR。");
+        var missingEndpoint = WorkBuddyApiFastPath.ClassifyClaimResponse(new ApiHttpResult(404, ""));
+        if (missingEndpoint.Kind != ApiAttemptKind.NeedsOcr || missingEndpoint.FallbackReason != "领取接口 HTTP 404")
+            throw new InvalidOperationException("领取接口 404 必须进入 OCR 并触发人工兼容更新提示。");
         var limited = WorkBuddyApiFastPath.ClassifyStatusResponse(
             new ApiHttpResult(429, "{}", RetryAfter: TimeSpan.FromMinutes(5)), false);
         if (limited.Kind != ApiAttemptKind.Retry || limited.RetryAfter != TimeSpan.FromSeconds(60))
@@ -757,6 +890,11 @@ internal static class WorkBuddyApiSelfTests
                 key.StartsWith("ELECTRON_", StringComparison.OrdinalIgnoreCase) && key != "ELECTRON_RUN_AS_NODE") ||
             helper.Environment["ELECTRON_RUN_AS_NODE"] != "1")
             throw new InvalidOperationException("凭据助手必须隐藏运行并清理继承的 Node/Electron/WorkBuddy 环境变量。");
+        if (File.Exists(config.WorkBuddyPath))
+            WorkBuddyApiFastPath.VerifyEncryptedCredentialFixture(config.WorkBuddyPath);
+        if (!WorkBuddyApiFastPath.IsCompatibilityFailure("领取响应结构变化") ||
+            WorkBuddyApiFastPath.IsCompatibilityFailure("网络失败"))
+            throw new InvalidOperationException("只有接口兼容性失败才应触发上游人工更新检查。");
 
         var session = new WorkBuddyApiSession
         {
@@ -802,6 +940,14 @@ internal static class WorkBuddyApiSelfTests
             if (unknown.IsReady || unknown.PendingHost != "unknown.example" || unknown.FallbackReason != "未知服务端域名")
                 throw new InvalidOperationException(
                     $"未知域名必须在读取或解密令牌之前停止并转入 OCR（ready={unknown.IsReady}, host={unknown.PendingHost ?? "null"}, reason={unknown.FallbackReason ?? "null"}）。");
+            var rejected = WorkBuddyApiFastPath.LoadSession(new Config
+            {
+                ApiAuthFilePath = authFile,
+                WorkBuddyPath = Path.Combine(unknownHostDirectory, "missing.exe"),
+                ApiRejectedHosts = ["unknown.example"]
+            });
+            if (rejected.IsReady || rejected.PendingHost is not null || rejected.FallbackReason != "已拒绝服务端域名")
+                throw new InvalidOperationException("已拒绝域名必须保持拦截且不再反复请求用户确认。");
         }
         finally
         {

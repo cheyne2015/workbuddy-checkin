@@ -567,24 +567,38 @@ internal static class Program
         {
             int currentAttempt = attempt;
             Log($"接口快速通道第 {attempt}/{maxAttempts} 次：先查询今日状态。");
-            lastResult = WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent, () =>
+            try
             {
-                claimMayHaveBeenSent = true;
-                RecordRunStatus(new RunStatus
+                lastResult = WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent, () =>
                 {
-                    UpdatedAt = DateTimeOffset.Now,
-                    Mode = isManualTest ? "Manual" : "Automatic",
-                    Outcome = "Pending",
-                    Message = "领取请求即将发送；若响应丢失，下次将先查询状态。",
-                    AttemptsPerformed = currentAttempt,
-                    MaxAttempts = maxAttempts,
-                    ExecutionChannel = "Api",
-                    ApiResult = "Pending",
-                    EndpointHost = session.Endpoint.Host,
-                    BalanceFresh = false,
-                    AfterBalance = lastKnownBalance
+                    SaveRunStatus(new RunStatus
+                    {
+                        UpdatedAt = DateTimeOffset.Now,
+                        Mode = isManualTest ? "Manual" : "Automatic",
+                        Outcome = "Pending",
+                        Message = "领取请求即将发送；若响应丢失，下次将先查询状态。",
+                        AttemptsPerformed = currentAttempt,
+                        MaxAttempts = maxAttempts,
+                        ExecutionChannel = "Api",
+                        ApiResult = "Pending",
+                        EndpointHost = session.Endpoint.Host,
+                        BalanceFresh = false,
+                        AfterBalance = lastKnownBalance
+                    });
+                    claimMayHaveBeenSent = true;
                 });
-            });
+            }
+            catch (Exception ex)
+            {
+                Log($"接口快速通道内部异常（{ex.GetType().Name}）；未记录响应正文或登录令牌。");
+                lastResult = claimMayHaveBeenSent
+                    ? new ApiAttemptResult(ApiAttemptKind.Retry,
+                        "领取请求后的接口处理异常；下次先查询状态。",
+                        FallbackReason: "接口处理异常", ClaimMayHaveBeenSent: true)
+                    : new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
+                        "接口状态查询发生内部异常，转入 OCR 保底。",
+                        FallbackReason: "接口处理异常");
+            }
             Log($"接口结果：HTTP {lastResult.HttpStatus?.ToString() ?? "无"}，{lastResult.Message}");
 
             if (lastResult.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed)
@@ -607,6 +621,17 @@ internal static class Program
                             continue;
                         }
                     }
+                    else if (!string.IsNullOrWhiteSpace(refreshed.PendingHost))
+                    {
+                        Log("HTTP 401 刷新会话时发现未知服务端域名；未发送新令牌，转入 OCR 保底。");
+                        Notify("WorkBuddy 接口域名待确认",
+                            $"刷新登录会话时发现未知服务端域名：{refreshed.PendingHost}\n登录令牌未发送，已转入 OCR 保底。",
+                            ToolTipIcon.Warning);
+                        return RunOcrOnlyCore(config, mode, Math.Max(1, maxAttempts - attempt + 1),
+                            attempt - 1, maxAttempts, refreshed.FallbackReason,
+                            endpointHost: refreshed.PendingHost, pendingEndpointHost: refreshed.PendingHost,
+                            executionChannel: "OcrFallback");
+                    }
                 }
                 lastResult = new ApiAttemptResult(ApiAttemptKind.NeedsOcr,
                     "接口认证在唯一一次会话刷新后仍失败，转入 OCR 保底。", HttpStatus: 401,
@@ -615,12 +640,14 @@ internal static class Program
 
             if (lastResult.Kind is ApiAttemptKind.NeedsOcr or ApiAttemptKind.InactiveNeedsSingleOcr)
             {
+                var fallbackReason = WorkBuddyApiFastPath.AddManualUpstreamUpdateHint(
+                    lastResult.FallbackReason ?? lastResult.Message);
                 var ocrAttempts = lastResult.Kind == ApiAttemptKind.InactiveNeedsSingleOcr
                     ? 1
                     : Math.Max(1, maxAttempts - attempt + 1);
-                Log($"接口快速通道转入 OCR 保底：{lastResult.FallbackReason ?? lastResult.Message}；OCR 最多 {ocrAttempts} 次。");
+                Log($"接口快速通道转入 OCR 保底：{fallbackReason}；OCR 最多 {ocrAttempts} 次。");
                 return RunOcrOnlyCore(config, mode, ocrAttempts, attempt - 1, maxAttempts,
-                    lastResult.FallbackReason ?? lastResult.Message, session.Endpoint.Host,
+                    fallbackReason, session.Endpoint.Host,
                     executionChannel: "OcrFallback");
             }
 
@@ -856,9 +883,9 @@ internal static class Program
                 PendingEndpointHost = pendingEndpointHost
             });
             Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
-                BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
+                AppendApiFallbackNotice(BuildRunNotificationText(outcomeKind, FormatNotificationBalance(notificationBeforeBalance),
                     FormatNotificationBalance(notificationAfterBalance), attemptsPerformed, displayedMaxAttempts,
-                    DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result), ToolTipIcon.Info);
+                    DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result), fallbackReason), ToolTipIcon.Info);
             return 0;
         }
 
@@ -881,6 +908,7 @@ internal static class Program
         var failureNotification = BuildRunNotificationText(ClaimOutcomeKind.Failed,
             FormatNotificationBalance(notificationBeforeBalance), FormatNotificationBalance(notificationAfterBalance),
             attemptsPerformed, displayedMaxAttempts, DescribeWorkBuddyLifecycle(launchedByTool, preserveVisibleWindow), result);
+        failureNotification = AppendApiFallbackNotice(failureNotification, fallbackReason);
         if (isManualTest)
             NotifyManualTestFailure(result, failureNotification);
         else
@@ -5357,6 +5385,11 @@ internal static class Program
             ? $"{baseText}\n失败阶段：{ClassifyFailureStage(result)} · {attempts} · WorkBuddy：{lifecycle}"
             : $"{baseText}\n{attempts} · WorkBuddy：{lifecycle}";
     }
+
+    private static string AppendApiFallbackNotice(string notification, string? fallbackReason) =>
+        !string.IsNullOrWhiteSpace(fallbackReason) && fallbackReason.Contains("上游", StringComparison.Ordinal)
+            ? notification + "\n接口提示：" + fallbackReason
+            : notification;
 
     private static string ClassifyFailureStage(string result)
     {
