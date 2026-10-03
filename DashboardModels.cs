@@ -24,6 +24,11 @@ internal sealed record RunStatus
     public int? GrowthEnergy { get; init; }
     public int? GrowthStreakDays { get; init; }
     public bool GrowthNeedsAttention { get; init; }
+    public string? RouteDiscoveryMessage { get; init; }
+    public DateTimeOffset? RouteDiscoveryUpdatedAt { get; init; }
+    public string? UpdateMessage { get; init; }
+    public DateTimeOffset? UpdateCheckedAt { get; init; }
+    public string? AvailableVersion { get; init; }
 }
 
 internal sealed record DashboardStatusView(string Title, string Balance, string Detail, string UpdatedAt)
@@ -63,8 +68,12 @@ internal sealed record DashboardStatusView(string Title, string Balance, string 
         var fallback = string.IsNullOrWhiteSpace(status.FallbackReason) ? "" : $" · 接口回退：{status.FallbackReason}";
         var growth = string.IsNullOrWhiteSpace(status.GrowthMessage) ? "" :
             $"\n成长中心（{status.GrowthUpdatedAt?.LocalDateTime:MM-dd HH:mm}）：{status.GrowthMessage}";
+        var route = string.IsNullOrWhiteSpace(status.RouteDiscoveryMessage) ? "" :
+            $"\n接口路由（{status.RouteDiscoveryUpdatedAt?.LocalDateTime:MM-dd HH:mm}）：{status.RouteDiscoveryMessage}";
+        var update = string.IsNullOrWhiteSpace(status.UpdateMessage) ? "" :
+            $"\n程序更新（{status.UpdateCheckedAt?.LocalDateTime:MM-dd HH:mm}）：{status.UpdateMessage}";
         return new DashboardStatusView(title, balance,
-            $"{balanceDetail}{reward}{streak} · {attempts}{fallback}\n{mode} · {channel}：{status.Message}{growth}",
+            $"{balanceDetail}{reward}{streak} · {attempts}{fallback}\n{mode} · {channel}：{status.Message}{growth}{route}{update}",
             status.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"));
     }
 }

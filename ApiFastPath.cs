@@ -158,7 +158,9 @@ internal static class WorkBuddyApiFastPath
     {
         if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         using var client = CreateClient(session, config, handler);
-        var status = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
+        var statusPath = ApiRouteCatalog.Get(ApiRouteKeys.DailyStatus, config);
+        var claimPath = ApiRouteCatalog.Get(ApiRouteKeys.DailyClaim, config);
+        var status = Send(client, BuildApiUri(session.Endpoint, statusPath), config.ApiTimeoutSeconds, cancellationToken);
         var statusDecision = ClassifyStatusResponse(status, claimMayHaveBeenSent);
         if (statusDecision.Kind != ApiAttemptKind.NeedsOcr || statusDecision.FallbackReason != "STATUS_UNCLAIMED")
             return statusDecision with { EndpointHost = session.Endpoint.Host };
@@ -166,20 +168,20 @@ internal static class WorkBuddyApiFastPath
         if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         beforeClaimSend();
         if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
-        var claim = Send(client, BuildApiUri(session.Endpoint, ClaimPath), config.ApiTimeoutSeconds, cancellationToken);
+        var claim = Send(client, BuildApiUri(session.Endpoint, claimPath), config.ApiTimeoutSeconds, cancellationToken);
         var claimDecision = ClassifyClaimResponse(claim);
         if (claimDecision.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed or
             ApiAttemptKind.RefreshCredentials or ApiAttemptKind.NeedsOcr or ApiAttemptKind.Retry)
         {
             if (claimDecision.Kind == ApiAttemptKind.Claimed)
             {
-                var freshStatus = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
+                var freshStatus = Send(client, BuildApiUri(session.Endpoint, statusPath), config.ApiTimeoutSeconds, cancellationToken);
                 claimDecision = EnrichClaimedFromStatus(claimDecision, freshStatus);
             }
             else if (claimDecision.Kind == ApiAttemptKind.Retry && claimDecision.ClaimMayHaveBeenSent &&
                      claim.StatusCode is >= 200 and < 300)
             {
-                var verification = Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken);
+                var verification = Send(client, BuildApiUri(session.Endpoint, statusPath), config.ApiTimeoutSeconds, cancellationToken);
                 var verified = ClassifyStatusResponse(verification, claimMayHaveBeenSent: true);
                 if (verified.Kind == ApiAttemptKind.AlreadyClaimed) claimDecision = verified;
                 else if (verified.FallbackReason == "STATUS_UNCLAIMED")
@@ -194,11 +196,17 @@ internal static class WorkBuddyApiFastPath
 
     internal static ApiAttemptResult QueryStatusOnly(WorkBuddyApiSession session, Config config,
         HttpMessageHandler? handler = null, CancellationToken cancellationToken = default)
+        => QueryStatusOnlyWithPath(session, config, ApiRouteCatalog.Get(ApiRouteKeys.DailyStatus, config),
+            handler, cancellationToken);
+
+    internal static ApiAttemptResult QueryStatusOnlyWithPath(WorkBuddyApiSession session, Config config, string statusPath,
+        HttpMessageHandler? handler = null, CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested) return CancelledResult(session);
         using var client = CreateClient(session, config, handler);
         return ClassifyStatusResponse(
-            Send(client, BuildApiUri(session.Endpoint, StatusPath), config.ApiTimeoutSeconds, cancellationToken), claimMayHaveBeenSent: false)
+            Send(client, BuildApiUri(session.Endpoint, statusPath),
+                config.ApiTimeoutSeconds, cancellationToken), claimMayHaveBeenSent: false)
             with { EndpointHost = session.Endpoint.Host };
     }
 

@@ -65,8 +65,26 @@ internal sealed class TrayDaemonContext : ApplicationContext
             if (e.Button == MouseButtons.Left) ShowDashboard();
         };
 
+        Func<RunStatus?>? statusLoader = smokeTest ? () => new RunStatus
+        {
+            UpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 2, TimeSpan.FromHours(8)),
+            Mode = "Automatic",
+            Outcome = "Claimed",
+            Message = "接口领取成功，未启动 WorkBuddy 图形界面。",
+            BeforeBalance = "1200.00",
+            AfterBalance = "1300.00",
+            AttemptsPerformed = 1,
+            MaxAttempts = 5,
+            ExecutionChannel = "Api",
+            CreditGained = "100",
+            StreakDays = 4,
+            RouteDiscoveryMessage = "接口路由已通过只读状态校验。",
+            RouteDiscoveryUpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.FromHours(8)),
+            UpdateMessage = "当前已是最新版本。",
+            UpdateCheckedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.FromHours(8))
+        } : null;
         _dashboard = new DashboardForm(StartRetry, () => Volatile.Read(ref _retryInProgress) != 0,
-            () => _configChanged.Set());
+            () => _configChanged.Set(), statusLoader, smokeTest ? () => new Config() : null);
         _ = _dashboard.Handle;
         BeginStartupStateRefresh();
 
@@ -284,6 +302,8 @@ internal sealed class DashboardForm : Form
     private readonly Action _retry;
     private readonly Func<bool> _retryRunning;
     private readonly Action _configSaved;
+    private readonly Func<RunStatus?> _loadStatus;
+    private readonly Func<Config> _loadConfig;
     private readonly Label _statusTitle = new();
     private readonly Label _balanceValue = new();
     private readonly Label _updatedValue = new();
@@ -301,17 +321,22 @@ internal sealed class DashboardForm : Form
     private readonly NumericUpDown _cardWait = new();
     private readonly CheckBox _apiFastPath = new();
     private readonly CheckBox _growthCenter = new();
+    private readonly CheckBox _routeDiscovery = new();
+    private readonly CheckBox _automaticUpdates = new();
     private readonly Label _saveMessage = new();
     private readonly TabControl _tabs = new() { Dock = DockStyle.Fill, Padding = new Point(16, 7) };
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1500 };
     private bool _allowClose;
     private bool _darkMode;
 
-    internal DashboardForm(Action retry, Func<bool> retryRunning, Action configSaved)
+    internal DashboardForm(Action retry, Func<bool> retryRunning, Action configSaved,
+        Func<RunStatus?>? statusLoader = null, Func<Config>? configLoader = null)
     {
         _retry = retry;
         _retryRunning = retryRunning;
         _configSaved = configSaved;
+        _loadStatus = statusLoader ?? Program.LoadRunStatus;
+        _loadConfig = configLoader ?? Program.LoadConfig;
         Text = "WorkBuddy 自动领取守护";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(560, 610);
@@ -415,13 +440,14 @@ internal sealed class DashboardForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            RowCount = 11,
+            RowCount = 13,
             AutoScroll = true
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
-        for (var i = 0; i < 10; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        for (var i = 0; i < 11; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         _workBuddyPath.Dock = DockStyle.Fill;
@@ -437,6 +463,10 @@ internal sealed class DashboardForm : Form
         _apiFastPath.Dock = DockStyle.Fill;
         _growthCenter.Text = "成长中心全套（每 4 小时）";
         _growthCenter.Dock = DockStyle.Fill;
+        _routeDiscovery.Text = "自动发现并只读验证接口路由";
+        _routeDiscovery.Dock = DockStyle.Fill;
+        _automaticUpdates.Text = "自动检查、验证并安装 GitHub Release";
+        _automaticUpdates.Dock = DockStyle.Fill;
 
         AddSettingRow(layout, 0, "WorkBuddy 程序", _workBuddyPath, browse);
         AddSettingRow(layout, 1, "每天领取时间", _claimTime, new Label { Text = "HH:mm", TextAlign = ContentAlignment.MiddleCenter });
@@ -447,6 +477,8 @@ internal sealed class DashboardForm : Form
         AddSettingRow(layout, 6, "领取界面等待", _cardWait, new Label { Text = "秒", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 7, "接口快速通道", _apiFastPath, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
         AddSettingRow(layout, 8, "成长中心", _growthCenter, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
+        AddSettingRow(layout, 9, "接口路由更新", _routeDiscovery, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
+        AddSettingRow(layout, 10, "程序自动更新", _automaticUpdates, new Label { Text = "", TextAlign = ContentAlignment.MiddleCenter });
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
         var save = new Button { Text = "保存并立即应用", AutoSize = true, Height = 36 };
@@ -455,12 +487,12 @@ internal sealed class DashboardForm : Form
         advanced.Click += (_, _) => OpenAdvancedConfig();
         actions.Controls.Add(save);
         actions.Controls.Add(advanced);
-        layout.Controls.Add(actions, 0, 9);
+        layout.Controls.Add(actions, 0, 11);
         layout.SetColumnSpan(actions, 3);
         _saveMessage.Dock = DockStyle.Fill;
         _saveMessage.AutoSize = false;
         _saveMessage.Padding = new Padding(0, 10, 0, 0);
-        layout.Controls.Add(_saveMessage, 0, 10);
+        layout.Controls.Add(_saveMessage, 0, 12);
         layout.SetColumnSpan(_saveMessage, 3);
         page.Controls.Add(layout);
         return page;
@@ -497,7 +529,7 @@ internal sealed class DashboardForm : Form
     {
         var darkMode = IsDarkMode();
         if (darkMode != _darkMode) ApplyTheme();
-        var status = Program.LoadRunStatus();
+        var status = _loadStatus();
         var view = DashboardStatusView.From(status);
         _statusTitle.Text = view.Title;
         _statusTitle.ForeColor = status?.Outcome switch
@@ -515,7 +547,7 @@ internal sealed class DashboardForm : Form
             : "";
         try
         {
-            var config = Program.LoadConfig();
+            var config = _loadConfig();
             _nextRunValue.Text = "下次自动领取：" + CalculateNextRun(config, status).ToString("yyyy-MM-dd HH:mm");
         }
         catch (Exception ex)
@@ -554,6 +586,9 @@ internal sealed class DashboardForm : Form
             _automaticAttempts.Minimum != 1 || _manualAttempts.Minimum != 1 ||
             !_growthCenter.Text.Contains("成长中心", StringComparison.Ordinal))
             throw new InvalidOperationException("守护面板缺少可用的重试领取或次数配置控件。");
+        if (!_routeDiscovery.Text.Contains("接口路由", StringComparison.Ordinal) ||
+            !_automaticUpdates.Text.Contains("GitHub Release", StringComparison.Ordinal))
+            throw new InvalidOperationException("守护面板缺少接口路由或程序自动更新开关。");
     }
 
     private void SaveWindowBitmap(string path)
@@ -567,7 +602,7 @@ internal sealed class DashboardForm : Form
     {
         try
         {
-            var config = Program.LoadConfig();
+            var config = _loadConfig();
             _workBuddyPath.Text = config.WorkBuddyPath;
             if (TimeSpan.TryParseExact(config.ClaimTime, @"hh\:mm", null, out var time))
                 _claimTime.Value = DateTime.Today.Add(time);
@@ -578,6 +613,8 @@ internal sealed class DashboardForm : Form
             _cardWait.Value = Math.Clamp(config.CardReadyTimeoutSeconds, (int)_cardWait.Minimum, (int)_cardWait.Maximum);
             _apiFastPath.Checked = config.UseApiFastPath;
             _growthCenter.Checked = config.EnableGrowthCenter;
+            _routeDiscovery.Checked = config.EnableAutomaticRouteDiscovery;
+            _automaticUpdates.Checked = config.EnableAutomaticUpdates;
         }
         catch (Exception ex)
         {
@@ -589,7 +626,7 @@ internal sealed class DashboardForm : Form
     {
         try
         {
-            var config = Program.LoadConfig();
+            var config = _loadConfig();
             config.WorkBuddyPath = _workBuddyPath.Text.Trim();
             config.ClaimTime = _claimTime.Value.ToString("HH:mm");
             config.MaxAttempts = Decimal.ToInt32(_automaticAttempts.Value);
@@ -599,6 +636,8 @@ internal sealed class DashboardForm : Form
             config.CardReadyTimeoutSeconds = Decimal.ToInt32(_cardWait.Value);
             config.UseApiFastPath = _apiFastPath.Checked;
             config.EnableGrowthCenter = _growthCenter.Checked;
+            config.EnableAutomaticRouteDiscovery = _routeDiscovery.Checked;
+            config.EnableAutomaticUpdates = _automaticUpdates.Checked;
             Program.SaveConfig(config);
             _configSaved();
             _saveMessage.Text = $"已保存并应用 · {DateTime.Now:HH:mm:ss}";

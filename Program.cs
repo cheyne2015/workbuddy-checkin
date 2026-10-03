@@ -50,8 +50,11 @@ internal static class Program
     {
         var command = args.FirstOrDefault()?.ToLowerInvariant() ?? "--daemon";
         if (command == "--daemon-ready-probe") return RunDaemonReadyProbe(args);
+        if (command == "--apply-update") return AutomaticUpdater.ApplyUpdatePlan(args.Skip(1).FirstOrDefault());
         if (command == "--self-test") return RunSelfTest();
         if (command == "--growth-test") return GrowthCenterSelfTests.RunPublic();
+        if (command == "--route-discovery-test") return RouteDiscoverySelfTests.RunPublic();
+        if (command == "--update-test") return AutomaticUpdateSelfTests.RunPublic();
         if (command == "--api-status-test") return RunApiStatusTest();
         if (command == "--ui-smoke-test") return TrayApplication.RunSmokeTest(args.Skip(1).FirstOrDefault());
         if (command == "--startup-status") return RunStartupStatusProbe();
@@ -169,6 +172,14 @@ internal static class Program
         using var daemonReady = new EventWaitHandle(false, EventResetMode.AutoReset, DaemonReadyEventName);
         daemonReady.Set();
         Log("后台守护已启动并发出就绪信号，领取时间: " + config.ClaimTime);
+        var updateResult = AutomaticUpdater.ConsumeResult();
+        if (!string.IsNullOrWhiteSpace(updateResult))
+        {
+            UpdateMaintenanceStatus(updateMessage: updateResult);
+            Log(updateResult);
+            if (updateResult.StartsWith("失败：", StringComparison.Ordinal))
+                Notify("WorkBuddy 自动领取守护", updateResult, ToolTipIcon.Warning);
+        }
 
         using var manualTestRequest = new EventWaitHandle(false, EventResetMode.AutoReset, ManualTestRequestName);
         while (true)
@@ -203,6 +214,8 @@ internal static class Program
                     }
                 }
                 var scheduledToday = now.Date.Add(claimTime);
+                var dailyWorkIsDue = now >= scheduledToday && !HasDailyTerminalState(state, DateOnly.FromDateTime(now));
+                if (!dailyWorkIsDue && RunBackgroundMaintenance(config, state, now)) return 0;
                 if (state.SuccessDate == DateOnly.FromDateTime(now))
                 {
                     if (config.EnableGrowthCenter && config.UseApiFastPath)
@@ -213,10 +226,10 @@ internal static class Program
                             if (RunGrowthPoll(config, manualTestRequest)) return 0;
                             continue;
                         }
-                        var nextWake = nextGrowth < NextClaimTime(now, claimTime) ? nextGrowth : NextClaimTime(now, claimTime);
+                        var nextWake = Earliest(nextGrowth, NextClaimTime(now, claimTime), NextMaintenanceTime(state, now, config));
                         if (SleepUntilOrManualTestRequest(nextWake, "今天已成功领取，等待成长中心轮询", manualTestRequest, configChanged)) return 0;
                     }
-                    else if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天已成功领取", manualTestRequest, configChanged)) return 0;
+                    else if (SleepUntilOrManualTestRequest(Earliest(NextClaimTime(now, claimTime), NextMaintenanceTime(state, now, config)), "今天已成功领取", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
                 if (state.TerminalFailureDate == DateOnly.FromDateTime(now))
@@ -229,18 +242,18 @@ internal static class Program
                             if (RunGrowthPoll(config, manualTestRequest)) return 0;
                             continue;
                         }
-                        var nextWake = nextGrowth < NextClaimTime(now, claimTime) ? nextGrowth : NextClaimTime(now, claimTime);
+                        var nextWake = Earliest(nextGrowth, NextClaimTime(now, claimTime), NextMaintenanceTime(state, now, config));
                         if (SleepUntilOrManualTestRequest(nextWake,
                                 $"今天已完成 {config.MaxAttempts} 次领取尝试；仅等待成长中心轮询或明日任务",
                                 manualTestRequest, configChanged)) return 0;
                     }
-                    else if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), $"今天已完成 {config.MaxAttempts} 次领取尝试，等待明天", manualTestRequest, configChanged)) return 0;
+                    else if (SleepUntilOrManualTestRequest(Earliest(NextClaimTime(now, claimTime), NextMaintenanceTime(state, now, config)), $"今天已完成 {config.MaxAttempts} 次领取尝试，等待明天", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
 
                 if (now < scheduledToday)
                 {
-                    if (SleepUntilOrManualTestRequest(scheduledToday, "尚未到领取时间", manualTestRequest, configChanged)) return 0;
+                    if (SleepUntilOrManualTestRequest(Earliest(scheduledToday, NextMaintenanceTime(state, now, config)), "尚未到领取时间", manualTestRequest, configChanged)) return 0;
                     continue;
                 }
 
@@ -279,7 +292,7 @@ internal static class Program
                         // start another attempt batch every minute for the rest of today.
                         state.TerminalFailureDate = DateOnly.FromDateTime(now);
                         SaveState(state);
-                        if (SleepUntilOrManualTestRequest(NextClaimTime(now, claimTime), "今天领取失败，已停止重复尝试", manualTestRequest, configChanged)) return 0;
+                        if (SleepUntilOrManualTestRequest(Earliest(NextClaimTime(now, claimTime), NextMaintenanceTime(state, now, config)), "今天领取失败，已停止重复尝试", manualTestRequest, configChanged)) return 0;
                         continue;
                     }
                 }
@@ -300,6 +313,97 @@ internal static class Program
         if (!state.LastGrowthPollAt.HasValue) return now;
         var next = state.LastGrowthPollAt.Value.LocalDateTime.AddHours(config.GrowthPollHours);
         return next <= now ? now : next;
+    }
+
+    private static DateTime Earliest(params DateTime[] values) => values.Min();
+
+    private static DateTime NextMaintenanceTime(State state, DateTime now, Config config)
+    {
+        var candidates = new List<DateTime>();
+        if (config.EnableAutomaticRouteDiscovery)
+            candidates.Add(state.LastRouteDiscoveryAt?.LocalDateTime.AddHours(config.RouteDiscoveryHours) ?? now);
+        if (config.EnableAutomaticUpdates)
+            candidates.Add(state.LastUpdateCheckAt?.LocalDateTime.AddHours(config.UpdateCheckHours) ?? now);
+        return candidates.Count == 0 ? DateTime.MaxValue : candidates.Min();
+    }
+
+    private static bool RunBackgroundMaintenance(Config config, State state, DateTime now)
+    {
+        if (config.EnableAutomaticRouteDiscovery)
+        {
+            var resources = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(config.WorkBuddyPath)) ?? "", "resources");
+            var asarPath = Path.Combine(resources, "app.asar");
+            var signature = File.Exists(asarPath)
+                ? $"{new FileInfo(asarPath).Length}:{File.GetLastWriteTimeUtc(asarPath).Ticks}"
+                : "missing";
+            var routeDue = !state.LastRouteDiscoveryAt.HasValue ||
+                           state.LastRouteDiscoveryAt.Value.LocalDateTime.AddHours(config.RouteDiscoveryHours) <= now ||
+                           !string.Equals(state.LastRouteDiscoveryAsarSignature, signature, StringComparison.Ordinal);
+            if (routeDue)
+            {
+                state.LastRouteDiscoveryAt = DateTimeOffset.Now;
+                state.LastRouteDiscoveryAsarSignature = signature;
+                try
+                {
+                    var manifest = RouteDiscoveryEngine.Discover(config);
+                    var session = WorkBuddyApiFastPath.LoadSession(config);
+                    if (!session.IsReady) throw new InvalidOperationException("无法读取登录会话，候选路由未启用：" + session.Message);
+                    var statusPath = manifest.Routes[ApiRouteKeys.DailyStatus].Path;
+                    var check = WorkBuddyApiFastPath.QueryStatusOnlyWithPath(session.Session!, config, statusPath);
+                    if (check.Kind is not (ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed or
+                        ApiAttemptKind.NeedsOcr or ApiAttemptKind.InactiveNeedsSingleOcr))
+                        throw new InvalidOperationException("只读签到状态校验未通过：" + check.Message);
+                    manifest.ReadOnlyVerified = true;
+                    RouteDiscoveryEngine.SaveWithBackup(manifest, ApiRouteCatalog.ResolveManifestPath(config));
+                    UpdateMaintenanceStatus(routeMessage: $"接口路由已验证（WorkBuddy {manifest.WorkBuddyVersion}）。");
+                    Log($"自动路由发现完成并通过只读状态校验，共 {manifest.Routes.Count} 条路由。");
+                }
+                catch (Exception ex)
+                {
+                    UpdateMaintenanceStatus(routeMessage: "接口路由发现未启用新结果：" + ex.Message);
+                    Log("自动路由发现失败，继续使用已验证清单或内置路由: " + ex.Message);
+                }
+                SaveState(state);
+            }
+        }
+
+        if (config.EnableAutomaticUpdates && (!state.LastUpdateCheckAt.HasValue ||
+            state.LastUpdateCheckAt.Value.LocalDateTime.AddHours(config.UpdateCheckHours) <= now))
+        {
+            state.LastUpdateCheckAt = DateTimeOffset.Now;
+            SaveState(state);
+            try
+            {
+                var result = AutomaticUpdater.CheckDownloadAndStage(config, Environment.ProcessPath!);
+                UpdateMaintenanceStatus(updateMessage: result.Message, availableVersion: result.Version);
+                Log("自动更新检查: " + result.Message);
+                if (result.Staged)
+                {
+                    Notify("WorkBuddy 自动领取守护", result.Message + " 程序将自动重启。", ToolTipIcon.Info);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateMaintenanceStatus(updateMessage: "自动更新检查失败：" + ex.Message);
+                Log("自动更新检查失败: " + ex.Message);
+            }
+        }
+        return false;
+    }
+
+    private static void UpdateMaintenanceStatus(string? routeMessage = null, string? updateMessage = null,
+        string? availableVersion = null)
+    {
+        var previous = LoadRunStatus() ?? new RunStatus();
+        SaveRunStatus(previous with
+        {
+            RouteDiscoveryMessage = routeMessage ?? previous.RouteDiscoveryMessage,
+            RouteDiscoveryUpdatedAt = routeMessage is null ? previous.RouteDiscoveryUpdatedAt : DateTimeOffset.Now,
+            UpdateMessage = updateMessage ?? previous.UpdateMessage,
+            UpdateCheckedAt = updateMessage is null ? previous.UpdateCheckedAt : DateTimeOffset.Now,
+            AvailableVersion = availableVersion ?? previous.AvailableVersion
+        });
     }
 
     private static bool HasDailyTerminalState(State state, DateOnly date) =>
@@ -4640,13 +4744,17 @@ internal static class Program
         try
         {
             var preservedGrowthTime = new DateTimeOffset(2026, 8, 10, 4, 0, 0, TimeSpan.FromHours(8));
-            SaveState(new State { SuccessDate = new DateOnly(2026, 8, 10), LastGrowthPollAt = preservedGrowthTime }, stateTestPath, stateTestBackupPath);
+            var preservedRouteTime = new DateTimeOffset(2026, 8, 10, 5, 0, 0, TimeSpan.FromHours(8));
+            SaveState(new State { SuccessDate = new DateOnly(2026, 8, 10), LastGrowthPollAt = preservedGrowthTime,
+                LastRouteDiscoveryAt = preservedRouteTime, LastRouteDiscoveryAsarSignature = "123:456" }, stateTestPath, stateTestBackupPath);
             SaveState(new State { TerminalFailureDate = new DateOnly(2026, 8, 11) }, stateTestPath, stateTestBackupPath);
             File.WriteAllText(stateTestPath, "{invalid json");
             var recoveredState = LoadState(stateTestPath, stateTestBackupPath);
             if (recoveredState.Source != StateLoadSource.Backup ||
                 recoveredState.State?.SuccessDate != new DateOnly(2026, 8, 10) ||
-                recoveredState.State?.LastGrowthPollAt != preservedGrowthTime)
+                recoveredState.State?.LastGrowthPollAt != preservedGrowthTime ||
+                recoveredState.State?.LastRouteDiscoveryAt != preservedRouteTime ||
+                recoveredState.State?.LastRouteDiscoveryAsarSignature != "123:456")
                 throw new InvalidOperationException("状态主文件损坏时必须从有效备份恢复，而不能重新执行领取。");
             File.WriteAllText(stateTestBackupPath, "{invalid backup");
             if (LoadState(stateTestPath, stateTestBackupPath).Source != StateLoadSource.Invalid)
@@ -4752,7 +4860,9 @@ internal static class Program
         if (defaultConfig.MaxAttempts != 5 || defaultConfig.ManualMaxAttempts != 1 ||
             defaultConfig.RetryIntervalSeconds != 60 || !defaultConfig.EnableGrowthCenter ||
             defaultConfig.GrowthPollHours != 4 || defaultConfig.GrowthRunBudgetSeconds != 180 ||
-            defaultConfig.GrowthRequestTimeoutSeconds != 30)
+            defaultConfig.GrowthRequestTimeoutSeconds != 30 || !defaultConfig.EnableAutomaticRouteDiscovery ||
+            defaultConfig.RouteDiscoveryHours != 24 || !defaultConfig.EnableAutomaticUpdates ||
+            defaultConfig.UpdateCheckHours != 6)
             throw new InvalidOperationException("新配置的自动/手动尝试次数和重试间隔默认值不正确。");
         var pollState = new State { LastGrowthPollAt = new DateTimeOffset(2026, 10, 2, 0, 0, 0, TimeSpan.FromHours(8)) };
         if (NextGrowthPollTime(pollState, new DateTime(2026, 10, 2, 1, 0, 0), defaultConfig) !=
@@ -4760,6 +4870,15 @@ internal static class Program
             NextGrowthPollTime(new State(), new DateTime(2026, 10, 2, 1, 0, 0), defaultConfig) !=
             new DateTime(2026, 10, 2, 1, 0, 0))
             throw new InvalidOperationException("成长中心必须按每四小时调度，首次无记录时立即补跑。");
+        var maintenanceNow = new DateTime(2026, 10, 2, 1, 0, 0);
+        var maintenanceState = new State
+        {
+            LastRouteDiscoveryAt = new DateTimeOffset(maintenanceNow.AddHours(-1)),
+            LastUpdateCheckAt = new DateTimeOffset(maintenanceNow.AddHours(-1))
+        };
+        if (NextMaintenanceTime(maintenanceState, maintenanceNow, defaultConfig) != maintenanceNow.AddHours(5) ||
+            NextMaintenanceTime(new State(), maintenanceNow, defaultConfig) != maintenanceNow)
+            throw new InvalidOperationException("后台维护必须按最早到期的 Release 或路由检查唤醒，首次无记录时立即检查。");
         if (ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: true))
             throw new InvalidOperationException("已有后台 WorkBuddy 进程时不得被视为工具启动并关闭。");
         if (!ShouldTreatWorkBuddyAsToolLaunched(hadVisibleWindow: false, hadExistingProcess: false) ||
@@ -4805,6 +4924,10 @@ internal static class Program
                 MaxAttempts = 4,
                 ManualMaxAttempts = 2,
                 EnableGrowthCenter = false,
+                EnableAutomaticRouteDiscovery = false,
+                RouteDiscoveryHours = 48,
+                EnableAutomaticUpdates = false,
+                UpdateCheckHours = 12,
                 GrowthPollHours = 6,
                 GrowthRunBudgetSeconds = 210,
                 GrowthRequestTimeoutSeconds = 25,
@@ -4815,6 +4938,8 @@ internal static class Program
             var reloadedConfig = LoadConfig(configTestPath, createFromExample: false);
             if (reloadedConfig.ClaimTime != "01:25" || reloadedConfig.MaxAttempts != 4 ||
                 reloadedConfig.ManualMaxAttempts != 2 || reloadedConfig.EnableGrowthCenter ||
+                reloadedConfig.EnableAutomaticRouteDiscovery || reloadedConfig.RouteDiscoveryHours != 48 ||
+                reloadedConfig.EnableAutomaticUpdates || reloadedConfig.UpdateCheckHours != 12 ||
                 reloadedConfig.GrowthPollHours != 6 || reloadedConfig.GrowthRunBudgetSeconds != 210 ||
                 reloadedConfig.GrowthRequestTimeoutSeconds != 25 ||
                 reloadedConfig.BalanceValueCropScale != 7)
@@ -5338,6 +5463,8 @@ internal static class Program
         }
         WorkBuddyApiSelfTests.Run(config);
         GrowthCenterSelfTests.Run();
+        RouteDiscoverySelfTests.Run();
+        AutomaticUpdateSelfTests.Run();
         Log("Self test OK.");
         return 0;
     }
@@ -5374,6 +5501,12 @@ internal static class Program
             throw new InvalidOperationException("启动等待和界面等待必须在 5 到 120 秒之间。");
         if (config.ApiTimeoutSeconds is < 5 or > 60)
             throw new InvalidOperationException("接口请求超时必须在 5 到 60 秒之间。");
+        if (config.RouteDiscoveryHours is < 1 or > 168)
+            throw new InvalidOperationException("接口路由发现间隔必须在 1 到 168 小时之间。");
+        if (config.UpdateCheckHours is < 1 or > 168)
+            throw new InvalidOperationException("自动更新检查间隔必须在 1 到 168 小时之间。");
+        if (!Regex.IsMatch(config.UpdateGitHubRepository ?? "", @"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z", RegexOptions.CultureInvariant))
+            throw new InvalidOperationException("GitHub 更新仓库必须使用 owner/repository 格式。");
         if (config.GrowthPollHours is < 1 or > 24)
             throw new InvalidOperationException("成长中心轮询间隔必须在 1 到 24 小时之间。");
         if (config.GrowthRunBudgetSeconds is < 30 or > 240)
@@ -5745,6 +5878,12 @@ internal sealed class Config
     public int ApiTimeoutSeconds { get; set; } = 15;
     public bool ApiRefreshOnUnauthorized { get; set; } = true;
     public bool EnableGrowthCenter { get; set; } = true;
+    public bool EnableAutomaticRouteDiscovery { get; set; } = true;
+    public int RouteDiscoveryHours { get; set; } = 24;
+    public string ApiRouteManifestPath { get; set; } = "";
+    public bool EnableAutomaticUpdates { get; set; } = true;
+    public int UpdateCheckHours { get; set; } = 6;
+    public string UpdateGitHubRepository { get; set; } = "cheyne2015/workbuddy-checkin";
     public int GrowthPollHours { get; set; } = 4;
     public int GrowthRunBudgetSeconds { get; set; } = 180;
     public int GrowthRequestTimeoutSeconds { get; set; } = 30;
@@ -5787,6 +5926,9 @@ internal sealed class State
     public DateOnly? SuccessDate { get; set; }
     public DateOnly? TerminalFailureDate { get; set; }
     public DateTimeOffset? LastGrowthPollAt { get; set; }
+    public DateTimeOffset? LastRouteDiscoveryAt { get; set; }
+    public string? LastRouteDiscoveryAsarSignature { get; set; }
+    public DateTimeOffset? LastUpdateCheckAt { get; set; }
 }
 
 internal static class Native

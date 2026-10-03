@@ -20,8 +20,6 @@ internal sealed record GrowthCenterResult(
 
 internal static class WorkBuddyGrowthCenter
 {
-    private const string BasePath = "/v2/activity/growth";
-
     internal static GrowthCenterResult Execute(
         WorkBuddyApiSession session,
         Config config,
@@ -94,7 +92,7 @@ internal static class WorkBuddyGrowthCenter
 
         internal void RunTravel()
         {
-            var status = Get(BasePath + "/buddy/travel/status");
+            var status = Get(Route(ApiRouteKeys.TravelStatus));
             if (StopForAuth(status)) return;
             if (status.NetworkFailed || status.BudgetOut)
             {
@@ -117,7 +115,7 @@ internal static class WorkBuddyGrowthCenter
             var claimed = false;
             if (travel == "arrived")
             {
-                var result = Post(BasePath + "/buddy/travel/claim", new { record_id = Value(status.Body, "record_id") });
+                var result = Post(Route(ApiRouteKeys.TravelClaim), new { record_id = Value(status.Body, "record_id") });
                 if (StopForAuth(result)) return;
                 var reward = Integer(result.Body, "reward_credit");
                 if (result.IsSuccess && reward.HasValue)
@@ -142,14 +140,14 @@ internal static class WorkBuddyGrowthCenter
             }
             else if (travel == "idle")
             {
-                var locations = Get(BasePath + "/buddy/travel/config");
+                var locations = Get(Route(ApiRouteKeys.TravelConfig));
                 if (StopForAuth(locations)) return;
                 var first = Find(locations.Body, "locations") is JsonArray array && array.Count > 0
                     ? array[0] as JsonObject
                     : null;
                 if (locations.IsSuccess && first is not null)
                 {
-                    var departed = Post(BasePath + "/buddy/travel/depart", new { location_id = first["id"]?.DeepClone() });
+                    var departed = Post(Route(ApiRouteKeys.TravelDepart), new { location_id = first["id"]?.DeepClone() });
                     if (StopForAuth(departed)) return;
                     if (departed.IsSuccess)
                     {
@@ -183,7 +181,7 @@ internal static class WorkBuddyGrowthCenter
             if (CannotContinue("任务领奖")) return;
             try
             {
-                var response = Get(BasePath + "/tasks");
+                var response = Get(Route(ApiRouteKeys.Tasks));
                 if (StopForAuth(response)) return;
                 if (!response.IsSuccess)
                 {
@@ -202,7 +200,7 @@ internal static class WorkBuddyGrowthCenter
                 foreach (var batch in pending.Chunk(20))
                 {
                     if (CannotContinue("剩余任务接单")) break;
-                    var accepted = Post(BasePath + "/tasks/accept", new { task_codes = batch });
+                    var accepted = Post(Route(ApiRouteKeys.TasksAccept), new { task_codes = batch });
                     if (StopForAuth(accepted)) return;
                     var results = Find(accepted.Body, "results") as JsonArray;
                     if (results is null)
@@ -241,7 +239,7 @@ internal static class WorkBuddyGrowthCenter
                     var code = Text(task, "task_code");
                     if (string.IsNullOrWhiteSpace(code)) continue;
                     var title = titles.GetValueOrDefault(code, code);
-                    var claimed = Post(BasePath + "/tasks/" + Uri.EscapeDataString(code) + "/claim", new { });
+                    var claimed = Post(Route(ApiRouteKeys.TaskClaim, code), new { });
                     if (StopForAuth(claimed)) return;
                     if (claimed.IsSuccess && !Bool(claimed.Body, "already_claimed"))
                     {
@@ -274,7 +272,7 @@ internal static class WorkBuddyGrowthCenter
             if (CannotContinue("补登")) return;
             try
             {
-                var streak = Get(BasePath + "/streak");
+                var streak = Get(Route(ApiRouteKeys.Streak));
                 if (StopForAuth(streak)) return;
                 if (!IsApiSuccess(streak))
                 {
@@ -288,7 +286,7 @@ internal static class WorkBuddyGrowthCenter
                     : ToInt(cardsNode);
                 if (cards <= 0) return;
 
-                var heatmap = Get(BasePath + "/heatmap");
+                var heatmap = Get(Route(ApiRouteKeys.Heatmap));
                 if (StopForAuth(heatmap)) return;
                 if (!IsApiSuccess(heatmap))
                 {
@@ -300,7 +298,7 @@ internal static class WorkBuddyGrowthCenter
                 foreach (var date in dates.Take(Math.Min(cards, 1)))
                 {
                     if (CannotContinue("剩余补登")) break;
-                    var used = Post(BasePath + "/makeup-cards/use", new { target_date = date });
+                    var used = Post(Route(ApiRouteKeys.MakeupUse), new { target_date = date });
                     if (StopForAuth(used)) return;
                     if (IsApiSuccess(used))
                     {
@@ -343,7 +341,7 @@ internal static class WorkBuddyGrowthCenter
             if (CannotContinue("连登兑换")) return;
             try
             {
-                var summary = Get(BasePath + "/redeem/summary");
+                var summary = Get(Route(ApiRouteKeys.RedeemSummary));
                 if (StopForAuth(summary)) return;
                 if (!summary.IsSuccess)
                 {
@@ -361,9 +359,9 @@ internal static class WorkBuddyGrowthCenter
                     if (CannotContinue("剩余连登兑换")) break;
                     var status = Text(summary.Body, tier.StatusKey);
                     if (string.IsNullOrWhiteSpace(status) || status is "claimed" or "locked") continue;
-                    var redeemed = Post(BasePath + "/redeem", new { tier = tier.Tier, client_token = ClientToken() });
+                    var redeemed = Post(Route(ApiRouteKeys.Redeem), new { tier = tier.Tier, client_token = ClientToken() });
                     if (IsUnknownTier(redeemed))
-                        redeemed = Post(BasePath + "/redeem", new { tier = tier.Days, client_token = ClientToken() });
+                        redeemed = Post(Route(ApiRouteKeys.Redeem), new { tier = tier.Days, client_token = ClientToken() });
                     if (IsTierLocked(redeemed))
                     {
                         _parts.Add($"连登兑换「{tier.Label}」未解锁（连登天数不足）");
@@ -396,7 +394,7 @@ internal static class WorkBuddyGrowthCenter
             if (CannotContinue("盲盒")) return;
             try
             {
-                var chances = Get(BasePath + "/lottery/chances");
+                var chances = Get(Route(ApiRouteKeys.LotteryChances));
                 if (StopForAuth(chances)) return;
                 if (!chances.IsSuccess)
                 {
@@ -405,7 +403,7 @@ internal static class WorkBuddyGrowthCenter
                 }
                 var balance = Integer(chances.Body, "balance") ?? 0;
                 if (balance <= 0) return;
-                var drawn = Post(BasePath + "/lottery/draw", new { client_token = ClientToken() });
+                var drawn = Post(Route(ApiRouteKeys.LotteryDraw), new { client_token = ClientToken() });
                 if (StopForAuth(drawn)) return;
                 if (drawn.IsSuccess)
                 {
@@ -439,7 +437,7 @@ internal static class WorkBuddyGrowthCenter
             if (CannotContinue("Buddy 盲盒")) return;
             try
             {
-                var quota = Get(BasePath + "/buddy/quota");
+                var quota = Get(Route(ApiRouteKeys.BuddyQuota));
                 if (StopForAuth(quota)) return;
                 if (!quota.IsSuccess)
                 {
@@ -451,7 +449,7 @@ internal static class WorkBuddyGrowthCenter
                 if (maxOpen <= 0) maxOpen = 1;
                 if (affordable <= 0) return;
                 var count = Math.Min(affordable, maxOpen);
-                var opened = Post(BasePath + "/buddy/open", new { count, client_token = ClientToken() });
+                var opened = Post(Route(ApiRouteKeys.BuddyOpen), new { count, client_token = ClientToken() });
                 if (StopForAuth(opened)) return;
                 if (opened.IsSuccess)
                 {
@@ -478,7 +476,7 @@ internal static class WorkBuddyGrowthCenter
             if (_authenticationRejected || BudgetLeft <= 0) return;
             try
             {
-                var energy = Get(BasePath + "/energy");
+                var energy = Get(Route(ApiRouteKeys.Energy));
                 if (energy.IsSuccess) _energy = Integer(energy.Body, "balance");
             }
             catch { }
@@ -487,7 +485,7 @@ internal static class WorkBuddyGrowthCenter
                 var streak = _streakBody;
                 if (streak is null || _streakStale)
                 {
-                    var refreshed = Get(BasePath + "/streak");
+                    var refreshed = Get(Route(ApiRouteKeys.Streak));
                     streak = refreshed.IsSuccess ? refreshed.Body : null;
                 }
                 _streakDays = Integer(Find(streak, "streak"), "days");
@@ -528,6 +526,7 @@ internal static class WorkBuddyGrowthCenter
 
         private GrowthResponse Get(string path) => Send(HttpMethod.Get, path, null, retryRead: true);
         private GrowthResponse Post(string path, object? payload) => Send(HttpMethod.Post, path, payload, retryRead: false);
+        private string Route(string key, string? value = null) => ApiRouteCatalog.Get(key, config, value);
 
         private GrowthResponse Send(HttpMethod method, string path, object? payload, bool retryRead)
         {

@@ -19,6 +19,8 @@
 - 默认每天 `00:00` 尝试领取一次；时间可在 `config.json` 的 `ClaimTime` 中修改。
 - 接口快速通道不依赖可交互桌面；只有回退到 OCR 时，锁屏、睡眠或桌面暂不可操作才每 `60` 秒等待一次，且不计入领取次数。
 - 每日签到成功后不再反复领取；启用成长中心时每 `4` 小时仅运行一次幂等接口轮询，以便及时领取旅行礼物并再次派出 Buddy。
+- 默认每 `24` 小时扫描本机 WorkBuddy `app.asar` 与官方成长中心前端；候选接口必须通过当前登录会话的只读签到状态查询后才会启用，失败时继续使用上一份已验证清单或内置路由。
+- 默认每 `6` 小时检查本仓库最新稳定 GitHub Release。只有包名、版本、大小及 GitHub 提供的 SHA-256 digest 全部匹配才会安装；失败会回滚并恢复原守护。
 - 接口成功时不会启动 WorkBuddy 图形界面。只有 OCR 保底需要窗口：未运行时后台启动并在结束后关闭；原本前台则保持前台；原本最小化则完成后恢复最小化。
 - 成功、今日已领取、失败都会发送 Windows 通知中心通知，并保留三天。
 - 守护进程常驻在右下角通知区域：左键图标打开面板，右键可以打开面板、重试领取或退出守护。
@@ -30,7 +32,7 @@
 
 - “概览”显示最近领取状态、当前余额、成长中心最近结果、更新时间和下一次自动领取时间。
 - “重试领取”按照“手动尝试次数”执行；运行期间按钮会锁定，避免重复提交。
-- “设置”可开关接口快速通道和成长中心，并修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
+- “设置”可开关接口快速通道、成长中心、接口路由更新与程序自动更新，并修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
 - 点击“保存并立即应用”会唤醒守护并重新计算计划，不需要重启程序。
 - 关闭面板只会隐藏到右下角；要停止常驻守护，请右键托盘图标并选择“退出守护”。
 - “打开高级配置”可编辑 OCR 与界面适配参数，面板保存常用设置时会保留这些高级参数。
@@ -130,6 +132,12 @@
 | `ApiTimeoutSeconds` | `15` | 单次接口请求超时，允许 5～60 秒 |
 | `ApiRefreshOnUnauthorized` | `true` | HTTP 401 后重新读取一次本机登录会话 |
 | `EnableGrowthCenter` | `true` | 启用旅行、任务、补登、连登奖励、抽奖和 Buddy 盲盒 |
+| `EnableAutomaticRouteDiscovery` | `true` | 从已安装 WorkBuddy 与官方前端发现接口候选，并在只读验证后启用 |
+| `RouteDiscoveryHours` | `24` | 自动路由发现间隔，允许 1～168 小时；WorkBuddy 资源变化时会提前检查 |
+| `ApiRouteManifestPath` | 空 | 已验证路由清单路径；留空时保存到本机运行数据目录 |
+| `EnableAutomaticUpdates` | `true` | 自动检查并安装本仓库最新稳定 GitHub Release |
+| `UpdateCheckHours` | `6` | Release 检查间隔，允许 1～168 小时 |
+| `UpdateGitHubRepository` | `cheyne2015/workbuddy-checkin` | 自动更新使用的 GitHub `owner/repository` |
 | `GrowthPollHours` | `4` | 每次成长中心轮询的间隔小时数，允许 1～24 |
 | `GrowthRunBudgetSeconds` | `180` | 单轮成长中心总时间预算，允许 30～240 秒 |
 | `GrowthRequestTimeoutSeconds` | `30` | 成长中心单次查询超时；配合总预算动态收缩 |
@@ -153,6 +161,12 @@ cd .\release
 
 # 运行成长中心完整离线 HTTP 夹具；不会读取本机会话或访问真实接口
 .\WorkBuddyAutoClaim.exe --growth-test
+
+# 验证路由发现、ASAR 解析、只读激活门槛与清单备份；不访问真实接口
+.\WorkBuddyAutoClaim.exe --route-discovery-test
+
+# 验证 Release 选择、digest、ZIP 防穿越、失败回滚和配置保留；不连接 GitHub、不替换当前程序
+.\WorkBuddyAutoClaim.exe --update-test
 
 # 使用真实本机会话只查询签到状态；明确不会调用领取接口
 .\WorkBuddyAutoClaim.exe --api-status-test
@@ -198,8 +212,10 @@ cd .\release
 重点文件：
 
 - `workbuddy-auto-claim.log`：运行、OCR、通知与失败原因。
-- `state.json`：当天自动领取的成功或终止失败状态，以及最近成长中心轮询时间。
-- `run-status.json`：守护面板显示的最近领取状态、余额、成长中心结果和尝试次数。
+- `state.json`：当天自动领取终态，以及最近成长中心、路由发现和 Release 检查时间。
+- `run-status.json`：守护面板显示的最近领取、成长中心、接口路由和程序更新结果。
+- `api-routes.json`：通过只读状态接口验证后才会启用的动态路由清单；旧版保留为 `.bak`。
+- `updates\` / `update-backups\`：已验证的更新暂存目录和最近自动替换备份。
 - `workbuddy-*.png`：领取前后、个人中心识别失败等诊断截图。
 - `workbuddy-personal-center-ocr-failure.txt`：识别失败时保存的 OCR 原文。
 
@@ -221,7 +237,8 @@ cd .\release
 - `state.json` 使用原子写入和 `.bak` 备份。两份状态都损坏时，当天安全停止并通知，不会重复领取。
 - 安装的 Windows 任务在登录时启动守护进程；守护异常退出时，任务计划会每分钟最多重启 3 次。
 - 安装、手动测试或安全测试结束时，工具优先请求任务计划恢复守护；只有新守护完成配置加载并主动发出就绪信号后才记录恢复成功，直接启动回退也执行同样确认。
-- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.3.0.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
+- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.3.1.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
+- 自动更新只接受 GitHub 最新稳定 Release 中精确命名的 ZIP，并核对 Release 元数据里的 SHA-256 digest；安装前暂存，覆盖失败或最终 EXE 哈希不符时恢复原文件，`release\config.json` 始终保留。
 - `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-auto-claim.log` 只保留最近 30 天；`diagnostics\` 仅保留最新 20 份失败诊断。诊断包包含截图、OCR 原文、WorkBuddy 版本、窗口尺寸和 DPI；成功领取不会保留领取截图。
 
 失败通知除余额外，还会包含失败阶段、已执行尝试次数，以及 WorkBuddy 是保留原前台、保留后台最小化，还是由工具启动后关闭。
