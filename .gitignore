@@ -4,3 +4,6 @@ release/
 config.json
 *.user
 artifacts/*.png
+artifacts/installed-*-backup-*.zip
+artifacts/deploy-*.txt
+artifacts/finalize-*.txt
