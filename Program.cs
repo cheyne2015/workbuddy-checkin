@@ -351,8 +351,8 @@ internal static class Program
                     var activated = VerifyAndActivateDiscoveredRoutes(manifest, session.Session!, config);
                     RouteDiscoveryEngine.ActivateRoutes(manifest, activated, ApiRouteCatalog.ResolveManifestPath(config));
                     UpdateMaintenanceStatus(routeMessage:
-                        $"接口路由已逐项验证并启用 {activated.Count}/{manifest.Routes.Count} 条（WorkBuddy {manifest.WorkBuddyVersion}）。");
-                    Log($"自动路由发现完成：发现 {manifest.Routes.Count} 条，逐项验证后启用 {activated.Count} 条。");
+                        $"接口路由已检查并启用 {activated.Count}/{manifest.Routes.Count} 条：只读路由逐项实测，写路由仅保留内置已知路径（WorkBuddy {manifest.WorkBuddyVersion}）。");
+                    Log($"自动路由发现完成：发现 {manifest.Routes.Count} 条；只读路由逐项实测，写路由仅保留内置已知路径；共启用 {activated.Count} 条。");
                 }
                 catch (Exception ex)
                 {
@@ -426,11 +426,20 @@ internal static class Program
         };
         foreach (var (writeKey, companionKey) in writeCompanions)
         {
-            if (!activated.Contains(companionKey) || !manifest.Routes.TryGetValue(writeKey, out var route)) continue;
-            if (route.Source.StartsWith("asar:", StringComparison.Ordinal) ||
-                route.Source.StartsWith("h5:", StringComparison.Ordinal)) activated.Add(writeKey);
+            if (CanActivateDiscoveredWriteRoute(manifest, writeKey, companionKey, activated)) activated.Add(writeKey);
         }
         return activated;
+    }
+
+    internal static bool CanActivateDiscoveredWriteRoute(ApiRouteManifest manifest, string writeKey,
+        string companionKey, IReadOnlySet<string> activated)
+    {
+        if (!activated.Contains(companionKey) || !manifest.Routes.TryGetValue(writeKey, out var route) ||
+            !ApiRouteCatalog.BuiltIn.TryGetValue(writeKey, out var builtIn)) return false;
+        return string.Equals(route.Path, builtIn.Path, StringComparison.Ordinal) &&
+               string.Equals(route.Method, builtIn.Method, StringComparison.OrdinalIgnoreCase) &&
+               (route.Source.StartsWith("asar:", StringComparison.Ordinal) ||
+                route.Source.StartsWith("h5:", StringComparison.Ordinal));
     }
 
     internal static bool IsVerifiedRouteDiscoveryStatus(ApiAttemptResult result) =>
@@ -4910,6 +4919,16 @@ internal static class Program
             !IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "unclaimed", HttpStatus: 200, FallbackReason: "STATUS_UNCLAIMED")) ||
             !IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.InactiveNeedsSingleOcr, "inactive", HttpStatus: 200, FallbackReason: "active=false")))
             throw new InvalidOperationException("路由发现只能接受语义明确的 2xx 签到状态，网络/权限/结构失败不得激活候选路由。");
+        var writeGateManifest = new ApiRouteManifest
+        {
+            Routes = new Dictionary<string, ApiRouteDefinition>(StringComparer.Ordinal)
+            {
+                [ApiRouteKeys.DailyClaim] = new("POST", "/v2/billing/meter/daily-checkin-v2", "asar:fixture", 100)
+            }
+        };
+        if (CanActivateDiscoveredWriteRoute(writeGateManifest, ApiRouteKeys.DailyClaim, ApiRouteKeys.DailyStatus,
+                new HashSet<string>([ApiRouteKeys.DailyStatus], StringComparer.Ordinal)))
+            throw new InvalidOperationException("变更后的写接口不能仅凭静态发现自动激活，必须随已审查 Release 更新。");
         if (defaultConfig.MaxAttempts != 5 || defaultConfig.ManualMaxAttempts != 1 ||
             defaultConfig.RetryIntervalSeconds != 60 || !defaultConfig.EnableGrowthCenter ||
             defaultConfig.GrowthPollHours != 4 || defaultConfig.GrowthRunBudgetSeconds != 180 ||

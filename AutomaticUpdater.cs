@@ -24,6 +24,8 @@ internal sealed class UpdateApplyPlan
 
 internal static class AutomaticUpdater
 {
+    private const string DaemonReadyEventName = "WorkBuddyAutoClaim.DaemonReady";
+    private static readonly TimeSpan DaemonReadyTimeout = TimeSpan.FromSeconds(10);
     private const int MaximumReleaseMetadataBytes = 1_048_576;
     private const int MaximumArchiveBytes = 100 * 1024 * 1024;
     private const long MaximumExtractedBytes = 200L * 1024 * 1024;
@@ -134,8 +136,18 @@ internal static class AutomaticUpdater
             var recovery = ex.Message.Contains("回滚未完全成功", StringComparison.Ordinal)
                 ? "自动更新安装失败，且原文件未能完全恢复："
                 : "自动更新安装失败，原文件已恢复：";
+            Exception? restartError = null;
+            if (File.Exists(targetExe))
+            {
+                try { startDaemon(targetExe); }
+                catch (Exception restoreFailure) { restartError = restoreFailure; }
+            }
+            if (restartError is not null)
+            {
+                writeResult(recovery + ex.Message + "；旧守护恢复失败，请手动启动程序：" + restartError.Message, false);
+                return 5;
+            }
             writeResult(recovery + ex.Message, false);
-            if (File.Exists(targetExe)) { try { startDaemon(targetExe); } catch { } }
             return 1;
         }
     }
@@ -174,11 +186,18 @@ internal static class AutomaticUpdater
 
     private static void StartDaemon(string targetExe)
     {
-        Process.Start(new ProcessStartInfo(targetExe, "--daemon")
+        using var ready = new EventWaitHandle(false, EventResetMode.AutoReset, DaemonReadyEventName);
+        while (ready.WaitOne(0)) { }
+        using var process = Process.Start(new ProcessStartInfo(targetExe, "--daemon")
         {
             UseShellExecute = true,
             WorkingDirectory = Path.GetDirectoryName(targetExe)!
-        });
+        }) ?? throw new InvalidOperationException("无法启动更新后的守护进程。");
+        if (!ready.WaitOne(DaemonReadyTimeout))
+        {
+            var detail = process.HasExited ? $"进程已退出，退出码 {process.ExitCode}" : "等待就绪信号超时";
+            throw new InvalidOperationException("守护进程未确认就绪：" + detail);
+        }
     }
 
     internal static GitHubReleaseInfo? ParseRelease(string json, Version currentVersion)
@@ -462,6 +481,14 @@ internal static class AutomaticUpdateSelfTests
             if (failedCode != 1 || !started || applySuccess != false ||
                 File.ReadAllText(Path.Combine(handoffTarget, "release", "WorkBuddyAutoClaim.exe"), Encoding.UTF8) != "old-again")
                 throw new InvalidOperationException("更新交接失败时必须回滚旧文件、恢复旧守护并记录失败结果。");
+
+            string? combinedFailureMessage = null;
+            var combinedFailure = AutomaticUpdater.ExecuteApplyPlan(plan, _ => true,
+                _ => throw new InvalidOperationException("fixture restore failure"),
+                (message, _) => combinedFailureMessage = message, Path.Combine(temp, "handoff-combined-backup"));
+            if (combinedFailure != 5 ||
+                combinedFailureMessage?.Contains("旧守护恢复失败", StringComparison.Ordinal) != true)
+                throw new InvalidOperationException("替换与旧守护恢复同时失败时必须明确报告并返回独立退出码。");
 
             plan.ExpectedExeSha256 = exeHash;
             var restartFailure = AutomaticUpdater.ExecuteApplyPlan(plan, _ => true,
