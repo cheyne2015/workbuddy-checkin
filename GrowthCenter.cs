@@ -32,13 +32,13 @@ internal static class WorkBuddyGrowthCenter
         var context = new GrowthContext(client, session.Endpoint, config,
             wait ?? (duration => { Thread.Sleep(duration); return false; }),
             cancellationRequested ?? (() => false));
-        context.RunModule(context.RunTravel, "travel", "旅行");
-        context.RunModule(context.RunTasks, "tasks", "任务");
-        context.RunModule(context.RunMakeup, "makeup", "补登");
-        context.RunModule(context.RunRedeem, "redeem", "连登兑换");
-        context.RunModule(context.RunLottery, "lottery", "盲盒");
-        context.RunModule(context.RunBuddyBoxes, "buddy", "Buddy 盲盒");
-        context.RunModule(context.LoadSummary, "summary", "状态汇总");
+        context.RunModule(context.RunTravel, GrowthModuleCatalog.Travel, "旅行");
+        context.RunModule(context.RunTasks, GrowthModuleCatalog.Tasks, "任务");
+        context.RunModule(context.RunMakeup, GrowthModuleCatalog.Makeup, "补登");
+        context.RunModule(context.RunRedeem, GrowthModuleCatalog.Redeem, "连登兑换");
+        context.RunModule(context.RunLottery, GrowthModuleCatalog.Lottery, "盲盒");
+        context.RunModule(context.RunBuddyBoxes, GrowthModuleCatalog.Buddy, "Buddy 盲盒");
+        context.RunModule(context.LoadSummary, GrowthModuleCatalog.Summary, "状态汇总");
         return context.Complete();
     }
 

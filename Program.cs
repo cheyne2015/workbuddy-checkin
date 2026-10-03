@@ -981,10 +981,11 @@ internal static class Program
             SaveState(persistedState);
         }
         var message = result.Message + " 未启动 WorkBuddy 图形界面。";
-        var totalCredits = result.TotalCredits ?? lastKnownBalance;
-        var totalCreditsSource = !string.IsNullOrWhiteSpace(result.TotalCredits)
-            ? "Api"
-            : !string.IsNullOrWhiteSpace(lastKnownBalance) ? "Cached" : null;
+        var totalCredits = AddKnownCredits(result.TotalCredits, growth?.CreditsGained ?? 0) ?? lastKnownBalance;
+        var hasApiTotal = !string.IsNullOrWhiteSpace(result.TotalCredits);
+        CreditsValueSource? totalCreditsSource = hasApiTotal
+            ? growth?.CreditsGained > 0 ? CreditsValueSource.ApiWithGrowth : CreditsValueSource.Api
+            : null;
         RecordRunStatus(new RunStatus
         {
             UpdatedAt = DateTimeOffset.Now,
@@ -998,8 +999,9 @@ internal static class Program
             ApiResult = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "Already",
             CreditGained = result.Credit,
             StreakDays = result.StreakDays,
-            TotalCredits = totalCredits,
+            TotalCredits = hasApiTotal ? totalCredits : null,
             TotalCreditsSource = totalCreditsSource,
+            TotalCreditsUpdatedAt = hasApiTotal ? DateTimeOffset.Now : null,
             EndpointHost = result.EndpointHost,
             BalanceFresh = !string.IsNullOrWhiteSpace(result.TotalCredits),
             GrowthMessage = growth?.Report,
@@ -1015,7 +1017,9 @@ internal static class Program
         var reward = string.IsNullOrWhiteSpace(result.Credit) ? "" : $"\n本次：+{result.Credit} 积分";
         var streak = result.StreakDays.HasValue ? $"\n连签：{result.StreakDays} 天" : "";
         var growthText = growth is null || growth.Idle ? "" : "\n成长中心：" + growth.Report;
-        var totalSourceNote = !string.IsNullOrWhiteSpace(result.TotalCredits) ? "接口实时" : "最近缓存";
+        var totalSourceNote = hasApiTotal
+            ? growth?.CreditsGained > 0 ? "接口余额 + 本轮奖励" : "接口实时"
+            : !string.IsNullOrWhiteSpace(lastKnownBalance) ? "最近缓存" : "尚未读取";
         Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
             $"{result.Message}{reward}{streak}\n总积分：{totalCredits ?? "未读取到"}（{totalSourceNote}）\n尝试：{attempt}/{maxAttempts}{growthText}",
             growth?.NeedsAttention == true ? ToolTipIcon.Warning : ToolTipIcon.Info);
@@ -1129,6 +1133,8 @@ internal static class Program
             stateLoad.State!.LastGrowthPollAt = DateTimeOffset.Now;
             SaveState(stateLoad.State);
         }
+        var pollTotalCredits = AddKnownCredits(daily?.TotalCredits, result.CreditsGained);
+        var hasPollTotal = !string.IsNullOrWhiteSpace(daily?.TotalCredits);
         RecordRunStatus((previous ?? new RunStatus()) with
         {
             UpdatedAt = DateTimeOffset.Now,
@@ -1142,10 +1148,11 @@ internal static class Program
                 ? previous?.GrowthModules
                 : new Dictionary<string, string>(result.Modules, StringComparer.Ordinal),
             StreakDays = daily?.StreakDays ?? previous?.StreakDays,
-            TotalCredits = daily?.TotalCredits ?? previous?.TotalCredits,
-            TotalCreditsSource = !string.IsNullOrWhiteSpace(daily?.TotalCredits)
-                ? "Api"
-                : previous?.TotalCreditsSource,
+            TotalCredits = hasPollTotal ? pollTotalCredits : null,
+            TotalCreditsSource = hasPollTotal
+                ? result.CreditsGained > 0 ? CreditsValueSource.ApiWithGrowth : CreditsValueSource.Api
+                : null,
+            TotalCreditsUpdatedAt = hasPollTotal ? DateTimeOffset.Now : null,
             EndpointHost = loaded.Session?.Endpoint.Host ?? previous?.EndpointHost,
             PendingEndpointHost = loaded.PendingHost ?? previous?.PendingEndpointHost,
             FallbackReason = loaded.IsReady ? previous?.FallbackReason : loaded.FallbackReason
@@ -1312,6 +1319,7 @@ internal static class Program
                 SaveState(successfulState);
             }
             Log("完成: " + result);
+            var confirmedBalance = FormatNotificationBalance(notificationAfterBalance);
             RecordRunStatus(new RunStatus
             {
                 UpdatedAt = DateTimeOffset.Now,
@@ -1319,9 +1327,10 @@ internal static class Program
                 Outcome = outcomeKind.ToString(),
                 Message = result,
                 BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
-                AfterBalance = FormatNotificationBalance(notificationAfterBalance),
-                TotalCredits = FormatNotificationBalance(notificationAfterBalance),
-                TotalCreditsSource = FormatNotificationBalance(notificationAfterBalance) is null ? null : "Ocr",
+                AfterBalance = confirmedBalance,
+                TotalCredits = confirmedBalance,
+                TotalCreditsSource = confirmedBalance is null ? null : CreditsValueSource.Ocr,
+                TotalCreditsUpdatedAt = confirmedBalance is null ? null : DateTimeOffset.Now,
                 AttemptsPerformed = attemptsPerformed,
                 MaxAttempts = displayedMaxAttempts,
                 ExecutionChannel = executionChannel,
@@ -5553,7 +5562,8 @@ internal static class Program
             var growthCenterView = GrowthCenterDashboardView.From(completedStatus with
             {
                 TotalCredits = "2372.85",
-                TotalCreditsSource = "Api",
+                TotalCreditsSource = CreditsValueSource.Api,
+                TotalCreditsUpdatedAt = new DateTimeOffset(2026, 10, 2, 4, 0, 1, TimeSpan.FromHours(8)),
                 StreakDays = 7,
                 GrowthEnergy = 18,
                 GrowthCreditsGained = 20,
@@ -5565,22 +5575,40 @@ internal static class Program
                 }
             });
             if (growthCenterView.TotalCredits != "2,372.85" ||
-                growthCenterView.TotalCreditsSource != "接口实时" ||
+                !growthCenterView.TotalCreditsSource.StartsWith("接口实时", StringComparison.Ordinal) ||
                 growthCenterView.StreakDays != "7 天" || growthCenterView.Energy != "18" ||
                 growthCenterView.Modules.Count != 6 ||
                 growthCenterView.Modules[0].Detail != "领旅行礼物 +20 积分" ||
                 growthCenterView.Modules[1].Detail != "任务无可领取项")
                 throw new InvalidOperationException("成长中心页必须分项展示实时总积分、连续领取天数、能量和模块结果。");
+            if (AddKnownCredits("2372.85", 20) != "2392.85" || AddKnownCredits(null, 20) is not null)
+                throw new InvalidOperationException("成长中心实发积分必须在有明确接口总积分时计入总额，无基数时不得猜测。");
 
             var cachedGrowthView = GrowthCenterDashboardView.From(completedStatus with
             {
                 TotalCredits = null,
                 TotalCreditsSource = null,
+                TotalCreditsUpdatedAt = null,
                 AfterBalance = "1822.8",
                 BalanceFresh = false
             });
             if (cachedGrowthView.TotalCredits != "1,822.8" || cachedGrowthView.TotalCreditsSource != "最近缓存")
                 throw new InvalidOperationException("接口总积分缺失时必须回退到最近余额，并明确标记为缓存。");
+
+            var previousApiTotal = completedStatus with
+            {
+                TotalCredits = "2372.85",
+                TotalCreditsSource = CreditsValueSource.Api,
+                TotalCreditsUpdatedAt = new DateTimeOffset(2026, 10, 2, 4, 0, 1, TimeSpan.FromHours(8))
+            };
+            var preserved = PreserveDashboardInsights(new RunStatus
+            {
+                UpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.FromHours(8)),
+                Outcome = "Running"
+            }, previousApiTotal);
+            var preservedView = GrowthCenterDashboardView.From(preserved);
+            if (!preservedView.TotalCreditsSource.StartsWith("最近接口记录", StringComparison.Ordinal))
+                throw new InvalidOperationException("旧接口积分跨执行状态保留时，必须降级为最近接口记录，不能继续标为实时。");
         }
         finally
         {
@@ -5751,24 +5779,51 @@ internal static class Program
     private static RunStatus PreserveDashboardInsights(RunStatus status)
     {
         var previous = LoadRunStatus(RunStatusPath);
+        return PreserveDashboardInsights(status, previous);
+    }
+
+    private static RunStatus PreserveDashboardInsights(RunStatus status, RunStatus? previous)
+    {
         if (previous is null) return status;
+        var hasFreshTotal = !string.IsNullOrWhiteSpace(status.TotalCredits);
         return status with
         {
             StreakDays = status.StreakDays ?? previous.StreakDays,
             TotalCredits = status.TotalCredits ?? previous.TotalCredits,
-            TotalCreditsSource = status.TotalCreditsSource ?? previous.TotalCreditsSource,
+            TotalCreditsSource = hasFreshTotal
+                ? status.TotalCreditsSource
+                : ToCachedTotalCreditsSource(previous.TotalCreditsSource),
+            TotalCreditsUpdatedAt = hasFreshTotal
+                ? status.TotalCreditsUpdatedAt ?? status.UpdatedAt
+                : previous.TotalCreditsUpdatedAt,
             GrowthMessage = status.GrowthMessage ?? previous.GrowthMessage,
             GrowthUpdatedAt = status.GrowthUpdatedAt ?? previous.GrowthUpdatedAt,
             GrowthCreditsGained = status.GrowthUpdatedAt.HasValue
                 ? status.GrowthCreditsGained
                 : previous.GrowthCreditsGained,
-            GrowthEnergy = status.GrowthEnergy ?? previous.GrowthEnergy,
-            GrowthStreakDays = status.GrowthStreakDays ?? previous.GrowthStreakDays,
+            GrowthEnergy = status.GrowthUpdatedAt.HasValue ? status.GrowthEnergy : previous.GrowthEnergy,
+            GrowthStreakDays = status.GrowthUpdatedAt.HasValue ? status.GrowthStreakDays : previous.GrowthStreakDays,
             GrowthNeedsAttention = status.GrowthUpdatedAt.HasValue
                 ? status.GrowthNeedsAttention
                 : previous.GrowthNeedsAttention,
-            GrowthModules = status.GrowthModules ?? previous.GrowthModules
+            GrowthModules = status.GrowthUpdatedAt.HasValue ? status.GrowthModules : previous.GrowthModules
         };
+    }
+
+    private static CreditsValueSource? ToCachedTotalCreditsSource(CreditsValueSource? source) => source switch
+    {
+        CreditsValueSource.Api or CreditsValueSource.ApiWithGrowth => CreditsValueSource.CachedApi,
+        CreditsValueSource.Ocr => CreditsValueSource.CachedOcr,
+        _ => source
+    };
+
+    private static string? AddKnownCredits(string? totalCredits, int creditsGained)
+    {
+        if (string.IsNullOrWhiteSpace(totalCredits)) return null;
+        if (!decimal.TryParse(totalCredits.Replace(",", ""), NumberStyles.Number,
+                CultureInfo.InvariantCulture, out var parsed))
+            return totalCredits;
+        return (parsed + creditsGained).ToString("0.##", CultureInfo.InvariantCulture);
     }
 
     internal static void SaveRunStatus(RunStatus status, string path)

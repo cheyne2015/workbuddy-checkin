@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | <img src="docs/images/dashboard-overview.png" width="300" alt="WorkBuddy 自动领取守护概览窗口"> | <img src="docs/images/dashboard-overview-growth.png" width="300" alt="WorkBuddy 自动领取守护成长中心窗口"> | <img src="docs/images/dashboard-overview-settings.png" width="300" alt="WorkBuddy 自动领取守护设置窗口"> |
 
-概览页展示本机最近一次真实执行记录；截图中的 `尝试 5/5` 是升级到 v1.1.5 前的历史结果，不代表新版默认会执行五次。
+截图使用离线界面夹具，不会触发真实领取；实际面板会读取本机最近一次执行记录。
 
 ## 它会做什么
 

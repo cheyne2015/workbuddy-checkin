@@ -79,7 +79,8 @@ internal sealed class TrayDaemonContext : ApplicationContext
             CreditGained = "100",
             StreakDays = 4,
             TotalCredits = "2372.85",
-            TotalCreditsSource = "Api",
+            TotalCreditsSource = CreditsValueSource.Api,
+            TotalCreditsUpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 2, TimeSpan.FromHours(8)),
             GrowthMessage = "旅行礼物已领取；任务奖励无可领取项；补登无需处理；连登奖励等待下一档；今日抽奖已完成；Buddy 盲盒额度已用完",
             GrowthUpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 1, TimeSpan.FromHours(8)),
             GrowthCreditsGained = 20,
@@ -432,15 +433,13 @@ internal sealed class DashboardForm : Form
         };
         modules.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
         modules.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        var moduleDefinitions = new[]
-        {
-            ("travel", "旅行礼物"), ("tasks", "任务"), ("makeup", "补登"),
-            ("redeem", "连登奖励"), ("lottery", "抽奖"), ("buddy", "Buddy 盲盒")
-        };
-        for (var row = 0; row < moduleDefinitions.Length; row++)
+        var moduleDefinitions = GrowthModuleCatalog.Visible;
+        for (var row = 0; row < moduleDefinitions.Count; row++)
         {
             modules.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
-            var (key, title) = moduleDefinitions[row];
+            var definition = moduleDefinitions[row];
+            var key = definition.Key;
+            var title = definition.Title;
             var titleLabel = new Label
             {
                 Text = title,
@@ -488,8 +487,9 @@ internal sealed class DashboardForm : Form
         {
             caption.Text = "尚未读取";
             caption.Dock = DockStyle.Bottom;
-            caption.Height = 20;
+            caption.Height = 34;
             caption.Font = new Font(Font.FontFamily, 8.5f);
+            caption.TextAlign = ContentAlignment.BottomLeft;
             caption.Tag = "card";
             card.Controls.Add(caption);
         }

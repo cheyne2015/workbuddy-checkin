@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json.Serialization;
 
 namespace WorkBuddyAutoClaim;
 
@@ -17,7 +18,8 @@ internal sealed record RunStatus
     public string? CreditGained { get; init; }
     public int? StreakDays { get; init; }
     public string? TotalCredits { get; init; }
-    public string? TotalCreditsSource { get; init; }
+    public CreditsValueSource? TotalCreditsSource { get; init; }
+    public DateTimeOffset? TotalCreditsUpdatedAt { get; init; }
     public string? EndpointHost { get; init; }
     public string? FallbackReason { get; init; }
     public bool BalanceFresh { get; init; } = true;
@@ -34,6 +36,40 @@ internal sealed record RunStatus
     public string? UpdateMessage { get; init; }
     public DateTimeOffset? UpdateCheckedAt { get; init; }
     public string? AvailableVersion { get; init; }
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+internal enum CreditsValueSource
+{
+    Api,
+    ApiWithGrowth,
+    Ocr,
+    CachedApi,
+    CachedOcr,
+    Cached
+}
+
+internal sealed record GrowthModuleDefinition(string Key, string Title);
+
+internal static class GrowthModuleCatalog
+{
+    internal const string Travel = "travel";
+    internal const string Tasks = "tasks";
+    internal const string Makeup = "makeup";
+    internal const string Redeem = "redeem";
+    internal const string Lottery = "lottery";
+    internal const string Buddy = "buddy";
+    internal const string Summary = "summary";
+
+    internal static readonly IReadOnlyList<GrowthModuleDefinition> Visible =
+    [
+        new(Travel, "旅行礼物"),
+        new(Tasks, "任务"),
+        new(Makeup, "补登"),
+        new(Redeem, "连登奖励"),
+        new(Lottery, "抽奖"),
+        new(Buddy, "Buddy 盲盒")
+    ];
 }
 
 internal sealed record DashboardStatusView(string Title, string Balance, string Detail, string UpdatedAt)
@@ -98,16 +134,6 @@ internal sealed record GrowthCenterDashboardView(
     IReadOnlyList<GrowthModuleView> Modules,
     bool NeedsAttention)
 {
-    private static readonly (string Key, string Title)[] ModuleOrder =
-    [
-        ("travel", "旅行礼物"),
-        ("tasks", "任务"),
-        ("makeup", "补登"),
-        ("redeem", "连登奖励"),
-        ("lottery", "抽奖"),
-        ("buddy", "Buddy 盲盒")
-    ];
-
     internal static GrowthCenterDashboardView From(RunStatus? status)
     {
         if (status is null)
@@ -117,15 +143,20 @@ internal sealed record GrowthCenterDashboardView(
         var total = FormatCredits(rawTotal);
         var source = status.TotalCreditsSource switch
         {
-            "Api" => "接口实时",
-            "Ocr" => "OCR 读取",
-            "Cached" or "CachedOcr" => "最近缓存",
+            CreditsValueSource.Api => "接口实时",
+            CreditsValueSource.ApiWithGrowth => "接口 + 本轮奖励",
+            CreditsValueSource.Ocr => "OCR 读取",
+            CreditsValueSource.CachedApi => "最近接口记录",
+            CreditsValueSource.CachedOcr => "最近 OCR 记录",
+            CreditsValueSource.Cached => "最近缓存",
             _ when !string.IsNullOrWhiteSpace(status.TotalCredits) => "已记录",
             _ when !string.IsNullOrWhiteSpace(rawTotal) && status.BalanceFresh => "OCR 读取",
             _ when !string.IsNullOrWhiteSpace(rawTotal) => "最近缓存",
             _ => "尚未读取"
         };
-        var modules = ModuleOrder.Select(module => new GrowthModuleView(
+        if (status.TotalCreditsUpdatedAt.HasValue)
+            source += $"\n{status.TotalCreditsUpdatedAt.Value.LocalDateTime:MM-dd HH:mm}";
+        var modules = GrowthModuleCatalog.Visible.Select(module => new GrowthModuleView(
             module.Key,
             module.Title,
             status.GrowthModules?.TryGetValue(module.Key, out var detail) == true && !string.IsNullOrWhiteSpace(detail)
@@ -152,7 +183,7 @@ internal sealed record GrowthCenterDashboardView(
 
     private static GrowthCenterDashboardView Empty(string summary) =>
         new("--", "尚未读取", "--", "--", "+0", "--", summary,
-            ModuleOrder.Select(module => new GrowthModuleView(module.Key, module.Title, "暂无记录")).ToArray(), false);
+            GrowthModuleCatalog.Visible.Select(module => new GrowthModuleView(module.Key, module.Title, "暂无记录")).ToArray(), false);
 
     private static string FormatCredits(string? value)
     {
