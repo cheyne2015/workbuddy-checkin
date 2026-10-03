@@ -617,6 +617,12 @@ internal static class Program
             if (handoffRequest?.WaitOne(0) == true) return 4;
             int currentAttempt = attempt;
             Log($"接口快速通道第 {attempt}/{maxAttempts} 次：先查询今日状态。");
+            using var attemptCancellation = new CancellationTokenSource();
+            RegisteredWaitHandle? cancellationRegistration = null;
+            if (handoffRequest is not null)
+                cancellationRegistration = ThreadPool.RegisterWaitForSingleObject(handoffRequest,
+                    static (state, _) => ((CancellationTokenSource)state!).Cancel(), attemptCancellation,
+                    Timeout.InfiniteTimeSpan, executeOnlyOnce: true);
             try
             {
                 lastResult = WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent, () =>
@@ -636,7 +642,7 @@ internal static class Program
                         AfterBalance = lastKnownBalance
                     });
                     claimMayHaveBeenSent = true;
-                });
+                }, cancellationToken: attemptCancellation.Token);
             }
             catch (Exception ex)
             {
@@ -649,7 +655,13 @@ internal static class Program
                         "接口状态查询发生内部异常，转入 OCR 保底。",
                         FallbackReason: "接口处理异常");
             }
+            finally
+            {
+                cancellationRegistration?.Unregister(null);
+            }
             Log($"接口结果：HTTP {lastResult.HttpStatus?.ToString() ?? "无"}，{lastResult.Message}");
+
+            if (lastResult.Kind == ApiAttemptKind.Cancelled) return 4;
 
             if (lastResult.Kind is ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed)
                 return CompleteApiSuccess(config, mode, session, lastResult, attempt, maxAttempts, lastKnownBalance,
@@ -896,6 +908,7 @@ internal static class Program
                     }
                     else
                     {
+                        loaded = refreshed;
                         daily = daily with
                         {
                             Message = "重新读取 WorkBuddy 登录会话失败，成长中心跳过：" + refreshed.Message,
