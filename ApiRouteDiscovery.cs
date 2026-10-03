@@ -41,7 +41,7 @@ internal sealed class ApiRouteManifest
     public string WorkBuddyVersion { get; set; } = "unknown";
     public string AsarSha256 { get; set; } = "";
     public DateTimeOffset DiscoveredAt { get; set; } = DateTimeOffset.Now;
-    public bool ReadOnlyVerified { get; set; }
+    public HashSet<string> ActivatedRouteKeys { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, ApiRouteDefinition> Routes { get; set; } = new(StringComparer.Ordinal);
 }
 
@@ -79,7 +79,7 @@ internal static class ApiRouteCatalog
             var path = ResolveManifestPath(config);
             var manifest = RouteDiscoveryEngine.LoadVerifiedManifest(path) ??
                            RouteDiscoveryEngine.LoadVerifiedManifest(path + ".bak");
-            if (manifest?.ReadOnlyVerified == true && manifest.Routes.TryGetValue(key, out var discovered) &&
+            if (manifest?.ActivatedRouteKeys.Contains(key) == true && manifest.Routes.TryGetValue(key, out var discovered) &&
                 IsSafeRoute(key, discovered)) route = discovered.Path;
         }
         return value is null ? route : route.Replace("{code}", Uri.EscapeDataString(value), StringComparison.Ordinal);
@@ -215,15 +215,17 @@ internal static class RouteDiscoveryEngine
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
             var manifest = JsonSerializer.Deserialize<ApiRouteManifest>(File.ReadAllText(path, Encoding.UTF8));
             if (manifest is null || manifest.SchemaVersion != 1 || manifest.Routes.Count == 0) return null;
+            manifest.ActivatedRouteKeys ??= new HashSet<string>(StringComparer.Ordinal);
+            if (manifest.ActivatedRouteKeys.Any(key => !manifest.Routes.ContainsKey(key))) return null;
             if (manifest.Routes.Any(pair => !ApiRouteCatalog.IsSafeRoute(pair.Key, pair.Value))) return null;
             return manifest;
         }
         catch { return null; }
     }
 
-    internal static void MarkReadOnlyVerified(ApiRouteManifest manifest, string path)
+    internal static void ActivateRoutes(ApiRouteManifest manifest, IEnumerable<string> keys, string path)
     {
-        manifest.ReadOnlyVerified = true;
+        manifest.ActivatedRouteKeys = keys.Where(manifest.Routes.ContainsKey).ToHashSet(StringComparer.Ordinal);
         SaveWithBackup(manifest, path);
     }
 
@@ -279,7 +281,8 @@ internal static class RouteDiscoveryEngine
             {
                 var remaining = maximumBytes + 1 - (int)buffer.Length;
                 if (remaining <= 0) throw new InvalidDataException("官方前端资源超出单文件限制。");
-                var read = stream.Read(chunk, 0, Math.Min(chunk.Length, remaining));
+                var read = stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellation.Token)
+                    .AsTask().GetAwaiter().GetResult();
                 if (read == 0) break;
                 buffer.Write(chunk, 0, read);
             }
@@ -470,9 +473,18 @@ internal static class RouteDiscoverySelfTests
             RouteDiscoveryEngine.SaveWithBackup(manifest, manifestPath);
             if (ApiRouteCatalog.Get(ApiRouteKeys.DailyClaim, config) != ApiRouteCatalog.BuiltIn[ApiRouteKeys.DailyClaim].Path)
                 throw new InvalidOperationException("未经只读状态接口验证的动态路由不得启用。");
-            RouteDiscoveryEngine.MarkReadOnlyVerified(manifest, manifestPath);
+            RouteDiscoveryEngine.ActivateRoutes(manifest, [ApiRouteKeys.DailyStatus, ApiRouteKeys.DailyClaim], manifestPath);
             if (ApiRouteCatalog.Get(ApiRouteKeys.DailyClaim, config) != manifest.Routes[ApiRouteKeys.DailyClaim].Path)
                 throw new InvalidOperationException("只读验证后的动态路由应被启用。");
+            var changedHeatmap = manifest.WithRoute(ApiRouteKeys.Heatmap,
+                new ApiRouteDefinition("GET", "/v2/activity/growth/heatmap-v2", "h5:fixture", 90));
+            RouteDiscoveryEngine.ActivateRoutes(changedHeatmap, [ApiRouteKeys.DailyStatus, ApiRouteKeys.DailyClaim], manifestPath);
+            if (ApiRouteCatalog.Get(ApiRouteKeys.Heatmap, config) != ApiRouteCatalog.BuiltIn[ApiRouteKeys.Heatmap].Path)
+                throw new InvalidOperationException("未逐项激活的成长中心候选路由不得因每日状态验证而生效。");
+            RouteDiscoveryEngine.ActivateRoutes(changedHeatmap,
+                [ApiRouteKeys.DailyStatus, ApiRouteKeys.DailyClaim, ApiRouteKeys.Heatmap], manifestPath);
+            if (ApiRouteCatalog.Get(ApiRouteKeys.Heatmap, config) != "/v2/activity/growth/heatmap-v2")
+                throw new InvalidOperationException("逐项只读验证后的成长中心路由应被启用。");
             var second = manifest.WithRoute(ApiRouteKeys.DailyClaim,
                 new ApiRouteDefinition("POST", "/v2/billing/meter/daily-checkin-v2", "fixture", 90));
             RouteDiscoveryEngine.SaveWithBackup(second, manifestPath);

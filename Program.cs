@@ -348,15 +348,11 @@ internal static class Program
                     var manifest = RouteDiscoveryEngine.Discover(config);
                     var session = WorkBuddyApiFastPath.LoadSession(config);
                     if (!session.IsReady) throw new InvalidOperationException("无法读取登录会话，候选路由未启用：" + session.Message);
-                    var statusPath = manifest.Routes[ApiRouteKeys.DailyStatus].Path;
-                    var check = WorkBuddyApiFastPath.QueryStatusOnlyWithPath(session.Session!, config, statusPath);
-                    if (check.Kind is not (ApiAttemptKind.Claimed or ApiAttemptKind.AlreadyClaimed or
-                        ApiAttemptKind.NeedsOcr or ApiAttemptKind.InactiveNeedsSingleOcr))
-                        throw new InvalidOperationException("只读签到状态校验未通过：" + check.Message);
-                    manifest.ReadOnlyVerified = true;
-                    RouteDiscoveryEngine.SaveWithBackup(manifest, ApiRouteCatalog.ResolveManifestPath(config));
-                    UpdateMaintenanceStatus(routeMessage: $"接口路由已验证（WorkBuddy {manifest.WorkBuddyVersion}）。");
-                    Log($"自动路由发现完成并通过只读状态校验，共 {manifest.Routes.Count} 条路由。");
+                    var activated = VerifyAndActivateDiscoveredRoutes(manifest, session.Session!, config);
+                    RouteDiscoveryEngine.ActivateRoutes(manifest, activated, ApiRouteCatalog.ResolveManifestPath(config));
+                    UpdateMaintenanceStatus(routeMessage:
+                        $"接口路由已逐项验证并启用 {activated.Count}/{manifest.Routes.Count} 条（WorkBuddy {manifest.WorkBuddyVersion}）。");
+                    Log($"自动路由发现完成：发现 {manifest.Routes.Count} 条，逐项验证后启用 {activated.Count} 条。");
                 }
                 catch (Exception ex)
                 {
@@ -392,11 +388,63 @@ internal static class Program
         return false;
     }
 
+    private static HashSet<string> VerifyAndActivateDiscoveredRoutes(ApiRouteManifest manifest,
+        WorkBuddyApiSession session, Config config)
+    {
+        var activated = new HashSet<string>(StringComparer.Ordinal);
+        var statusPath = manifest.Routes[ApiRouteKeys.DailyStatus].Path;
+        var daily = WorkBuddyApiFastPath.QueryStatusOnlyWithPath(session, config, statusPath);
+        if (!IsVerifiedRouteDiscoveryStatus(daily))
+            throw new InvalidOperationException("只读签到状态校验未通过：" + daily.Message);
+        activated.Add(ApiRouteKeys.DailyStatus);
+
+        var readOnlyKeys = new[]
+        {
+            ApiRouteKeys.TravelStatus, ApiRouteKeys.TravelConfig, ApiRouteKeys.Tasks, ApiRouteKeys.Streak,
+            ApiRouteKeys.Heatmap, ApiRouteKeys.RedeemSummary, ApiRouteKeys.LotteryChances,
+            ApiRouteKeys.BuddyQuota, ApiRouteKeys.Energy
+        };
+        foreach (var key in readOnlyKeys)
+        {
+            if (!manifest.Routes.TryGetValue(key, out var route)) continue;
+            var result = WorkBuddyApiFastPath.ProbeReadOnlyRoute(session, config, route.Path);
+            if (result.Verified) activated.Add(key);
+            else Log($"候选路由未激活 {key}: {result.Message}");
+        }
+
+        var writeCompanions = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [ApiRouteKeys.DailyClaim] = ApiRouteKeys.DailyStatus,
+            [ApiRouteKeys.TravelClaim] = ApiRouteKeys.TravelStatus,
+            [ApiRouteKeys.TravelDepart] = ApiRouteKeys.TravelConfig,
+            [ApiRouteKeys.TasksAccept] = ApiRouteKeys.Tasks,
+            [ApiRouteKeys.TaskClaim] = ApiRouteKeys.Tasks,
+            [ApiRouteKeys.MakeupUse] = ApiRouteKeys.Heatmap,
+            [ApiRouteKeys.Redeem] = ApiRouteKeys.RedeemSummary,
+            [ApiRouteKeys.LotteryDraw] = ApiRouteKeys.LotteryChances,
+            [ApiRouteKeys.BuddyOpen] = ApiRouteKeys.BuddyQuota
+        };
+        foreach (var (writeKey, companionKey) in writeCompanions)
+        {
+            if (!activated.Contains(companionKey) || !manifest.Routes.TryGetValue(writeKey, out var route)) continue;
+            if (route.Source.StartsWith("asar:", StringComparison.Ordinal) ||
+                route.Source.StartsWith("h5:", StringComparison.Ordinal)) activated.Add(writeKey);
+        }
+        return activated;
+    }
+
+    internal static bool IsVerifiedRouteDiscoveryStatus(ApiAttemptResult result) =>
+        result.Kind == ApiAttemptKind.AlreadyClaimed && result.HttpStatus is >= 200 and < 300 ||
+        result.Kind == ApiAttemptKind.NeedsOcr && result.HttpStatus is >= 200 and < 300 &&
+            result.FallbackReason == "STATUS_UNCLAIMED" ||
+        result.Kind == ApiAttemptKind.InactiveNeedsSingleOcr && result.HttpStatus is >= 200 and < 300 &&
+            result.FallbackReason == "active=false";
+
     private static void UpdateMaintenanceStatus(string? routeMessage = null, string? updateMessage = null,
         string? availableVersion = null)
     {
         var previous = LoadRunStatus() ?? new RunStatus();
-        SaveRunStatus(previous with
+        RecordRunStatus(previous with
         {
             RouteDiscoveryMessage = routeMessage ?? previous.RouteDiscoveryMessage,
             RouteDiscoveryUpdatedAt = routeMessage is null ? previous.RouteDiscoveryUpdatedAt : DateTimeOffset.Now,
@@ -4857,6 +4905,11 @@ internal static class Program
             throw new InvalidOperationException("签到入口失败结果必须如实区分未识别与已点击后未出现立即领取。");
         ValidateUserConfig(config);
         var defaultConfig = new Config();
+        if (IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "network", FallbackReason: "网络失败")) ||
+            IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "forbidden", HttpStatus: 403, FallbackReason: "HTTP 403")) ||
+            !IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.NeedsOcr, "unclaimed", HttpStatus: 200, FallbackReason: "STATUS_UNCLAIMED")) ||
+            !IsVerifiedRouteDiscoveryStatus(new ApiAttemptResult(ApiAttemptKind.InactiveNeedsSingleOcr, "inactive", HttpStatus: 200, FallbackReason: "active=false")))
+            throw new InvalidOperationException("路由发现只能接受语义明确的 2xx 签到状态，网络/权限/结构失败不得激活候选路由。");
         if (defaultConfig.MaxAttempts != 5 || defaultConfig.ManualMaxAttempts != 1 ||
             defaultConfig.RetryIntervalSeconds != 60 || !defaultConfig.EnableGrowthCenter ||
             defaultConfig.GrowthPollHours != 4 || defaultConfig.GrowthRunBudgetSeconds != 180 ||

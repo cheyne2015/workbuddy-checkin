@@ -107,26 +107,47 @@ internal static class AutomaticUpdater
             if (!stagedRoot.StartsWith(updateRoot, StringComparison.OrdinalIgnoreCase)) return 2;
             targetExe = Path.Combine(Path.GetFullPath(plan.TargetRoot), "release", "WorkBuddyAutoClaim.exe");
             if (!File.Exists(targetExe)) return 2;
-            try
+            return ExecuteApplyPlan(plan, WaitForParent, StartDaemon, WriteResult);
+        }
+        catch (Exception ex) { WriteResult("自动更新交接计划无效：" + ex.Message, success: false); return 1; }
+    }
+
+    internal static int ExecuteApplyPlan(UpdateApplyPlan plan, Func<int, bool> waitForParent,
+        Action<string> startDaemon, Action<string, bool> writeResult, string? backupRoot = null)
+    {
+        if (!waitForParent(plan.ParentProcessId)) return 3;
+        var targetExe = Path.Combine(Path.GetFullPath(plan.TargetRoot), "release", "WorkBuddyAutoClaim.exe");
+        try
+        {
+            ApplyFiles(plan.StagedRoot, plan.TargetRoot, plan.ExpectedExeSha256, backupRoot);
+            try { startDaemon(targetExe); }
+            catch (Exception ex)
             {
-                using var parent = Process.GetProcessById(plan.ParentProcessId);
-                if (!parent.WaitForExit(120_000)) return 3;
+                writeResult("自动更新已安装，但守护重启失败，请手动启动程序：" + ex.Message, false);
+                return 4;
             }
-            catch (ArgumentException) { }
-            ApplyFiles(plan.StagedRoot, plan.TargetRoot, plan.ExpectedExeSha256);
-            WriteResult("自动更新安装成功，已重新启动守护。", success: true);
-            StartDaemon(targetExe);
+            writeResult("自动更新安装成功，已重新启动守护。", true);
             return 0;
         }
         catch (Exception ex)
         {
-            WriteResult("自动更新安装失败，已恢复原文件：" + ex.Message, success: false);
-            if (!string.IsNullOrWhiteSpace(targetExe) && File.Exists(targetExe))
-            {
-                try { StartDaemon(targetExe); } catch { }
-            }
+            var recovery = ex.Message.Contains("回滚未完全成功", StringComparison.Ordinal)
+                ? "自动更新安装失败，且原文件未能完全恢复："
+                : "自动更新安装失败，原文件已恢复：";
+            writeResult(recovery + ex.Message, false);
+            if (File.Exists(targetExe)) { try { startDaemon(targetExe); } catch { } }
             return 1;
         }
+    }
+
+    private static bool WaitForParent(int parentProcessId)
+    {
+        try
+        {
+            using var parent = Process.GetProcessById(parentProcessId);
+            return parent.WaitForExit(120_000);
+        }
+        catch (ArgumentException) { return true; }
     }
 
     internal static string? ConsumeResult()
@@ -258,8 +279,9 @@ internal static class AutomaticUpdater
             if (!string.Equals(Sha256File(installedExe), expectedExeSha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("更新后的 EXE 哈希校验失败。");
         }
-        catch
+        catch (Exception original)
         {
+            var rollbackErrors = new List<Exception>();
             foreach (var change in changes.AsEnumerable().Reverse())
             {
                 try
@@ -267,8 +289,11 @@ internal static class AutomaticUpdater
                     if (change.Existed && change.Backup is not null) File.Copy(change.Backup, change.Target, overwrite: true);
                     else if (File.Exists(change.Target)) File.Delete(change.Target);
                 }
-                catch { }
+                catch (Exception rollbackError) { rollbackErrors.Add(rollbackError); }
             }
+            if (rollbackErrors.Count > 0)
+                throw new InvalidOperationException("更新失败，且回滚未完全成功，请从 update-backups 手动恢复。",
+                    new AggregateException([original, .. rollbackErrors]));
             throw;
         }
     }
@@ -319,7 +344,8 @@ internal static class AutomaticUpdater
             {
                 var remaining = maximumBytes + 1 - (int)buffer.Length;
                 if (remaining <= 0) throw new InvalidDataException("下载内容超出限制。");
-                var read = stream.Read(chunk, 0, Math.Min(chunk.Length, remaining));
+                var read = stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellation.Token)
+                    .AsTask().GetAwaiter().GetResult();
                 if (read == 0) break;
                 buffer.Write(chunk, 0, read);
             }
@@ -403,6 +429,46 @@ internal static class AutomaticUpdateSelfTests
                 File.ReadAllText(Path.Combine(target, "README.md"), Encoding.UTF8) != "new" ||
                 Sha256(Path.Combine(target, "release", "WorkBuddyAutoClaim.exe")) != exeHash)
                 throw new InvalidOperationException("自动替换必须更新程序文件并保留用户 config.json。");
+
+            var handoffTarget = Path.Combine(temp, "handoff-target");
+            Directory.CreateDirectory(Path.Combine(handoffTarget, "release"));
+            File.WriteAllText(Path.Combine(handoffTarget, "release", "WorkBuddyAutoClaim.exe"), "old", Encoding.UTF8);
+            var plan = new UpdateApplyPlan
+            {
+                ParentProcessId = 123,
+                StagedRoot = stagedRoot,
+                TargetRoot = handoffTarget,
+                ExpectedExeSha256 = exeHash
+            };
+            var waited = false;
+            var started = false;
+            string? applyMessage = null;
+            bool? applySuccess = null;
+            var applyCode = AutomaticUpdater.ExecuteApplyPlan(plan,
+                _ => { waited = true; return true; },
+                _ => started = true,
+                (message, success) => { applyMessage = message; applySuccess = success; },
+                Path.Combine(temp, "handoff-backup"));
+            if (applyCode != 0 || !waited || !started || applySuccess != true ||
+                applyMessage?.Contains("重新启动守护", StringComparison.Ordinal) != true)
+                throw new InvalidOperationException("更新交接必须等待父进程、替换文件、恢复守护并记录成功结果。");
+
+            File.WriteAllText(Path.Combine(handoffTarget, "release", "WorkBuddyAutoClaim.exe"), "old-again", Encoding.UTF8);
+            started = false;
+            applySuccess = null;
+            plan.ExpectedExeSha256 = new string('0', 64);
+            var failedCode = AutomaticUpdater.ExecuteApplyPlan(plan, _ => true, _ => started = true,
+                (_, success) => applySuccess = success, Path.Combine(temp, "handoff-failed-backup"));
+            if (failedCode != 1 || !started || applySuccess != false ||
+                File.ReadAllText(Path.Combine(handoffTarget, "release", "WorkBuddyAutoClaim.exe"), Encoding.UTF8) != "old-again")
+                throw new InvalidOperationException("更新交接失败时必须回滚旧文件、恢复旧守护并记录失败结果。");
+
+            plan.ExpectedExeSha256 = exeHash;
+            var restartFailure = AutomaticUpdater.ExecuteApplyPlan(plan, _ => true,
+                _ => throw new InvalidOperationException("fixture restart failure"), (_, success) => applySuccess = success,
+                Path.Combine(temp, "handoff-restart-backup"));
+            if (restartFailure != 4 || applySuccess != false)
+                throw new InvalidOperationException("安装完成但守护重启失败时必须单独报告，不能声称已回滚。");
 
             var malicious = Path.Combine(temp, "malicious.zip");
             using (var archive = ZipFile.Open(malicious, ZipArchiveMode.Create))

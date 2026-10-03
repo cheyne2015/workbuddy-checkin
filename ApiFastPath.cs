@@ -33,6 +33,8 @@ internal sealed record ApiAttemptResult(
     string? FallbackReason = null,
     bool ClaimMayHaveBeenSent = false);
 
+internal sealed record ApiReadOnlyProbeResult(bool Verified, string Message, int? HttpStatus = null);
+
 internal sealed class WorkBuddyApiSession
 {
     internal required Uri Endpoint { get; init; }
@@ -210,6 +212,22 @@ internal static class WorkBuddyApiFastPath
             with { EndpointHost = session.Endpoint.Host };
     }
 
+    internal static ApiReadOnlyProbeResult ProbeReadOnlyRoute(WorkBuddyApiSession session, Config config, string path,
+        HttpMessageHandler? handler = null, CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.IsCancellationRequested) return new(false, "只读探测已取消。");
+        using var client = CreateClient(session, config, handler);
+        var result = SendGet(client, BuildApiUri(session.Endpoint, path), config.ApiTimeoutSeconds, cancellationToken);
+        if (result.Cancelled) return new(false, "只读探测已取消。");
+        if (result.TimedOut) return new(false, "只读探测超时。");
+        if (result.NetworkFailed) return new(false, "只读探测网络失败。");
+        if (result.StatusCode is not (>= 200 and < 300))
+            return new(false, $"只读探测 HTTP {result.StatusCode?.ToString() ?? "未知"}。", result.StatusCode);
+        if (!TryParseJson(result.Body, out var document)) return new(false, "只读探测响应不是 JSON。", result.StatusCode);
+        document.Dispose();
+        return new(true, "只读接口返回有效 2xx JSON。", result.StatusCode);
+    }
+
     private static ApiAttemptResult CancelledResult(WorkBuddyApiSession session) =>
         new(ApiAttemptKind.Cancelled, "接口操作已让出执行权。", EndpointHost: session.Endpoint.Host,
             FallbackReason: "操作已取消");
@@ -268,6 +286,32 @@ internal static class WorkBuddyApiFastPath
             return new ApiHttpResult(null, null, NetworkFailed: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
         }
         catch (IOException)
+        {
+            return new ApiHttpResult(null, null, NetworkFailed: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
+        }
+    }
+
+    private static ApiHttpResult SendGet(HttpClient client, Uri uri, int timeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        var started = Stopwatch.StartNew();
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
+        try
+        {
+            using var response = client.Send(request, HttpCompletionOption.ResponseContentRead, linked.Token);
+            return new ApiHttpResult((int)response.StatusCode,
+                response.Content.ReadAsStringAsync(linked.Token).GetAwaiter().GetResult(),
+                RetryAfter: response.Headers.RetryAfter?.Delta, ElapsedMilliseconds: started.ElapsedMilliseconds);
+        }
+        catch (OperationCanceledException)
+        {
+            return cancellationToken.IsCancellationRequested
+                ? new ApiHttpResult(null, null, Cancelled: true, ElapsedMilliseconds: started.ElapsedMilliseconds)
+                : new ApiHttpResult(null, null, TimedOut: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
         {
             return new ApiHttpResult(null, null, NetworkFailed: true, ElapsedMilliseconds: started.ElapsedMilliseconds);
         }
