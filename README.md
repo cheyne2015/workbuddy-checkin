@@ -8,9 +8,9 @@
 
 ## 界面预览
 
-| 概览 | 设置 |
-| --- | --- |
-| <img src="docs/images/dashboard-overview.png" width="420" alt="WorkBuddy 自动领取守护概览窗口"> | <img src="docs/images/dashboard-overview-settings.png" width="420" alt="WorkBuddy 自动领取守护设置窗口"> |
+| 概览 | 成长中心 | 设置 |
+| --- | --- | --- |
+| <img src="docs/images/dashboard-overview.png" width="300" alt="WorkBuddy 自动领取守护概览窗口"> | <img src="docs/images/dashboard-overview-growth.png" width="300" alt="WorkBuddy 自动领取守护成长中心窗口"> | <img src="docs/images/dashboard-overview-settings.png" width="300" alt="WorkBuddy 自动领取守护设置窗口"> |
 
 概览页展示本机最近一次真实执行记录；截图中的 `尝试 5/5` 是升级到 v1.1.5 前的历史结果，不代表新版默认会执行五次。
 
@@ -28,9 +28,10 @@
 
 ## 守护面板
 
-面板会自动适配 Windows 的浅色/深色模式，并分为“概览”和“设置”：
+面板会自动适配 Windows 的浅色/深色模式，并分为“概览”“成长中心”和“设置”：
 
-- “概览”显示最近领取状态、当前余额、成长中心最近结果、更新时间和下一次自动领取时间。
+- “概览”显示最近领取状态、当前余额、成长中心摘要、更新时间和下一次自动领取时间，不再堆叠成长中心长明细。
+- “成长中心”独立显示总积分、连续领取天数、本轮成长积分、能量，以及旅行礼物、任务、补登、连登奖励、抽奖和 Buddy 盲盒六项结果。总积分会标注“接口实时”“OCR 读取”或“最近缓存”，不会把缓存值伪装成实时值。
 - “重试领取”按照“手动尝试次数”执行；运行期间按钮会锁定，避免重复提交。
 - “设置”可开关接口快速通道、成长中心、接口路由更新与程序自动更新，并修改 WorkBuddy 路径、领取时间、自动/手动尝试次数、失败间隔以及两个界面等待时间。
 - 点击“保存并立即应用”会唤醒守护并重新计算计划，不需要重启程序。
@@ -46,7 +47,7 @@
 3. 每次先调用只读状态接口。已领取则直接结束；未领取才调用每日领取接口；`credit` 字段是接口领取成功的必要依据。
 4. 领取请求超时或响应丢失后，不立即启动 OCR，而是在下一次先查状态，避免重复领取。HTTP 429 最多按服务端要求等待 60 秒；HTTP 401 全程只重新读取一次本地会话。
 5. 自动任务最多 5 次，间隔依次为 5、15、30、60 秒。`active=false` 时只执行一次完整 OCR；接口状态查询在发送领取前就失败时，可在当前尝试转入 OCR。
-6. 接口成功会显示本次增加积分及连签天数。由于没有打开个人中心，余额沿用最近一次 OCR 数值并明确标注“接口领取后未刷新”。
+6. 接口成功会显示本次增加积分、连续领取天数及 `total_credits` 总积分；接口未返回总积分时才沿用最近一次明确余额，并标注“最近缓存”。OCR 通道成功后则记录个人中心确认过的余额并标注“OCR 读取”。
 
 ### 成长中心（默认开启）
 
@@ -237,7 +238,7 @@ cd .\release
 - `state.json` 使用原子写入和 `.bak` 备份。两份状态都损坏时，当天安全停止并通知，不会重复领取。
 - 安装的 Windows 任务在登录时启动守护进程；守护异常退出时，任务计划会每分钟最多重启 3 次。
 - 安装、手动测试或安全测试结束时，工具优先请求任务计划恢复守护；只有新守护完成配置加载并主动发出就绪信号后才记录恢复成功，直接启动回退也执行同样确认。
-- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.3.1.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
+- `build.ps1` 同时生成 `artifacts\WorkBuddyAutoClaim-v1.3.2.zip`；包内不包含本机 `config.json`、PDB、状态或诊断数据。
 - 自动更新只接受 GitHub 最新稳定 Release 中精确命名的 ZIP，并核对 Release 元数据里的 SHA-256 digest；安装前暂存，覆盖失败或最终 EXE 哈希不符时恢复原文件，`release\config.json` 始终保留。
 - `%LOCALAPPDATA%\WorkBuddyAutoClaim\workbuddy-auto-claim.log` 只保留最近 30 天；`diagnostics\` 仅保留最新 20 份失败诊断。诊断包包含截图、OCR 原文、WorkBuddy 版本、窗口尺寸和 DPI；成功领取不会保留领取截图。
 

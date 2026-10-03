@@ -16,7 +16,8 @@ internal sealed record GrowthCenterResult(
     int? Energy = null,
     int? StreakDays = null,
     bool AuthenticationRejected = false,
-    bool Cancelled = false);
+    bool Cancelled = false,
+    IReadOnlyDictionary<string, string>? Modules = null);
 
 internal static class WorkBuddyGrowthCenter
 {
@@ -31,13 +32,13 @@ internal static class WorkBuddyGrowthCenter
         var context = new GrowthContext(client, session.Endpoint, config,
             wait ?? (duration => { Thread.Sleep(duration); return false; }),
             cancellationRequested ?? (() => false));
-        context.RunModule(context.RunTravel, "旅行");
-        context.RunModule(context.RunTasks, "任务");
-        context.RunModule(context.RunMakeup, "补登");
-        context.RunModule(context.RunRedeem, "连登兑换");
-        context.RunModule(context.RunLottery, "盲盒");
-        context.RunModule(context.RunBuddyBoxes, "Buddy 盲盒");
-        context.RunModule(context.LoadSummary, "状态汇总");
+        context.RunModule(context.RunTravel, "travel", "旅行");
+        context.RunModule(context.RunTasks, "tasks", "任务");
+        context.RunModule(context.RunMakeup, "makeup", "补登");
+        context.RunModule(context.RunRedeem, "redeem", "连登兑换");
+        context.RunModule(context.RunLottery, "lottery", "盲盒");
+        context.RunModule(context.RunBuddyBoxes, "buddy", "Buddy 盲盒");
+        context.RunModule(context.LoadSummary, "summary", "状态汇总");
         return context.Complete();
     }
 
@@ -70,6 +71,7 @@ internal static class WorkBuddyGrowthCenter
     {
         private readonly Stopwatch _elapsed = Stopwatch.StartNew();
         private readonly List<string> _parts = [];
+        private readonly Dictionary<string, string> _modules = new(StringComparer.Ordinal);
         private int _credits;
         private int _failures;
         private int _hardFailures;
@@ -82,12 +84,25 @@ internal static class WorkBuddyGrowthCenter
         private int? _energy;
         private int? _streakDays;
 
-        internal void RunModule(Action action, string label)
+        internal void RunModule(Action action, string key, string label)
         {
-            if (CheckCancellation()) return;
-            if (_stopAll) return;
+            if (CheckCancellation())
+            {
+                _modules[key] = "已取消";
+                return;
+            }
+            if (_stopAll)
+            {
+                _modules[key] = "因前序错误跳过";
+                return;
+            }
+            var start = _parts.Count;
             try { action(); }
             catch (Exception ex) { ModuleException(label, ex); }
+            var details = _parts.Skip(start).ToArray();
+            _modules[key] = details.Length > 0
+                ? string.Join("；", details)
+                : _cancelled ? "已取消" : _stopAll ? "因前序错误停止" : "无可处理项";
         }
 
         internal void RunTravel()
@@ -505,7 +520,8 @@ internal static class WorkBuddyGrowthCenter
             if (tail.Count > 0) report += "（" + string.Join("，", tail) + "）";
             return new GrowthCenterResult(_hardFailures > 0 || _authenticationRejected,
                 _successes == 0 && _failures == 0, report, _credits, _energy, _streakDays,
-                _authenticationRejected, _cancelled);
+                _authenticationRejected, _cancelled,
+                new Dictionary<string, string>(_modules, StringComparer.Ordinal));
         }
 
         private bool CannotContinue(string label)
@@ -856,7 +872,11 @@ internal static class GrowthCenterSelfTests
             !result.Report.Contains("补登 2026-10-01", StringComparison.Ordinal) ||
             !result.Report.Contains("连登兑换", StringComparison.Ordinal) ||
             !result.Report.Contains("开盲盒获得", StringComparison.Ordinal) ||
-            !result.Report.Contains("开 Buddy 盲盒", StringComparison.Ordinal))
+            !result.Report.Contains("开 Buddy 盲盒", StringComparison.Ordinal) ||
+            result.Modules is null || result.Modules.Count != 7 ||
+            !result.Modules["travel"].Contains("领旅行礼物 +20", StringComparison.Ordinal) ||
+            !result.Modules["tasks"].Contains("领取任务", StringComparison.Ordinal) ||
+            !result.Modules["buddy"].Contains("开 Buddy 盲盒", StringComparison.Ordinal))
             throw new InvalidOperationException("成长中心完整策略或请求顺序与上游契约不一致。\n" + result.Report +
                                                 "\n" + string.Join("\n", handler.Paths));
         var acceptIndex = Array.IndexOf(expected, "/v2/activity/growth/tasks/accept");

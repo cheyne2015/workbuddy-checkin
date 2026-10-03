@@ -723,7 +723,7 @@ internal static class Program
         bool isManualTest = mode == ClaimRunMode.ManualTest;
         int maxAttempts = GetAttemptLimit(config, mode);
         var previousStatus = LoadRunStatus();
-        var lastKnownBalance = previousStatus?.AfterBalance ?? previousStatus?.BeforeBalance;
+        var lastKnownBalance = previousStatus?.TotalCredits ?? previousStatus?.AfterBalance ?? previousStatus?.BeforeBalance;
         RecordRunStatus(new RunStatus
         {
             UpdatedAt = DateTimeOffset.Now,
@@ -788,7 +788,7 @@ internal static class Program
             {
                 lastResult = WorkBuddyApiFastPath.ExecuteAttempt(session, config, claimMayHaveBeenSent, () =>
                 {
-                    SaveRunStatus(new RunStatus
+                    SaveRunStatus(PreserveDashboardInsights(new RunStatus
                     {
                         UpdatedAt = DateTimeOffset.Now,
                         Mode = isManualTest ? "Manual" : "Automatic",
@@ -801,7 +801,7 @@ internal static class Program
                         EndpointHost = session.Endpoint.Host,
                         BalanceFresh = false,
                         AfterBalance = lastKnownBalance
-                    });
+                    }));
                     claimMayHaveBeenSent = true;
                 }, cancellationToken: attemptCancellation.Token);
             }
@@ -981,33 +981,43 @@ internal static class Program
             SaveState(persistedState);
         }
         var message = result.Message + " 未启动 WorkBuddy 图形界面。";
+        var totalCredits = result.TotalCredits ?? lastKnownBalance;
+        var totalCreditsSource = !string.IsNullOrWhiteSpace(result.TotalCredits)
+            ? "Api"
+            : !string.IsNullOrWhiteSpace(lastKnownBalance) ? "Cached" : null;
         RecordRunStatus(new RunStatus
         {
             UpdatedAt = DateTimeOffset.Now,
             Mode = isManualTest ? "Manual" : "Automatic",
             Outcome = outcome,
             Message = message,
-            AfterBalance = lastKnownBalance,
+            AfterBalance = totalCredits,
             AttemptsPerformed = attempt,
             MaxAttempts = maxAttempts,
             ExecutionChannel = "Api",
             ApiResult = result.Kind == ApiAttemptKind.Claimed ? "Claimed" : "Already",
             CreditGained = result.Credit,
             StreakDays = result.StreakDays,
+            TotalCredits = totalCredits,
+            TotalCreditsSource = totalCreditsSource,
             EndpointHost = result.EndpointHost,
-            BalanceFresh = false,
+            BalanceFresh = !string.IsNullOrWhiteSpace(result.TotalCredits),
             GrowthMessage = growth?.Report,
             GrowthUpdatedAt = growth is null ? null : DateTimeOffset.Now,
             GrowthCreditsGained = growth?.CreditsGained ?? 0,
             GrowthEnergy = growth?.Energy,
             GrowthStreakDays = growth?.StreakDays,
-            GrowthNeedsAttention = growth?.NeedsAttention ?? false
+            GrowthNeedsAttention = growth?.NeedsAttention ?? false,
+            GrowthModules = growth?.Modules is null
+                ? null
+                : new Dictionary<string, string>(growth.Modules, StringComparer.Ordinal)
         });
         var reward = string.IsNullOrWhiteSpace(result.Credit) ? "" : $"\n本次：+{result.Credit} 积分";
         var streak = result.StreakDays.HasValue ? $"\n连签：{result.StreakDays} 天" : "";
         var growthText = growth is null || growth.Idle ? "" : "\n成长中心：" + growth.Report;
+        var totalSourceNote = !string.IsNullOrWhiteSpace(result.TotalCredits) ? "接口实时" : "最近缓存";
         Notify(isManualTest ? "WorkBuddy 手动测试" : "WorkBuddy 自动领取",
-            $"{result.Message}{reward}{streak}\n账户余额：{lastKnownBalance ?? "未读取到"}（接口领取后未刷新）\n尝试：{attempt}/{maxAttempts}{growthText}",
+            $"{result.Message}{reward}{streak}\n总积分：{totalCredits ?? "未读取到"}（{totalSourceNote}）\n尝试：{attempt}/{maxAttempts}{growthText}",
             growth?.NeedsAttention == true ? ToolTipIcon.Warning : ToolTipIcon.Info);
         Log("接口快速通道完成: " + result.Message);
         return growth?.NeedsAttention == true ? 1 : 0;
@@ -1128,6 +1138,14 @@ internal static class Program
             GrowthEnergy = result.Energy,
             GrowthStreakDays = result.StreakDays,
             GrowthNeedsAttention = result.NeedsAttention,
+            GrowthModules = result.Modules is null
+                ? previous?.GrowthModules
+                : new Dictionary<string, string>(result.Modules, StringComparer.Ordinal),
+            StreakDays = daily?.StreakDays ?? previous?.StreakDays,
+            TotalCredits = daily?.TotalCredits ?? previous?.TotalCredits,
+            TotalCreditsSource = !string.IsNullOrWhiteSpace(daily?.TotalCredits)
+                ? "Api"
+                : previous?.TotalCreditsSource,
             EndpointHost = loaded.Session?.Endpoint.Host ?? previous?.EndpointHost,
             PendingEndpointHost = loaded.PendingHost ?? previous?.PendingEndpointHost,
             FallbackReason = loaded.IsReady ? previous?.FallbackReason : loaded.FallbackReason
@@ -1302,6 +1320,8 @@ internal static class Program
                 Message = result,
                 BeforeBalance = FormatNotificationBalance(notificationBeforeBalance),
                 AfterBalance = FormatNotificationBalance(notificationAfterBalance),
+                TotalCredits = FormatNotificationBalance(notificationAfterBalance),
+                TotalCreditsSource = FormatNotificationBalance(notificationAfterBalance) is null ? null : "Ocr",
                 AttemptsPerformed = attemptsPerformed,
                 MaxAttempts = displayedMaxAttempts,
                 ExecutionChannel = executionChannel,
@@ -5526,8 +5546,41 @@ internal static class Program
                 GrowthUpdatedAt = new DateTimeOffset(2026, 10, 2, 4, 0, 0, TimeSpan.FromHours(8)),
                 GrowthCreditsGained = 20
             });
-            if (!growthView.Detail.Contains("成长中心（10-02 04:00）：领旅行礼物 +20 积分", StringComparison.Ordinal))
-                throw new InvalidOperationException("GUI 必须显示最近一次成长中心结果和执行时间。");
+            if (!growthView.Detail.Contains("成长中心：本轮 +20 积分", StringComparison.Ordinal) ||
+                growthView.Detail.Contains("领旅行礼物", StringComparison.Ordinal))
+                throw new InvalidOperationException("概览只能显示成长中心摘要，不能继续堆叠完整成长明细。");
+
+            var growthCenterView = GrowthCenterDashboardView.From(completedStatus with
+            {
+                TotalCredits = "2372.85",
+                TotalCreditsSource = "Api",
+                StreakDays = 7,
+                GrowthEnergy = 18,
+                GrowthCreditsGained = 20,
+                GrowthUpdatedAt = new DateTimeOffset(2026, 10, 2, 4, 0, 0, TimeSpan.FromHours(8)),
+                GrowthModules = new Dictionary<string, string>
+                {
+                    ["travel"] = "领旅行礼物 +20 积分",
+                    ["tasks"] = "任务无可领取项"
+                }
+            });
+            if (growthCenterView.TotalCredits != "2,372.85" ||
+                growthCenterView.TotalCreditsSource != "接口实时" ||
+                growthCenterView.StreakDays != "7 天" || growthCenterView.Energy != "18" ||
+                growthCenterView.Modules.Count != 6 ||
+                growthCenterView.Modules[0].Detail != "领旅行礼物 +20 积分" ||
+                growthCenterView.Modules[1].Detail != "任务无可领取项")
+                throw new InvalidOperationException("成长中心页必须分项展示实时总积分、连续领取天数、能量和模块结果。");
+
+            var cachedGrowthView = GrowthCenterDashboardView.From(completedStatus with
+            {
+                TotalCredits = null,
+                TotalCreditsSource = null,
+                AfterBalance = "1822.8",
+                BalanceFresh = false
+            });
+            if (cachedGrowthView.TotalCredits != "1,822.8" || cachedGrowthView.TotalCreditsSource != "最近缓存")
+                throw new InvalidOperationException("接口总积分缺失时必须回退到最近余额，并明确标记为缓存。");
         }
         finally
         {
@@ -5691,8 +5744,31 @@ internal static class Program
 
     private static void RecordRunStatus(RunStatus status)
     {
-        try { SaveRunStatus(status); }
+        try { SaveRunStatus(PreserveDashboardInsights(status)); }
         catch (Exception ex) { Log("保存最近领取状态失败: " + ex.Message); }
+    }
+
+    private static RunStatus PreserveDashboardInsights(RunStatus status)
+    {
+        var previous = LoadRunStatus(RunStatusPath);
+        if (previous is null) return status;
+        return status with
+        {
+            StreakDays = status.StreakDays ?? previous.StreakDays,
+            TotalCredits = status.TotalCredits ?? previous.TotalCredits,
+            TotalCreditsSource = status.TotalCreditsSource ?? previous.TotalCreditsSource,
+            GrowthMessage = status.GrowthMessage ?? previous.GrowthMessage,
+            GrowthUpdatedAt = status.GrowthUpdatedAt ?? previous.GrowthUpdatedAt,
+            GrowthCreditsGained = status.GrowthUpdatedAt.HasValue
+                ? status.GrowthCreditsGained
+                : previous.GrowthCreditsGained,
+            GrowthEnergy = status.GrowthEnergy ?? previous.GrowthEnergy,
+            GrowthStreakDays = status.GrowthStreakDays ?? previous.GrowthStreakDays,
+            GrowthNeedsAttention = status.GrowthUpdatedAt.HasValue
+                ? status.GrowthNeedsAttention
+                : previous.GrowthNeedsAttention,
+            GrowthModules = status.GrowthModules ?? previous.GrowthModules
+        };
     }
 
     internal static void SaveRunStatus(RunStatus status, string path)

@@ -71,13 +71,29 @@ internal sealed class TrayDaemonContext : ApplicationContext
             Mode = "Automatic",
             Outcome = "Claimed",
             Message = "接口领取成功，未启动 WorkBuddy 图形界面。",
-            BeforeBalance = "1200.00",
-            AfterBalance = "1300.00",
+            BeforeBalance = "2272.85",
+            AfterBalance = "2372.85",
             AttemptsPerformed = 1,
             MaxAttempts = 5,
             ExecutionChannel = "Api",
             CreditGained = "100",
             StreakDays = 4,
+            TotalCredits = "2372.85",
+            TotalCreditsSource = "Api",
+            GrowthMessage = "旅行礼物已领取；任务奖励无可领取项；补登无需处理；连登奖励等待下一档；今日抽奖已完成；Buddy 盲盒额度已用完",
+            GrowthUpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 1, TimeSpan.FromHours(8)),
+            GrowthCreditsGained = 20,
+            GrowthEnergy = 18,
+            GrowthStreakDays = 4,
+            GrowthModules = new Dictionary<string, string>
+            {
+                ["travel"] = "旅行礼物已领取 · +20 积分",
+                ["tasks"] = "无可领取奖励",
+                ["makeup"] = "无需补登",
+                ["redeem"] = "等待下一档奖励",
+                ["lottery"] = "今日抽奖已完成",
+                ["buddy"] = "今日额度已用完"
+            },
             RouteDiscoveryMessage = "接口路由已通过只读状态校验。",
             RouteDiscoveryUpdatedAt = new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.FromHours(8)),
             UpdateMessage = "当前已是最新版本。",
@@ -309,6 +325,14 @@ internal sealed class DashboardForm : Form
     private readonly Label _updatedValue = new();
     private readonly Label _nextRunValue = new();
     private readonly Label _detailValue = new();
+    private readonly Label _growthTotalValue = new();
+    private readonly Label _growthTotalSource = new();
+    private readonly Label _growthStreakValue = new();
+    private readonly Label _growthCreditsValue = new();
+    private readonly Label _growthEnergyValue = new();
+    private readonly Label _growthUpdatedValue = new();
+    private readonly Label _growthSummaryValue = new();
+    private readonly Dictionary<string, Label> _growthModuleValues = new(StringComparer.Ordinal);
     private readonly Button _retryButton = new();
     private readonly FlowLayoutPanel _endpointApprovalPanel = new();
     private readonly Label _endpointApprovalLabel = new();
@@ -345,6 +369,7 @@ internal sealed class DashboardForm : Form
         AutoScaleMode = AutoScaleMode.Dpi;
 
         _tabs.TabPages.Add(BuildOverviewTab());
+        _tabs.TabPages.Add(BuildGrowthCenterTab());
         _tabs.TabPages.Add(BuildSettingsTab());
         Controls.Add(_tabs);
 
@@ -359,6 +384,116 @@ internal sealed class DashboardForm : Form
         _refreshTimer.Start();
         ApplyTheme();
         LoadSettings();
+    }
+
+    private TabPage BuildGrowthCenterTab()
+    {
+        var page = new TabPage("成长中心") { Padding = new Padding(18) };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 5,
+            AutoScroll = true
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var heading = new Label
+        {
+            Text = "成长中心概况",
+            Dock = DockStyle.Fill,
+            Font = new Font(Font.FontFamily, 15, FontStyle.Bold)
+        };
+        var stats = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1 };
+        for (var i = 0; i < 4; i++) stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        stats.Controls.Add(BuildStatCard("总积分", _growthTotalValue, _growthTotalSource), 0, 0);
+        stats.Controls.Add(BuildStatCard("连续领取", _growthStreakValue), 1, 0);
+        stats.Controls.Add(BuildStatCard("本轮积分", _growthCreditsValue), 2, 0);
+        stats.Controls.Add(BuildStatCard("当前能量", _growthEnergyValue), 3, 0);
+
+        _growthUpdatedValue.Dock = DockStyle.Fill;
+        _growthUpdatedValue.TextAlign = ContentAlignment.MiddleLeft;
+        _growthSummaryValue.Dock = DockStyle.Fill;
+        _growthSummaryValue.AutoEllipsis = true;
+        _growthSummaryValue.Padding = new Padding(10, 8, 10, 8);
+        _growthSummaryValue.Tag = "card";
+
+        var modules = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 6,
+            Padding = new Padding(0, 6, 0, 0)
+        };
+        modules.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
+        modules.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var moduleDefinitions = new[]
+        {
+            ("travel", "旅行礼物"), ("tasks", "任务"), ("makeup", "补登"),
+            ("redeem", "连登奖励"), ("lottery", "抽奖"), ("buddy", "Buddy 盲盒")
+        };
+        for (var row = 0; row < moduleDefinitions.Length; row++)
+        {
+            modules.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            var (key, title) = moduleDefinitions[row];
+            var titleLabel = new Label
+            {
+                Text = title,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font(Font, FontStyle.Bold),
+                Padding = new Padding(8, 0, 4, 0),
+                Tag = "card"
+            };
+            var detailLabel = new Label
+            {
+                Text = "暂无记录",
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(8, 0, 8, 0),
+                Tag = "card"
+            };
+            _growthModuleValues[key] = detailLabel;
+            modules.Controls.Add(titleLabel, 0, row);
+            modules.Controls.Add(detailLabel, 1, row);
+        }
+
+        layout.Controls.Add(heading, 0, 0);
+        layout.Controls.Add(stats, 0, 1);
+        layout.Controls.Add(_growthUpdatedValue, 0, 2);
+        layout.Controls.Add(_growthSummaryValue, 0, 3);
+        layout.Controls.Add(modules, 0, 4);
+        page.Controls.Add(layout);
+        return page;
+    }
+
+    private Panel BuildStatCard(string title, Label value, Label? caption = null)
+    {
+        var card = new Panel { Dock = DockStyle.Fill, Margin = new Padding(4), Padding = new Padding(10), Tag = "card" };
+        var titleLabel = new Label { Text = title, Dock = DockStyle.Top, Height = 22, Tag = "card" };
+        value.Text = "--";
+        value.Dock = DockStyle.Fill;
+        value.Font = new Font("Segoe UI Variable Display", 17, FontStyle.Bold);
+        value.TextAlign = ContentAlignment.MiddleLeft;
+        value.Tag = "card";
+        card.Controls.Add(value);
+        card.Controls.Add(titleLabel);
+        if (caption is not null)
+        {
+            caption.Text = "尚未读取";
+            caption.Dock = DockStyle.Bottom;
+            caption.Height = 20;
+            caption.Font = new Font(Font.FontFamily, 8.5f);
+            caption.Tag = "card";
+            card.Controls.Add(caption);
+        }
+        return card;
     }
 
     private TabPage BuildOverviewTab()
@@ -541,6 +676,19 @@ internal sealed class DashboardForm : Form
         _balanceValue.Text = view.Balance;
         _updatedValue.Text = "更新时间：" + view.UpdatedAt;
         _detailValue.Text = view.Detail;
+        var growthView = GrowthCenterDashboardView.From(status);
+        _growthTotalValue.Text = growthView.TotalCredits;
+        _growthTotalSource.Text = growthView.TotalCreditsSource;
+        _growthStreakValue.Text = growthView.StreakDays;
+        _growthCreditsValue.Text = growthView.CreditsGained;
+        _growthEnergyValue.Text = growthView.Energy;
+        _growthUpdatedValue.Text = "最近更新：" + growthView.UpdatedAt;
+        _growthSummaryValue.Text = growthView.Summary;
+        _growthSummaryValue.ForeColor = growthView.NeedsAttention
+            ? Color.FromArgb(232, 93, 88)
+            : (_darkMode ? Color.FromArgb(238, 240, 243) : Color.FromArgb(31, 35, 40));
+        foreach (var module in growthView.Modules)
+            if (_growthModuleValues.TryGetValue(module.Key, out var label)) label.Text = module.Detail;
         _endpointApprovalPanel.Visible = !string.IsNullOrWhiteSpace(status?.PendingEndpointHost);
         _endpointApprovalLabel.Text = status?.PendingEndpointHost is { Length: > 0 } host
             ? $"待确认接口域名：{host}"
@@ -572,6 +720,11 @@ internal sealed class DashboardForm : Form
         SaveWindowBitmap(overviewPath);
         _tabs.SelectedIndex = 1;
         Application.DoEvents();
+        var growthPath = Path.Combine(Path.GetDirectoryName(overviewPath)!,
+            Path.GetFileNameWithoutExtension(overviewPath) + "-growth.png");
+        SaveWindowBitmap(growthPath);
+        _tabs.SelectedIndex = 2;
+        Application.DoEvents();
         var settingsPath = Path.Combine(Path.GetDirectoryName(overviewPath)!,
             Path.GetFileNameWithoutExtension(overviewPath) + "-settings.png");
         SaveWindowBitmap(settingsPath);
@@ -580,8 +733,12 @@ internal sealed class DashboardForm : Form
 
     internal void ValidateSmoke()
     {
-        if (_tabs.TabPages.Count != 2 || _tabs.TabPages[0].Text != "概览" || _tabs.TabPages[1].Text != "设置")
-            throw new InvalidOperationException("守护面板必须包含概览和设置页。");
+        if (_tabs.TabPages.Count != 3 || _tabs.TabPages[0].Text != "概览" ||
+            _tabs.TabPages[1].Text != "成长中心" || _tabs.TabPages[2].Text != "设置")
+            throw new InvalidOperationException("守护面板必须包含概览、成长中心和设置页。");
+        if (_growthModuleValues.Count != 6 || string.IsNullOrWhiteSpace(_growthTotalValue.Text) ||
+            string.IsNullOrWhiteSpace(_growthStreakValue.Text))
+            throw new InvalidOperationException("成长中心页缺少总积分、连续领取天数或分模块状态。");
         if (!_retryButton.Text.Contains("重试领取", StringComparison.Ordinal) ||
             _automaticAttempts.Minimum != 1 || _manualAttempts.Minimum != 1 ||
             !_growthCenter.Text.Contains("成长中心", StringComparison.Ordinal))
@@ -740,7 +897,10 @@ internal sealed class DashboardForm : Form
         foreach (Control control in parent.Controls)
         {
             control.ForeColor = foreground;
-            control.BackColor = control is TabPage or TextBox or NumericUpDown or DateTimePicker ? surface : background;
+            control.BackColor = control is TabPage or TextBox or NumericUpDown or DateTimePicker ||
+                                string.Equals(control.Tag as string, "card", StringComparison.Ordinal)
+                ? surface
+                : background;
             if (control is Label label && !label.Font.Bold) label.ForeColor = muted;
             if (control is Button button)
             {
